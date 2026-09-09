@@ -507,29 +507,36 @@ impl RealInference {
             let seq_len = self.kv_cache_k[blk].len() / h;
             debug_assert_eq!(self.kv_cache_v[blk].len() / h, seq_len);
 
-            // Attention sobre cache acumulado (seq_len)
-            // scores[i] = Q·K_i * scale
+            // Attention PER-HEAD sobre o cache (MHA/GQA correto: softmax por head,
+            // não sobre o vetor 1536 concatenado — a versão conjunta saturava
+            // numa posição e congelava o hidden).
             let t_attn0 = now();
             let k_cache = &self.kv_cache_k[blk];
             let v_cache = &self.kv_cache_v[blk];
-            let mut scores = vec![0.0f32; seq_len];
-            for i in 0..seq_len {
-                let k_i = &k_cache[i*h..(i+1)*h];
-                let mut dot = 0.0f32;
-                for (a,b) in q.iter().zip(k_i.iter()) { dot += a * b; }
-                scores[i] = dot * scale;
-            }
-            // causal softmax (todos os tokens anteriores são visíveis; futuro não existe)
-            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for s in scores.iter_mut() { *s = (*s - max).exp(); sum += *s; }
-            for s in scores.iter_mut() { *s /= sum; }
-            // weighted sum V
             let mut attn_agg = vec![0.0f32; h];
-            for i in 0..seq_len {
-                let v_i = &v_cache[i*h..(i+1)*h];
-                let w = scores[i];
-                for j in 0..h { attn_agg[j] += w * v_i[j]; }
+            for hh in 0..n_heads {
+                let hb = hh * head_dim;
+                if hb + head_dim > h || hb + head_dim > q.len() {
+                    break; // config degenerada (testes dummy): ignora heads extras
+                }
+                let qb = &q[hb..hb + head_dim];
+                let mut scores = vec![0.0f32; seq_len];
+                for i in 0..seq_len {
+                    let kb = &k_cache[i * h + hb..i * h + hb + head_dim];
+                    let mut dot = 0.0f32;
+                    for (a, b) in qb.iter().zip(kb.iter()) { dot += a * b; }
+                    scores[i] = dot * scale;
+                }
+                // causal softmax por head (todo o cache é passado; futuro não existe)
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() { *s = (*s - max).exp(); sum += *s; }
+                for s in scores.iter_mut() { *s /= sum; }
+                for i in 0..seq_len {
+                    let vb = &v_cache[i * h + hb..i * h + hb + head_dim];
+                    let w = scores[i];
+                    for j in 0..head_dim { attn_agg[hb + j] += w * vb[j]; }
+                }
             }
             if profile { t_attn += t_attn0.elapsed().as_micros(); }
 
@@ -585,11 +592,31 @@ impl RealInference {
         }
         if profile {
             // t_norm_ffn inclui t_matvec+t_attn (tempo de bloco); fases em ms
-            eprintln!("[profile tok {}] layersTOTAL={:.0}ms matvec={:.0}ms attn={:.0}ms norm+ffn-resto={:.0}ms head={:.0}ms",
+            // + sanidade dos logits: top1/entropia denunciam pico sistemático
+            let mut top1 = 0usize;
+            let mut topv = f32::NEG_INFINITY;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > topv { topv = v; top1 = i; }
+            }
+            let maxl = topv;
+            let mut se = 0.0f32;
+            let mut ssum = 0.0f32;
+            for &v in logits.iter() {
+                let e = (v - maxl).exp();
+                ssum += e;
+            }
+            for &v in logits.iter() {
+                let p = (v - maxl).exp() / ssum;
+                if p > 1e-12 { se -= p * p.ln(); }
+            }
+            let top1p = ((topv - maxl).exp() / ssum) * 100.0;
+            let hmean: f32 = hidden_norm_final.iter().map(|a| a.abs()).sum::<f32>() / hidden_norm_final.len() as f32;
+            eprintln!("[profile tok {}] layersTOTAL={:.0}ms matvec={:.0}ms attn={:.0}ms norm+ffn-resto={:.0}ms head={:.0}ms top1={}({:.1}%) H={:.2} |h|={:.3}",
                 token_id, t_norm_ffn as f64 / 1000.0, t_matvec as f64 / 1000.0,
                 t_attn as f64 / 1000.0,
                 (t_norm_ffn as f64 - t_matvec as f64 - t_attn as f64).max(0.0) / 1000.0,
-                t_head0.elapsed().as_micros() as f64 / 1000.0);
+                t_head0.elapsed().as_micros() as f64 / 1000.0,
+                top1, top1p, se, hmean);
         }
         Ok(logits)
     }
@@ -669,22 +696,30 @@ impl RealInference {
             let seq_len = self.kv_cache_k[blk].len() / h;
             let k_cache = &self.kv_cache_k[blk];
             let v_cache = &self.kv_cache_v[blk];
-            let mut scores = vec![0.0f32; seq_len];
-            for i in 0..seq_len {
-                let k_i = &k_cache[i*h..(i+1)*h];
-                let mut dot = 0.0f32;
-                for (a,b) in q.iter().zip(k_i.iter()) { dot += a * b; }
-                scores[i] = dot * scale;
-            }
-            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for s in scores.iter_mut() { *s = (*s - max).exp(); sum += *s; }
-            for s in scores.iter_mut() { *s /= sum; }
+            // Attention PER-HEAD (igual ao forward_one: softmax por head)
             let mut attn_agg = vec![0.0f32; h];
-            for i in 0..seq_len {
-                let v_i = &v_cache[i*h..(i+1)*h];
-                let w = scores[i];
-                for j in 0..h { attn_agg[j] += w * v_i[j]; }
+            for hh in 0..n_heads {
+                let hb = hh * head_dim;
+                if hb + head_dim > h || hb + head_dim > q.len() {
+                    break;
+                }
+                let qb = &q[hb..hb + head_dim];
+                let mut scores = vec![0.0f32; seq_len];
+                for i in 0..seq_len {
+                    let kb = &k_cache[i * h + hb..i * h + hb + head_dim];
+                    let mut dot = 0.0f32;
+                    for (a, b) in qb.iter().zip(kb.iter()) { dot += a * b; }
+                    scores[i] = dot * scale;
+                }
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() { *s = (*s - max).exp(); sum += *s; }
+                for s in scores.iter_mut() { *s /= sum; }
+                for i in 0..seq_len {
+                    let vb = &v_cache[i * h + hb..i * h + hb + head_dim];
+                    let w = scores[i];
+                    for j in 0..head_dim { attn_agg[hb + j] += w * vb[j]; }
+                }
             }
             let attn_out = self.matvec_weight(mem, &o_w_names, &attn_agg, h, h);
             let mut hidden2 = vec![0.0; h];
@@ -734,9 +769,20 @@ impl RealInference {
         self.sample_with_params(logits, 0.7, 0.9, 40, 1.1)
     }
 
-    /// Sampling com temperatura, top_p, top_k e repetition_penalty
+    /// Sampling com temperatura, top_p, top_k e repetition_penalty.
+    /// Overrides via env (padrões entre parênteses): M3_TEMP (0.7), M3_TOP_P
+    /// (0.9), M3_TOP_K (40), M3_REPPEN (1.1). Ex.: `M3_TEMP=0.3 M3_TOP_K=1`
+    /// para saída gulosa/determinística em modelos fracos.
     pub fn sample_with_params(&self, logits: &[f32], temp: f32, top_p: f32, top_k: usize, repeat_penalty: f32) -> u32 {
         if logits.is_empty() { return 0; }
+        let env_f = |k: &str, dflt: f32| {
+            std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(dflt)
+        };
+        let env_k = || {
+            std::env::var("M3_TOP_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(top_k)
+        };
+        let (temp, top_p, top_k, repeat_penalty) =
+            (env_f("M3_TEMP", temp), env_f("M3_TOP_P", top_p), env_k(), env_f("M3_REPPEN", repeat_penalty));
         // Repetition penalty estilo llama.cpp sobre os últimos 64 ids
         // (prompt + gerados, registrados via push_gen/extend_gen).
         let mut adj_logits = logits.to_vec();
@@ -817,7 +863,8 @@ impl RealInference {
         // BPE greedy longest-match sobre o vocab GGUF real.
         // Estilo: Qwen/GPT-2 usa Ġ (espaço) e Ċ (\n); SentencePiece usa ▁.
         // O pré-processamento traduz os separadores e o greedy resolve o resto
-        // (palavras com pontuação, especiais <|im_start|> etc. via lookup).
+        // (palavras com pontuação, especiais <｜User｜> etc. via lookup exato —
+        //  sem ids hardcoded: eles variam por arquivo, ex. 151643 é EOS aqui).
         let is_gpt2 = self.tokenizer.vocab.iter().any(|v| v.starts_with('Ġ'));
         let pre = if is_gpt2 {
             text.replace(' ', "Ġ").replace('\n', "Ċ")
@@ -905,24 +952,59 @@ impl RealInference {
     }
 
     pub fn format_chat(&self, user_text: &str) -> String {
-        // Usa template simples por arquitetura; ignora tokenizer.chat_template Jinja (muito grande)
+        // Usa template simples por arquitetura; ignora tokenizer.chat_template Jinja (muito grande).
+        // ATENÇÃO: literais de especiais variam por arquivo GGUF — aqui usamos os
+        // literais que existem NESTE vocab (ex. DeepSeek-R1-Distill-Qwen usa os
+        // fullwidth <｜User｜>/<｜Assistant｜>, não <|im_start|> ASCII).
+        // Se os marcadores não existirem no vocab (ex. TinyLlama Q4_K_M sem
+        // <|user|>), usa formato com palavras normais — emitir marcador
+        // fragmentado em peças envenena o prompt.
+        let has = |lit: &str| self.tokenizer.vocab.iter().any(|v| v == lit);
         match self.config.arch.as_str() {
             "qwen2" | "qwen" => {
-                // Qwen2 / DeepSeek: <|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n
-                format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", user_text)
+                // DeepSeek-R1-Distill-Qwen: <｜begin▁of▁sentence｜><｜User｜>{user}<｜Assistant｜>
+                // (bos=151646; geração termina em <｜end▁of▁sentence｜>=151643)
+                format!("<｜begin▁of▁sentence｜><｜User｜>{}<｜Assistant｜>", user_text)
             },
             "llama" | "tinyllama" => {
-                format!("<|user|>\n{}\n<|assistant|>\n", user_text)
+                // BOS (<s>) abre toda sequência Llama; sem ele o contexto sai
+                // da distribuição de treino. Marcadores <|user|> só se existirem.
+                if has("<|im_start|>") && has("<|im_end|>") {
+                    // SmolLM2 e similares: <|im_start|> também é BOS.
+                    format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", user_text)
+                } else if has("<|user|>") && has("<|assistant|>") {
+                    format!("<s><|user|>\n{}\n<|assistant|>\n", user_text)
+                } else {
+                    format!("<s>User: {}\nAssistant:", user_text)
+                }
             },
             _ => {
                 // Fallback genérico
                 if self.config.arch.contains("qwen") || self.config.arch.contains("deepseek") {
-                    format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", user_text)
+                    format!("<｜begin▁of▁sentence｜><｜User｜>{}<｜Assistant｜>", user_text)
+                } else if has("<|user|>") {
+                    format!("<s><|user|>\n{}\n<|assistant|>\n", user_text)
                 } else {
-                    format!("<|user|>\n{}\n<|assistant|>\n", user_text)
+                    format!("<s>User: {}\nAssistant:", user_text)
                 }
             }
         }
+    }
+
+    /// EOS deste arquivo: lê `tokenizer.ggml.eos_token_id` do KV, senão procura
+    /// literais conhecidos no vocab. `None` = gera até limite.
+    pub fn eos_id(&self) -> Option<u32> {
+        if let Some(s) = self.gguf.kv.get("tokenizer.ggml.eos_token_id") {
+            if let Ok(id) = s.parse::<u32>() {
+                return Some(id);
+            }
+        }
+        for lit in ["<｜end▁of▁sentence｜>", "<|im_end|>", "<|endoftext|>", "</s>"] {
+            if let Some(pos) = self.tokenizer.vocab.iter().position(|v| v == lit) {
+                return Some(pos as u32);
+            }
+        }
+        None
     }
 }
 
@@ -1010,6 +1092,70 @@ mod tests {
         let before: f32 = [1.0, 0.0, 3.0, 4.0].iter().map(|a| a * a).sum();
         let after: f32 = w.iter().map(|a| a * a).sum();
         assert!((before - after).abs() < 1e-5);
+    }
+    #[test]
+    fn test_repeat_penalty_dethrones() {
+        // Determinístico com top_k=1: sem histórico vence id 0; com id 0 no
+        // histórico e penalty 2.0, id 1 assume o topo.
+        let mem_mgr = crate::memory::MemoryManager::new_in_memory();
+        let _mem = crate::vm::MemBackend::Cpu(mem_mgr);
+        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
+        let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
+        let tok = crate::tokenizer::M3Tokenizer::mock();
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: HashMap::new(), gen_history: Vec::new() };
+        let logits = vec![2.0f32, 1.9];
+        assert_eq!(inf.sample_with_params(&logits, 1.0, 1.0, 1, 2.0), 0);
+        inf.push_gen(0);
+        assert_eq!(inf.sample_with_params(&logits, 1.0, 1.0, 1, 2.0), 1);
+    }
+    #[test]
+    fn test_tokenize_greedy_qwen_roundtrip() {
+        let gg_path = "./models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf";
+        if !std::path::Path::new(gg_path).exists() {
+            eprintln!("skip sem modelo");
+            return;
+        }
+        let inf = RealInference::new(gg_path).unwrap();
+        let ids = inf.tokenize("Hello, how are you?");
+        println!("ids: {:?}", ids);
+        // Qwen BPE: poucas peças (não explosão byte-a-byte), todas válidas
+        assert!(ids.len() < 20 && ids.len() >= 3, "len {}", ids.len());
+        assert!(ids.iter().all(|&i| (i as usize) < inf.tokenizer.vocab_size()));
+        let back = inf.tokenizer.decode_stream(&ids);
+        println!("roundtrip: {:?}", back);
+        assert!(back.contains("Hello"), "sem Hello: {:?}", back);
+        assert!(back.contains("you"), "sem you: {:?}", back);
+    }
+    #[test]
+    fn test_chat_template_uses_file_specials() {
+        // O template deve usar os especiais DESTE arquivo (fullwidth) e o
+        // greedy deve resolvê-los em 1 token cada — <|im_start|> ASCII não existe aqui.
+        let gg_path = "./models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf";
+        if !std::path::Path::new(gg_path).exists() {
+            eprintln!("skip sem modelo");
+            return;
+        }
+        let inf = RealInference::new(gg_path).unwrap();
+        let prompt = inf.format_chat("Hi");
+        println!("template: {:?}", prompt);
+        let ids = inf.tokenize(&prompt);
+        println!("template ids: {:?}", ids);
+        assert_eq!(ids.first().cloned(), Some(151646), "BOS");
+        assert!(ids.contains(&151644), "falta <｜User｜>: {:?}", ids);
+        assert_eq!(ids.last().cloned(), Some(151645), "Assistant no fim: {:?}", ids);
+        assert_eq!(inf.eos_id(), Some(151643));
+    }
+    #[test]
+    fn test_chat_template_plain_without_markers() {
+        // Vocab sem <|user|>/<|assistant|> (mock): template não deve emitir
+        // marcadores que fragmentariam em peças (caso TinyLlama Q4_K_M).
+        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
+        let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
+        let tok = crate::tokenizer::M3Tokenizer::mock();
+        let inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: HashMap::new(), gen_history: Vec::new() };
+        let prompt = inf.format_chat("Hi");
+        assert!(!prompt.contains("<|"), "marcador inexistente no template: {:?}", prompt);
+        assert!(prompt.contains("Hi"));
     }
     #[test]
     fn test_embedding_row_matches_full_matrix() {

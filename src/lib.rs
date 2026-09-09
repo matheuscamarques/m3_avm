@@ -16,6 +16,7 @@ pub mod quant;
 pub mod inference;
 pub mod matvec;
 pub mod matvec_quant;
+pub mod tui;
 pub mod utils;
 pub mod vm;
 

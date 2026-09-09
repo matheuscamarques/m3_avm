@@ -21,10 +21,10 @@ fn rss_mb() -> usize {
 }
 
 fn main() -> anyhow::Result<()> {
-    let path = "./models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf";
-    let mut inf = RealInference::new(path)?;
+    let path = std::env::args().nth(1).unwrap_or_else(|| "./models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf".to_string());
+    let mut inf = RealInference::new(&path)?;
     let mut mem_mgr = MemoryManager::new_in_memory();
-    mem_mgr.load_gguf_model(path)?;
+    mem_mgr.load_gguf_model(&path)?;
     let mem = MemBackend::Cpu(mem_mgr);
     eprintln!("[bench] rss após mmap: {} MiB", rss_mb());
 

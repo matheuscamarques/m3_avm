@@ -39,10 +39,16 @@ impl M3Tokenizer {
         if raw.starts_with("<|") && raw.ends_with("|>") {
             return raw;
         }
-        // Byte fallback GGUF <0xNN> -> char correspondente
+        // Byte fallback GGUF <0xNN> -> char correspondente, exceto os que não
+        // formam texto (bytes altos soltos): mostra � (padrão Unicode) em vez
+        // de glifos latinos enganosos como ðŁĺ.
         if raw.len() == 6 && raw.starts_with("<0x") && raw.ends_with('>') {
             if let Ok(b) = u8::from_str_radix(&raw[3..5], 16) {
-                return (b as char).to_string();
+                let c = b as char;
+                if c.is_alphanumeric() || c.is_ascii_punctuation() || c == ' ' {
+                    return c.to_string();
+                }
+                return "\u{FFFD}".to_string();
             }
         }
         // GPT-2/Qwen: Ġ = espaço, Ċ = newline

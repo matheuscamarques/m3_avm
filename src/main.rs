@@ -25,6 +25,7 @@ pub mod quant;
 pub mod inference;
 pub mod matvec;
 pub mod matvec_quant;
+pub mod tui;
 pub mod utils;
 pub mod vm;
 pub mod memory_wgpu;
@@ -790,22 +791,9 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
 }
 
 async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealInference, max_steps: u64, trace: bool) -> Result<(vm::VmStats, vm::Vm)> {
-    use std::io::{self, Write};
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdin.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {},
-                Err(_) => break,
-            }
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() { let _ = tx.send(trimmed); }
-        }
-    });
+    // REPL com linha de input fixa (tty) ou passthrough (pipe): output da LLM
+    // nunca se mistura com o que está sendo digitado.
+    let mut repl = tui::Repl::new()?;
     let bus = Bus::new();
     let mut is_generating = false;
     let mut output_buffer: Vec<String> = Vec::new();
@@ -816,16 +804,16 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
     let mut current_token: u32 = 0;
     let mut token_queue: Vec<u32> = Vec::new(); // tokens do prompt inicial a serem consumidos
 
-    println!("[Real] Aguardando prompt inicial — digite e ENTER");
+    repl.print_line("[Real] Aguardando prompt inicial — digite e ENTER (Ctrl+C sai)")?;
 
     loop {
-        if max_steps != 0 && steps >= max_steps { println!("\n[max_steps {} atingido]", max_steps); break; }
+        if max_steps != 0 && steps >= max_steps { repl.print_line("[max_steps atingido]")?; break; }
 
         // SENSE implícito
-        match rx.try_recv() {
-            Ok(new_prompt) => {
+        match repl.try_poll() {
+            tui::Input::Line(new_prompt) => {
                 if is_generating {
-                    println!("\n[Real Interrupção: \"{}\"]", new_prompt);
+                    repl.print_line(&format!("[Real Interrupção: \"{}\"]", new_prompt))?;
                     if !checkpoints.is_empty() {
                         let target_idx = crate::rollback::determine_target_token_index(&entropy_tracker, output_buffer.len());
                         let cp = checkpoints.iter().rev().find(|c| c.token_idx <= target_idx).copied().or_else(|| checkpoints.first().copied());
@@ -833,7 +821,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                             let t0 = crate::utils::now_ns();
                             let _ = vm.memory.restore(ver);
                             let dt = (crate::utils::now_ns() - t0)/1000;
-                            println!("[Real Rollback CoW {}µs para v{} — truncando {}->{} tok (target {} via V1)]", dt, ver, output_buffer.len(), tok_idx, target_idx);
+                            repl.print_line(&format!("[Real Rollback CoW {}µs para v{} — truncando {}->{} tok (target {} via V1)]", dt, ver, output_buffer.len(), tok_idx, target_idx))?;
                             output_buffer.truncate(tok_idx);
                             entropy_tracker.clear();
                             checkpoints.retain(|c| c.token_idx <= tok_idx);
@@ -845,14 +833,13 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                             // Tokeniza novo prompt e prefill sobre KV truncado
                             let prompt_fmt = if new_prompt.contains("<|im_start|>") || new_prompt.contains("<|user|>") { new_prompt.clone() } else { real.format_chat(&new_prompt) };
                             let prompt_tokens = real.tokenize(&prompt_fmt);
-                            println!("[Real] Interrupção tokenizada: {} tokens, prefill sobre KV truncado", prompt_tokens.len());
+                            repl.print_line(&format!("[Real] Interrupção tokenizada: {} tokens, prefill sobre KV truncado", prompt_tokens.len()))?;
                             match real.prefill_logits(&vm.memory, &prompt_tokens) {
                                 Ok(logits) => {
                                     let next = real.sample_with_params(&logits, 0.7, 0.9, 40, 1.1);
                                     current_token = next;
                                     let text = real.tokenizer.decode_human(next).replace('▁', " ");
-                                    print!("{}", text);
-                                    let _ = io::stdout().flush();
+                                    repl.print_output(&text)?;
                                     output_buffer.push(text.trim().to_string());
                                     let entropy = crate::rollback::compute_entropy(&logits);
                                     entropy_tracker.push(output_buffer.len()-1, entropy);
@@ -868,7 +855,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                         }
                     } else {
                         let _ = vm.memory.temporal_push(new_prompt.as_bytes());
-                        println!("[Real Sem checkpoint — prompt injetado]");
+                        repl.print_line("[Real Sem checkpoint — prompt injetado]")?;
                         let prompt_fmt = if new_prompt.contains("<|im_start|>") || new_prompt.contains("<|user|>") { new_prompt.clone() } else { real.format_chat(&new_prompt) };
                         let prompt_tokens = real.tokenize(&prompt_fmt);
                         real.clear_kv_cache();
@@ -878,8 +865,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                                 let next = real.sample_with_params(&logits, 0.7, 0.9, 40, 1.1);
                                 current_token = next;
                                 let text = real.tokenizer.decode_human(next).replace('▁', " ");
-                                print!("{}", text);
-                                let _ = io::stdout().flush();
+                                repl.print_output(&text)?;
                                 output_buffer.push(text.trim().to_string());
                                 token_queue.clear();
                             },
@@ -890,11 +876,11 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                         }
                     }
                 } else {
-                    println!("\n[Real Iniciando com prompt: \"{}\"]", new_prompt);
+                    repl.print_line(&format!("[Real Iniciando com prompt: \"{}\"]", new_prompt))?;
                     let _ = vm.memory.temporal_push(new_prompt.as_bytes());
                     let prompt_fmt = if new_prompt.contains("<|im_start|>") || new_prompt.contains("<|user|>") { new_prompt.clone() } else { real.format_chat(&new_prompt) };
                     let prompt_tokens = real.tokenize(&prompt_fmt);
-                    println!("[Real] Prompt tokenizado: {} tokens", prompt_tokens.len());
+                    repl.print_line(&format!("[Real] Prompt tokenizado: {} tokens", prompt_tokens.len()))?;
                     is_generating = true;
                     output_buffer.clear();
                     checkpoints.clear();
@@ -907,7 +893,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                         match real.prefill_logits(&vm.memory, &prompt_tokens) {
                             Ok(logits) => {
                                 let dt = (crate::utils::now_ns() - prefill_start)/1_000_000;
-                                println!("[Real] Prefill {} tokens em {}ms", prompt_tokens.len(), dt);
+                                repl.print_line(&format!("[Real] Prefill {} tokens em {}ms", prompt_tokens.len(), dt))?;
                                 // Amostra primeiro token após prompt
                                 let next = real.sample_with_params(&logits, 0.7, 0.9, 40, 1.1);
                                 current_token = next;
@@ -915,8 +901,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                                 // Decodifica e imprime primeiro token gerado imediatamente
                                 let text = real.tokenizer.decode_human(next);
                                 let clean = text.replace('▁', " ");
-                                print!("{}", clean);
-                                let _ = io::stdout().flush();
+                                repl.print_output(&clean)?;
                                 output_buffer.push(clean.trim().to_string());
                                 let entropy = crate::rollback::compute_entropy(&logits);
                                 entropy_tracker.push(0, entropy);
@@ -937,11 +922,15 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                     checkpoints.push(Checkpoint{ version: ver, token_idx: 0 });
                 }
             },
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            tui::Input::Eof => {
                 if !is_generating && output_buffer.is_empty() { break; }
-                // Se desconectou durante geração, continua até acabar ou max_steps
+                // Se EOF durante geração, continua até acabar ou max_steps
             },
-            Err(std::sync::mpsc::TryRecvError::Empty) => {},
+            tui::Input::Interrupt => {
+                repl.print_line("[interrompido via Ctrl+C — encerrando]")?;
+                break;
+            },
+            tui::Input::Empty => {},
         }
 
         if !is_generating {
@@ -964,13 +953,17 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
             }
             // último token do prompt: amostra próximo token diretamente dos logits
             let next = real.sample_with_params(&logits, 0.7, 0.9, 40, 1.1);
+            if Some(next) == real.eos_id() {
+                repl.print_line("[Real EOS — fim da resposta]")?;
+                is_generating = false;
+                continue;
+            }
             let text = real.tokenizer.decode_human(next).replace('▁', " ");
             if text.starts_with(' ') && !output_buffer.is_empty() && output_buffer.last().map(|s| s.ends_with(' ')).unwrap_or(false) {
-                print!("{}", text.trim_start());
+                repl.print_output(text.trim_start())?;
             } else {
-                print!("{}", text);
+                repl.print_output(&text)?;
             }
-            let _ = io::stdout().flush();
             output_buffer.push(text.trim().to_string());
             let entropy = crate::rollback::compute_entropy(&logits);
             entropy_tracker.push(output_buffer.len()-1, entropy);
@@ -994,19 +987,15 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
         };
         real.push_gen(token_to_feed);
         let next_token = real.sample_with_params(&logits, 0.7, 0.9, 40, 1.1);
+        if Some(next_token) == real.eos_id() {
+            repl.print_line("[Real EOS — fim da resposta]")?;
+            is_generating = false;
+            continue;
+        }
         let text_raw = real.tokenizer.decode_human(next_token);
         let text = text_raw.replace('▁', " ");
         // Streaming humano: não adiciona " " manual, ▁ já é espaço; evita duplicar
-        if text.starts_with(' ') && !output_buffer.is_empty() {
-            // Se texto começa com espaço, já temos separador
-            print!("{}", text);
-        } else if !output_buffer.is_empty() && !text.starts_with(' ') && !text.starts_with('\n') {
-            // Sem espaço, mas é continuação — imprime direto (ex: "token" após "Olá")
-            print!("{}", text);
-        } else {
-            print!("{}", text);
-        }
-        let _ = io::stdout().flush();
+        repl.print_output(&text)?;
         output_buffer.push(text.trim().to_string());
         let entropy = crate::rollback::compute_entropy(&logits);
         entropy_tracker.push(output_buffer.len()-1, entropy);
@@ -1026,7 +1015,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
 
         if vm.stats.steps >= max_steps { break; }
         // Se output_buffer muito grande, pausa
-        if output_buffer.len() > 200 { println!("\n[Real 200 tokens gerados — pausando, digite novo prompt ou Ctrl+C]"); is_generating = false; }
+        if output_buffer.len() > 200 { repl.print_line("[Real 200 tokens gerados — pausando, digite novo prompt ou Ctrl+C]")?; is_generating = false; }
     }
     Ok((vm.stats.clone(), vm))
 }

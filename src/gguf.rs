@@ -107,16 +107,24 @@ impl GgufFile {
                 if vtype==8 {
                     let v = read_string(&mut f)?;
                     kv.insert(key, v);
-                } else if vtype==4 || vtype==5 || vtype==10 || vtype==11 {
-                    // U32/I32/U64/I64 — lê e guarda como string
+                } else if vtype<=7 || vtype==10 || vtype==11 || vtype==12 {
+                    // Escalares numéricos com sinal correto (F32/F64 inclusive:
+                    // rope theta, eps etc. dependem disso!)
                     let val = match vtype {
-                        4 => read_u32_le(&mut f)? as u64,
-                        5 => { let mut b=[0u8;4]; f.read_exact(&mut b)?; u32::from_le_bytes(b) as u64 },
-                        10=> read_u64_le(&mut f)?,
-                        11=> { let mut b=[0u8;8]; f.read_exact(&mut b)?; u64::from_le_bytes(b) },
-                        _=>0,
+                        0 => { let mut b=[0u8;1]; f.read_exact(&mut b).map_err(|e| anyhow!("read U8: {}", e))?; (b[0] as f64).to_string() },
+                        1 => { let mut b=[0u8;1]; f.read_exact(&mut b).map_err(|e| anyhow!("read I8: {}", e))?; ((b[0] as i8) as f64).to_string() },
+                        2 => { let mut b=[0u8;2]; f.read_exact(&mut b).map_err(|e| anyhow!("read U16: {}", e))?; (u16::from_le_bytes(b) as f64).to_string() },
+                        3 => { let mut b=[0u8;2]; f.read_exact(&mut b).map_err(|e| anyhow!("read I16: {}", e))?; ((i16::from_le_bytes(b)) as f64).to_string() },
+                        4 => (read_u32_le(&mut f)? as f64).to_string(),
+                        5 => { let mut b=[0u8;4]; f.read_exact(&mut b).map_err(|e| anyhow!("read I32: {}", e))?; (i32::from_le_bytes(b) as f64).to_string() },
+                        6 => { let mut b=[0u8;4]; f.read_exact(&mut b).map_err(|e| anyhow!("read F32: {}", e))?; f32::from_le_bytes(b).to_string() },
+                        7 => { let mut b=[0u8;1]; f.read_exact(&mut b).map_err(|e| anyhow!("read bool: {}", e))?; (b[0] != 0).to_string() },
+                        10=> read_u64_le(&mut f)?.to_string(),
+                        11=> { let mut b=[0u8;8]; f.read_exact(&mut b).map_err(|e| anyhow!("read I64: {}", e))?; (i64::from_le_bytes(b)).to_string() },
+                        12=> { let mut b=[0u8;8]; f.read_exact(&mut b).map_err(|e| anyhow!("read F64: {}", e))?; f64::from_le_bytes(b).to_string() },
+                        _=> unreachable!(),
                     };
-                    kv.insert(key, val.to_string());
+                    kv.insert(key, val);
                 } else {
                     skip_value(&mut f, vtype)?;
                     kv.insert(key, format!("type{}", vtype));
@@ -154,6 +162,11 @@ impl GgufFile {
     pub fn tensors_by_dtype(&self, dtype: u32) -> Vec<&GgufTensorInfo> {
         self.tensors.iter().filter(|t| t.dtype==dtype).collect()
     }
+
+    /// Lê escalar F32 do KV com default (freq_base, eps etc. dependem disso).
+    pub fn kv_f32(&self, key: &str, default: f32) -> f32 {
+        self.kv.get(key).and_then(|v| v.parse::<f32>().ok()).unwrap_or(default)
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +185,20 @@ mod tests {
         } else {
             eprintln!("skip tinyllama f32 not downloaded");
         }
+    }
+    #[test]
+    fn test_gguf_f32_kv_parsed_not_type6() {
+        // Regressão: F32 do KV (rope theta, eps) era descartado como "type6",
+        // e o SmolLM2 (theta 130000) herdava default 10000 em silêncio.
+        let path = "./models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip sem modelo");
+            return;
+        }
+        let gg = GgufFile::open(path).unwrap();
+        let theta = gg.kv_f32("llama.rope.freq_base", 10000.0);
+        println!("smol theta kv = {}", theta);
+        assert!((theta - 130000.0).abs() < 1.0, "theta {}", theta);
     }
     #[test]
     fn test_gguf_deepseek_q4_header() {

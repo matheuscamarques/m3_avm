@@ -8,7 +8,7 @@
 //! - `matvec_faer`: SIMD via `faer`.
 //! - `matvec`: dispatcher padrão (faer, com fallback ndarray em shape mismatch).
 
-use faer::{col as fcol, mat as fmat, MatRef, RowRef};
+use faer::{col as fcol, mat as fmat};
 use ndarray::ShapeBuilder;
 
 /// Fallback para shape mismatch (mesma semântica do baseline em inference.rs).
