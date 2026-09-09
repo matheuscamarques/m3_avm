@@ -148,6 +148,26 @@ impl ModelConfig {
     }
 }
 
+/// Nomes de tensores de uma camada resolvidos 1× no `new()` (P0.1).
+/// `None` = tensor ausente (caminho dummy, como antes). Guardar o índice no
+/// `gguf.tensors` elimina `format!` + `Vec<String>` + busca linear (339 nomes)
+/// a cada um dos ~154 acessos por token.
+#[derive(Debug, Clone, Default)]
+pub struct LayerNames {
+    pub q: Option<usize>,
+    pub k: Option<usize>,
+    pub v: Option<usize>,
+    pub o: Option<usize>,
+    pub gate: Option<usize>,
+    pub up: Option<usize>,
+    pub down: Option<usize>,
+    pub attn_norm: Option<usize>,
+    pub ffn_norm: Option<usize>,
+    pub qbias: Option<usize>,
+    pub kbias: Option<usize>,
+    pub vbias: Option<usize>,
+}
+
 pub struct RealInference {
     pub config: ModelConfig,
     pub tokenizer: M3Tokenizer,
@@ -157,9 +177,13 @@ pub struct RealInference {
     pub kv_cache_k: Vec<Vec<f32>>,
     pub kv_cache_v: Vec<Vec<f32>>,
     // Cache de pesos dequantizados (Fase 2.1) — evita 197 dequants/token
-    weight_cache: HashMap<String, std::sync::Arc<Vec<f32>>>,
+    weight_cache: fxhash::FxHashMap<String, std::sync::Arc<Vec<f32>>>,
     // Histórico de ids gerados (+prompt) para repetition penalty real
     gen_history: Vec<u32>,
+    // P0.1: nomes resolvidos por camada (índice em gguf.tensors)
+    layer_names: Vec<LayerNames>,
+    // P0.2: profiler lido 1× (env M3_PROFILE), não por token
+    profile: bool,
 }
 
 impl RealInference {
@@ -169,7 +193,49 @@ impl RealInference {
         let tok = M3Tokenizer::from_gguf_or_mock(gguf_path);
         eprintln!("[inference] config {:?} vocab {} tensors {}", cfg, tok.vocab_size(), gg.n_tensors);
         let n_layers = cfg.n_layers;
-        Ok(Self { config: cfg, tokenizer: tok, gguf: gg, gguf_path: gguf_path.to_string(), kv_cache_k: vec![Vec::new(); n_layers], kv_cache_v: vec![Vec::new(); n_layers], weight_cache: HashMap::new(), gen_history: Vec::new() })
+        let profile = std::env::var("M3_PROFILE").map(|v| v == "1").unwrap_or(false);
+        let mut inf = Self { config: cfg, tokenizer: tok, gguf: gg, gguf_path: gguf_path.to_string(), kv_cache_k: vec![Vec::new(); n_layers], kv_cache_v: vec![Vec::new(); n_layers], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile };
+        inf.resolve_layer_names();
+        Ok(inf)
+    }
+
+    /// P0.1: resolve 1× qual candidato existe por (camada, kind). Idempotente;
+    /// chamada de novo se `n_layers` mudar (mesmo padrão do resize de KV).
+    fn resolve_layer_names(&mut self) {
+        let mut out = Vec::with_capacity(self.config.n_layers);
+        for blk in 0..self.config.n_layers {
+            let mut ln = LayerNames::default();
+            let mut resolve = |kind: &str| -> Option<usize> {
+                for name in self.config.try_get_tensor_names(blk, kind) {
+                    if let Some(pos) = self.gguf.tensors.iter().position(|t| t.name == name) {
+                        return Some(pos);
+                    }
+                }
+                None
+            };
+            ln.q = resolve("q");
+            ln.k = resolve("k");
+            ln.v = resolve("v");
+            ln.o = resolve("o");
+            ln.gate = resolve("gate");
+            ln.up = resolve("up");
+            ln.down = resolve("down");
+            ln.attn_norm = resolve("attn_norm");
+            ln.ffn_norm = resolve("ffn_norm");
+            ln.qbias = resolve("qbias");
+            ln.kbias = resolve("kbias");
+            ln.vbias = resolve("vbias");
+            out.push(ln);
+        }
+        self.layer_names = out;
+    }
+
+    /// Acesso seguro (testes constroem sem `new()`; resolve sob demanda).
+    fn layer_name(&mut self, blk: usize, f: impl Fn(&LayerNames) -> Option<usize>) -> Option<usize> {
+        if self.layer_names.len() != self.config.n_layers {
+            self.resolve_layer_names();
+        }
+        self.layer_names.get(blk).and_then(f)
     }
     /// Histórico p/ repetition penalty: registra prompt + gerados
     pub fn push_gen(&mut self, id: u32) { self.gen_history.push(id); }
@@ -191,43 +257,40 @@ impl RealInference {
         for v in &mut self.kv_cache_v { v.truncate(seq_len * h); }
     }
 
-    /// Repete KV heads para GQA (n_kv_heads < n_heads) — expande kv_hidden para hidden
-    fn repeat_kv(kv_small: &[f32], n_heads: usize, n_kv_heads: usize, head_dim: usize) -> Vec<f32> {
+    /// Repete KV heads para GQA (n_kv_heads < n_heads) — expande kv_hidden para hidden.
+    /// P1.3: estende direto no destino (KV cache), sem Vec temporário.
+    fn repeat_kv_extend(dst: &mut Vec<f32>, kv_small: &[f32], n_heads: usize, n_kv_heads: usize, head_dim: usize) {
+        let hidden = n_heads * head_dim;
+        if kv_small.is_empty() {
+            dst.resize(dst.len() + hidden, 0.0);
+            return;
+        }
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             // fallback: repete simples até preencher hidden
-            let hidden = n_heads * head_dim;
-            let mut out = Vec::with_capacity(hidden);
-            while out.len() < hidden {
-                let need = hidden - out.len();
-                out.extend_from_slice(&kv_small[..need.min(kv_small.len())]);
+            let mut n = 0;
+            while n < hidden {
+                let take = (hidden - n).min(kv_small.len());
+                dst.extend_from_slice(&kv_small[..take]);
+                n += take;
             }
-            return out;
+            return;
         }
         let groups = n_heads / n_kv_heads;
-        let mut out = Vec::with_capacity(n_heads * head_dim);
         for kv_idx in 0..n_kv_heads {
-            let src = &kv_small[kv_idx*head_dim..(kv_idx+1)*head_dim];
+            let src = &kv_small[kv_idx * head_dim..(kv_idx + 1) * head_dim];
             for _ in 0..groups {
-                out.extend_from_slice(src);
+                dst.extend_from_slice(src);
             }
         }
-        out
     }
 
-    /// Lê tensor do GGUF via MemBackend (mmap PERSISTENTE) e dequantiza se Q4_K/Q6_K
-    /// Fase 2.1: usa weight_cache (HashMap<String, Arc<Vec<f32>>>) para evitar 197 dequants/token
-    fn read_tensor_f32(&self, mem: &crate::vm::MemBackend, name: &str) -> Result<Vec<f32>> {
-        // Checa cache primeiro (sem lock, &self mas interior mutability via cache é &mut na prática)
-        // Para manter &self, usamos try: se estiver em cache, clona Arc
-        if let Some(cached) = self.weight_cache.get(name) {
-            return Ok((**cached).clone());
-        }
-        let info = self.gguf.find_tensor(name).ok_or_else(|| anyhow!("tensor {} não encontrado", name))?;
-        let n = info.n_elements;
-        let file_offset = self.gguf.data_offset + info.offset;
+    /// Núcleo compartilhado: lê bytes do tensor e dequantiza (Fase 2.1).
+    /// Extraído de `read_tensor_f32` para reuso pelo caminho por índice (P0.1).
+    fn dequant_by_info(&self, mem: &crate::vm::MemBackend, dtype: u32, n: usize, offset: u64, name: &str) -> Result<Vec<f32>> {
+        let file_offset = self.gguf.data_offset + offset;
         let paddr = crate::memory::make_persistent_addr(file_offset as u128);
         // Calcula byte_len via dtype; para Q6_K usa 210 por 256, para Q8_0 34 por 32, etc.
-        let raw_len = match DType::from_u32(info.dtype) {
+        let raw_len = match DType::from_u32(dtype) {
             DType::F32 => n*4,
             DType::F16 => n*2,
             DType::Q4_K | DType::Q5_K => (n/256)*144,
@@ -238,14 +301,14 @@ impl RealInference {
                 // fallback: estima via próximo tensor offset se disponível
                 let mut next_off = None;
                 for t in &self.gguf.tensors {
-                    if t.offset > info.offset {
+                    if t.offset > offset {
                         if next_off.is_none() || t.offset < next_off.unwrap() {
                             next_off = Some(t.offset);
                         }
                     }
                 }
                 if let Some(no) = next_off {
-                    (no - info.offset) as usize
+                    (no - offset) as usize
                 } else {
                     n*4
                 }
@@ -253,28 +316,86 @@ impl RealInference {
         };
         let raw = mem.read(paddr, raw_len)?;
         let mut dst = vec![0.0f32; n];
-        let ok = crate::quant::dequantize(&raw, info.dtype, &mut dst, n);
+        let ok = crate::quant::dequantize(&raw, dtype, &mut dst, n);
         if !ok {
             // fallback: tenta interpretar como F32 LE se dequant não suportado
             for i in 0..n.min(raw.len()/4) {
                 dst[i] = f32::from_le_bytes([raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3]]);
             }
             // se ainda falhar e for quantizado, loga
-            if DType::from_u32(info.dtype).is_quantized() {
-                eprintln!("[quant] aviso: dequant fallback F32 para dtype {} tensor {}", info.dtype, name);
+            if DType::from_u32(dtype).is_quantized() {
+                eprintln!("[quant] aviso: dequant fallback F32 para dtype {} tensor {}", dtype, name);
             }
         }
         Ok(dst)
     }
-    /// Versão com cache interior mutável (usada no loop para evitar clone desnecessário)
-    fn read_tensor_f32_cached(&mut self, mem: &crate::vm::MemBackend, name: &str) -> Result<std::sync::Arc<Vec<f32>>> {
+
+    /// Lê tensor do GGUF via MemBackend (mmap PERSISTENTE) e dequantiza se Q4_K/Q6_K
+    /// Fase 2.1: usa weight_cache (FxHashMap<String, Arc<Vec<f32>>>) para evitar 197 dequants/token
+    fn read_tensor_f32(&self, mem: &crate::vm::MemBackend, name: &str) -> Result<Vec<f32>> {
+        // Checa cache primeiro (sem lock, &self mas interior mutability via cache é &mut na prática)
+        // Para manter &self, usamos try: se estiver em cache, clona Arc
         if let Some(cached) = self.weight_cache.get(name) {
+            return Ok((**cached).clone());
+        }
+        let info = self.gguf.find_tensor(name).ok_or_else(|| anyhow!("tensor {} não encontrado", name))?;
+        self.dequant_by_info(mem, info.dtype, info.n_elements, info.offset, name)
+    }
+    /// Versão por nome (embedding fallback, LM head: 1×/token, sem hot loop).
+    /// Delega ao caminho por índice.
+    fn read_tensor_f32_cached(&mut self, mem: &crate::vm::MemBackend, name: &str) -> Result<std::sync::Arc<Vec<f32>>> {
+        let idx = self.gguf.tensors.iter().position(|t| t.name == name)
+            .ok_or_else(|| anyhow!("tensor {} não encontrado", name))?;
+        self.read_tensor_f32_cached_idx(mem, idx)
+    }
+
+    /// Versão por índice pré-resolvido (P0.1): hit sem nenhuma alocação
+    /// (chave &str emprestada); miss clona o nome 1× para inserir.
+    fn read_tensor_f32_cached_idx(&mut self, mem: &crate::vm::MemBackend, idx: usize) -> Result<std::sync::Arc<Vec<f32>>> {
+        let key: &str = self.gguf.tensors.get(idx).map(|t| t.name.as_str()).unwrap_or("");
+        if let Some(cached) = self.weight_cache.get(key) {
             return Ok(cached.clone());
         }
-        let v = self.read_tensor_f32(mem, name)?;
+        let info = self.gguf.tensors.get(idx).ok_or_else(|| anyhow!("tensor idx {} inválido", idx))?;
+        let (dtype, n, offset, name) = (info.dtype, info.n_elements, info.offset, info.name.clone());
+        let v = self.dequant_by_info(mem, dtype, n, offset, &name)?;
         let arc = std::sync::Arc::new(v);
-        self.weight_cache.insert(name.to_string(), arc.clone());
+        self.weight_cache.insert(name, arc.clone());
         Ok(arc)
+    }
+
+    /// Matvec por índice pré-resolvido (P0.1): kernel direto sobre bytes GGUF
+    /// quando possível; senão cache f32 + faer. `None` = tensor ausente
+    /// (testes sem modelo) → dot sobre dummy 0.5, paridade legada.
+    fn matvec_weight_pre(&mut self, mem: &crate::vm::MemBackend, tidx: Option<usize>, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
+        if let Some(idx) = tidx {
+            if let Some(info) = self.gguf.tensors.get(idx) {
+                let (dtype, n, offset) = (info.dtype, info.n_elements, info.offset);
+                if n == in_dim * out_dim {
+                    if let Some(raw_len) = crate::matvec_quant::quant_raw_len(dtype, n) {
+                        let file_offset = self.gguf.data_offset + offset;
+                        if let Some(raw) = mem.read_model_raw(file_offset, raw_len) {
+                            if let Some(y) = crate::matvec_quant::matvec_quant(x, raw, dtype, in_dim, out_dim) {
+                                return y;
+                            }
+                        } else {
+                            let paddr = crate::memory::make_persistent_addr(file_offset as u128);
+                            if let Ok(raw) = mem.read(paddr, raw_len) {
+                                if let Some(y) = crate::matvec_quant::matvec_quant(x, &raw, dtype, in_dim, out_dim) {
+                                    return y;
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(w) = self.read_tensor_f32_cached_idx(mem, idx) {
+                        return crate::matvec::matvec(x, &w[..], in_dim, out_dim);
+                    }
+                } else if let Ok(w) = self.read_tensor_f32_cached_idx(mem, idx) {
+                    return crate::matvec::matvec(x, &w[..], in_dim, out_dim);
+                }
+            }
+        }
+        crate::matvec::matvec(x, &vec![0.5; in_dim * out_dim], in_dim, out_dim)
     }
     /// Tenta múltiplos nomes (HF vs GGUF) até achar um tensor (sem cache)
     fn read_tensor_f32_try(&self, mem: &crate::vm::MemBackend, names: &[String]) -> Result<Vec<f32>> {
@@ -287,78 +408,27 @@ impl RealInference {
         }
         Err(last_err.unwrap_or_else(|| anyhow!("tensor {:?} não encontrado", names)))
     }
-    /// Versão com cache (Fase 2.1) — evita 197 dequants/token, ~6× ganho
-    fn read_tensor_f32_try_cached(&mut self, mem: &crate::vm::MemBackend, names: &[String]) -> Result<std::sync::Arc<Vec<f32>>> {
-        for n in names {
-            if let Some(cached) = self.weight_cache.get(n) {
-                return Ok(cached.clone());
-            }
-            if self.gguf.find_tensor(n).is_some() {
-                // achou, dequantiza e cacheia
-                let v = self.read_tensor_f32(mem, n)?;
-                let arc = std::sync::Arc::new(v);
-                self.weight_cache.insert(n.clone(), arc.clone());
-                return Ok(arc);
-            }
-        }
-        // tenta qualquer nome da lista e retorna erro do último
-        let mut last_err = None;
-        for n in names {
-            match self.read_tensor_f32(mem, n) {
-                Ok(v) => {
-                    let arc = std::sync::Arc::new(v);
-                    self.weight_cache.insert(n.clone(), arc.clone());
-                    return Ok(arc);
-                },
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("tensor {:?} não encontrado", names)))
+    // REMOVIDO (P0.1): `read_tensor_f32_try_cached(names)` superseded por
+    // `read_tensor_f32_cached_idx` + `LayerNames` (resolve_layer_names).
+    /// Atalho P0.1: peso de camada por índice (sem Vec/format/find por token).
+    fn matvec_layer(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&LayerNames) -> Option<usize>, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
+        let idx = self.layer_name(blk, f);
+        self.matvec_weight_pre(mem, idx, x, in_dim, out_dim)
     }
-    /// Matvec com bypass int4 (Fase 3.2): tenta kernel direto sobre os bytes GGUF
-    /// (1 pass fundido, sem dequant full nem clone de cache); senão cai para
-    /// cache f32 + faer. Tensor ausente → dot sobre dummy 0.5 (paridade legada
-    /// com os testes sem modelo).
-    fn matvec_weight(&mut self, mem: &crate::vm::MemBackend, names: &[String], x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
-        let meta = {
-            let mut found = None;
-            for name in names {
-                if let Some(info) = self.gguf.find_tensor(name) {
-                    found = Some((info.dtype, info.n_elements, info.offset));
-                    break;
-                }
-            }
-            found
-        };
-        if let Some((dtype, n, offset)) = meta {
-            if n == in_dim * out_dim {
-                // Caminho rápido: kernel direto (Q4_K/Q6_K/Q4_0/Q8_0).
-                // Zero-copy do mmap primeiro; `read` (cópia) como fallback.
-                if let Some(raw_len) = crate::matvec_quant::quant_raw_len(dtype, n) {
-                    let file_offset = self.gguf.data_offset + offset;
-                    if let Some(raw) = mem.read_model_raw(file_offset, raw_len) {
-                        if let Some(y) = crate::matvec_quant::matvec_quant(x, raw, dtype, in_dim, out_dim) {
-                            return y;
-                        }
-                    } else {
-                        let paddr = crate::memory::make_persistent_addr(file_offset as u128);
-                        if let Ok(raw) = mem.read(paddr, raw_len) {
-                            if let Some(y) = crate::matvec_quant::matvec_quant(x, &raw, dtype, in_dim, out_dim) {
-                                return y;
-                            }
-                        }
-                    }
-                }
-                // Fallback f32 (F32/F16, kernel None ou raw curto)
-                if let Ok(w) = self.read_tensor_f32_try_cached(mem, names) {
-                    return crate::matvec::matvec(x, &w[..], in_dim, out_dim);
-                }
-            } else if let Ok(w) = self.read_tensor_f32_try_cached(mem, names) {
-                // Shape inesperado: preserva fallback-mismatch legado via matvec
-                return crate::matvec::matvec(x, &w[..], in_dim, out_dim);
+
+    /// Atalho P0.1: vetor de camada (norms/bias) por índice, com dummy.
+    fn cached_layer_vec(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&LayerNames) -> Option<usize>, dummy: Vec<f32>) -> std::sync::Arc<Vec<f32>> {
+        if let Some(idx) = self.layer_name(blk, f) {
+            if let Ok(w) = self.read_tensor_f32_cached_idx(mem, idx) {
+                return w;
             }
         }
-        crate::matvec::matvec(x, &vec![0.5; in_dim * out_dim], in_dim, out_dim)
+        std::sync::Arc::new(dummy)
+    }
+
+    /// Variante Option (bias: ausente = skip, sem dummy).
+    fn cached_layer_opt(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&LayerNames) -> Option<usize>) -> Option<std::sync::Arc<Vec<f32>>> {
+        self.layer_name(blk, f).and_then(|idx| self.read_tensor_f32_cached_idx(mem, idx).ok())
     }
 
     /// Linha `row` de matriz [rows, hidden] row-major sem dequantizar tudo.
@@ -416,8 +486,8 @@ impl RealInference {
     ///   - attn_out = Σ_i w_i * V_cache[i]
     /// Isso garante O(seq_len) por camada com memória O(layers*seq_len*hidden) = 1GiB lógico
     pub fn forward_one(&mut self, mem: &crate::vm::MemBackend, token_id: u32) -> Result<Vec<f32>> {
-        // Profiler opcional via env M3_PROFILE=1 (fases em ms, sem custo quando off)
-        let profile = std::env::var("M3_PROFILE").map(|v| v == "1").unwrap_or(false);
+        // Profiler opcional (P0.2: flag lida 1× no new(), sem syscall por token)
+        let profile = self.profile;
         let mut t_matvec = 0u128;
         let mut t_attn = 0u128;
         let mut t_norm_ffn = 0u128;
@@ -454,6 +524,8 @@ impl RealInference {
         }
 
         // Loop sobre todas as camadas reais (22 para TinyLlama, 28 para DeepSeek) — tese 2.1: KV_CACHE 0x30
+        // P0.4: arena reutilizável p/ rms_norm (evita ~57 allocs/token)
+        let mut norm_buf = vec![0.0f32; self.config.intermediate.max(h)];
         let mut hidden_cur = hidden;
         let n_heads = self.config.n_heads.max(1);
         let head_dim = if self.config.hidden % n_heads == 0 { self.config.hidden / n_heads } else { self.config.hidden };
@@ -471,39 +543,44 @@ impl RealInference {
         for blk in 0..self.config.n_layers {
             let t_blk = now();
             // Arc emprestado (sem clone de dados); dummy 1.0 só sem modelo
-            let gamma_attn = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "attn_norm")).unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
-            let hidden_norm = rms_norm(&hidden_cur, &gamma_attn[..]);
+            let gamma_attn = self.cached_layer_vec(mem, blk, |l| l.attn_norm, vec![1.0; h]);
+            rms_norm_into(&hidden_cur, &gamma_attn[..], &mut norm_buf[..h]);
+            let hidden_norm = &norm_buf[..h];
 
             // Suporte GQA: q = h*h, k/v = h*kv_hidden (kv_hidden = n_kv_heads * head_dim)
             let kv_hidden = self.config.n_kv_heads * self.config.head_dim();
             // Kernel int4 direto quando possível (bypass dequant+clone)
             let t0 = now();
-            let mut q = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "q"), &hidden_norm, h, h);
-            let mut k_small = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "k"), &hidden_norm, h, kv_hidden);
-            let mut v_small = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "v"), &hidden_norm, h, kv_hidden);
-            let o_w_names = self.config.try_get_tensor_names(blk, "o");
+            let mut q = self.matvec_layer(mem, blk, |l| l.q, &hidden_norm, h, h);
+            let mut k_small = self.matvec_layer(mem, blk, |l| l.k, &hidden_norm, h, kv_hidden);
+            let mut v_small = self.matvec_layer(mem, blk, |l| l.v, &hidden_norm, h, kv_hidden);
+            let o_w_idx = self.layer_name(blk, |l| l.o);
             if profile { t_matvec += t0.elapsed().as_micros(); }
             // Bias q/k/v (Qwen2/DeepSeek têm attn_*.bias F32; ausente = skip)
-            if let Ok(b) = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "qbias")) {
+            if let Some(b) = self.cached_layer_opt(mem, blk, |l| l.qbias) {
                 for (a, bb) in q.iter_mut().zip(b.iter()) { *a += *bb; }
             }
-            if let Ok(b) = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "kbias")) {
+            if let Some(b) = self.cached_layer_opt(mem, blk, |l| l.kbias) {
                 for (a, bb) in k_small.iter_mut().zip(b.iter()) { *a += *bb; }
             }
-            if let Ok(b) = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "vbias")) {
+            if let Some(b) = self.cached_layer_opt(mem, blk, |l| l.vbias) {
                 for (a, bb) in v_small.iter_mut().zip(b.iter()) { *a += *bb; }
             }
             // RoPE em q/k ANTES do KV append e do repeat GQA
             apply_rope(&mut q, self.config.n_heads, rope_hd, &rope_freqs);
             apply_rope(&mut k_small, self.config.n_kv_heads, rope_hd, &rope_freqs);
             // Expande GQA se necessário (kv_hidden < h)
-            let k = if kv_hidden == h { k_small } else { Self::repeat_kv(&k_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim()) };
-            let v = if kv_hidden == h { v_small } else { Self::repeat_kv(&v_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim()) };
+            // P1.3: append direto no KV (GQA ou cópia), sem Vec temporário
+            if kv_hidden == h {
+                self.kv_cache_k[blk].extend_from_slice(&k_small);
+                self.kv_cache_v[blk].extend_from_slice(&v_small);
+            } else {
+                Self::repeat_kv_extend(&mut self.kv_cache_k[blk], &k_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim());
+                Self::repeat_kv_extend(&mut self.kv_cache_v[blk], &v_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim());
+            }
 
             // --- KV Cache append (0x30 região) ---
-            // Garante que buffers existem e fazem push do token atual
-            self.kv_cache_k[blk].extend_from_slice(&k);
-            self.kv_cache_v[blk].extend_from_slice(&v);
+            // (já estendido acima, com ou sem repeat GQA)
             let seq_len = self.kv_cache_k[blk].len() / h;
             debug_assert_eq!(self.kv_cache_v[blk].len() / h, seq_len);
 
@@ -541,22 +618,23 @@ impl RealInference {
             if profile { t_attn += t_attn0.elapsed().as_micros(); }
 
             let t1 = now();
-            let attn_out = self.matvec_weight(mem, &o_w_names, &attn_agg, h, h);
+            let attn_out = self.matvec_weight_pre(mem, o_w_idx, &attn_agg, h, h);
             let mut hidden2 = vec![0.0; h];
             for i in 0..h { hidden2[i] = hidden_cur[i] + attn_out[i]; }
 
-            let gamma_ffn = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "ffn_norm")).unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
-            let hidden2_norm = rms_norm(&hidden2, &gamma_ffn[..]);
+            let gamma_ffn = self.cached_layer_vec(mem, blk, |l| l.ffn_norm, vec![1.0; h]);
+            rms_norm_into(&hidden2, &gamma_ffn[..], &mut norm_buf[..h]);
+            let hidden2_norm = &norm_buf[..h];
             let inter = self.config.intermediate;
-            let gate = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "gate"), &hidden2_norm, h, inter);
-            let up = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "up"), &hidden2_norm, h, inter);
+            let gate = self.matvec_layer(mem, blk, |l| l.gate, &hidden2_norm, h, inter);
+            let up = self.matvec_layer(mem, blk, |l| l.up, &hidden2_norm, h, inter);
             let mut ffn_h = vec![0.0; self.config.intermediate];
             for i in 0..self.config.intermediate {
                 let g = gate[i];
                 let sig = 1.0/(1.0+(-g).exp());
                 ffn_h[i] = g * sig * up[i];
             }
-            let ffn_out = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "down"), &ffn_h, inter, h);
+            let ffn_out = self.matvec_layer(mem, blk, |l| l.down, &ffn_h, inter, h);
             if profile { t_matvec += t1.elapsed().as_micros(); t_norm_ffn += t_blk.elapsed().as_micros(); }
             let mut hidden_next = vec![0.0; h];
             for i in 0..h { hidden_next[i] = hidden2[i] + ffn_out[i]; }
@@ -566,7 +644,8 @@ impl RealInference {
         // Final norm + LM head (cache, Arc emprestado — sem clone de 934MB)
         let t_head0 = now();
         let out_norm_w = self.read_tensor_f32_cached(mem, "output_norm.weight").unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
-        let hidden_norm_final = rms_norm(&hidden_cur, &out_norm_w[..]);
+        rms_norm_into(&hidden_cur, &out_norm_w[..], &mut norm_buf[..h]);
+        let hidden_norm_final = &norm_buf[..h];
         let lm_head = self.read_tensor_f32_cached(mem, "output.weight")
             .or_else(|_| self.read_tensor_f32_cached(mem, "token_embd.weight"))
             .unwrap_or_else(|_| {
@@ -658,8 +737,7 @@ impl RealInference {
         let head_dim = if h % n_heads == 0 { h / n_heads } else { h };
         let scale = (head_dim as f32).sqrt().recip();
         // RoPE: mesma convenção do forward_one (posição = seq_len atual)
-        let pos = self.kv_cache_k.first().map(|k| k.len() / h.max(1)).unwrap_or(0);
-        let rope_hd = self.config.head_dim();
+        let pos = self.kv_cache_k.first().map(|k| k.len() / h.max(1)).unwrap_or(0);        let rope_hd = self.config.head_dim();
         let rope_theta = self.config.rope_theta;
         let rope_freqs: Vec<(f32, f32)> = (0..rope_hd.max(2) / 2)
             .map(|i| {
@@ -667,32 +745,40 @@ impl RealInference {
                 (f.cos(), f.sin())
             })
             .collect();
+        // P0.4: arena reutilizável p/ rms_norm (igual ao forward_one)
+        let mut norm_buf = vec![0.0f32; self.config.intermediate.max(h)];
         for blk in 0..self.config.n_layers {
-            let gamma_attn = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "attn_norm")).unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
-            let hidden_norm = rms_norm(&hidden_cur, &gamma_attn[..]);
+            let gamma_attn = self.cached_layer_vec(mem, blk, |l| l.attn_norm, vec![1.0; h]);
+            rms_norm_into(&hidden_cur, &gamma_attn[..], &mut norm_buf[..h]);
+            let hidden_norm = &norm_buf[..h];
             let kv_hidden = self.config.n_kv_heads * self.config.head_dim();
-            let mut q = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "q"), &hidden_norm, h, h);
-            let mut k_small = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "k"), &hidden_norm, h, kv_hidden);
-            let mut v_small = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "v"), &hidden_norm, h, kv_hidden);
-            let o_w_names = self.config.try_get_tensor_names(blk, "o");
-            if let Ok(b) = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "qbias")) {
+            let mut q = self.matvec_layer(mem, blk, |l| l.q, &hidden_norm, h, h);
+            let mut k_small = self.matvec_layer(mem, blk, |l| l.k, &hidden_norm, h, kv_hidden);
+            let mut v_small = self.matvec_layer(mem, blk, |l| l.v, &hidden_norm, h, kv_hidden);
+            let o_w_idx = self.layer_name(blk, |l| l.o);
+            if let Some(b) = self.cached_layer_opt(mem, blk, |l| l.qbias) {
                 for (a, bb) in q.iter_mut().zip(b.iter()) { *a += *bb; }
             }
-            if let Ok(b) = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "kbias")) {
+            if let Some(b) = self.cached_layer_opt(mem, blk, |l| l.kbias) {
                 for (a, bb) in k_small.iter_mut().zip(b.iter()) { *a += *bb; }
             }
-            if let Ok(b) = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "vbias")) {
+            if let Some(b) = self.cached_layer_opt(mem, blk, |l| l.vbias) {
                 for (a, bb) in v_small.iter_mut().zip(b.iter()) { *a += *bb; }
             }
             apply_rope(&mut q, self.config.n_heads, rope_hd, &rope_freqs);
             apply_rope(&mut k_small, self.config.n_kv_heads, rope_hd, &rope_freqs);
-            let k = if kv_hidden == h { k_small } else { Self::repeat_kv(&k_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim()) };
-            let v = if kv_hidden == h { v_small } else { Self::repeat_kv(&v_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim()) };
-            // internal cache
-            self.kv_cache_k[blk].extend_from_slice(&k);
-            self.kv_cache_v[blk].extend_from_slice(&v);
-            // mem cache (0x30)
-            let _ = mem.kv_cache_append(blk, &k, &v);
+            // P1.3: append direto no KV (GQA ou cópia), sem Vec temporário
+            if kv_hidden == h {
+                self.kv_cache_k[blk].extend_from_slice(&k_small);
+                self.kv_cache_v[blk].extend_from_slice(&v_small);
+            } else {
+                Self::repeat_kv_extend(&mut self.kv_cache_k[blk], &k_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim());
+                Self::repeat_kv_extend(&mut self.kv_cache_v[blk], &v_small, self.config.n_heads, self.config.n_kv_heads, self.config.head_dim());
+            }
+            // internal cache (já estendido acima)
+            // mem cache (0x30): espelha a cauda recém-anexada (borrow disjunto)
+            let (kk, vv) = (self.kv_cache_k[blk].len(), self.kv_cache_v[blk].len());
+            let _ = mem.kv_cache_append(blk, &self.kv_cache_k[blk][kk - h..kk], &self.kv_cache_v[blk][vv - h..vv]);
             let seq_len = self.kv_cache_k[blk].len() / h;
             let k_cache = &self.kv_cache_k[blk];
             let v_cache = &self.kv_cache_v[blk];
@@ -721,27 +807,29 @@ impl RealInference {
                     for j in 0..head_dim { attn_agg[hb + j] += w * vb[j]; }
                 }
             }
-            let attn_out = self.matvec_weight(mem, &o_w_names, &attn_agg, h, h);
+            let attn_out = self.matvec_weight_pre(mem, o_w_idx, &attn_agg, h, h);
             let mut hidden2 = vec![0.0; h];
             for i in 0..h { hidden2[i] = hidden_cur[i] + attn_out[i]; }
-            let gamma_ffn = self.read_tensor_f32_try_cached(mem, &self.config.try_get_tensor_names(blk, "ffn_norm")).unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
-            let hidden2_norm = rms_norm(&hidden2, &gamma_ffn[..]);
+            let gamma_ffn = self.cached_layer_vec(mem, blk, |l| l.ffn_norm, vec![1.0; h]);
+            rms_norm_into(&hidden2, &gamma_ffn[..], &mut norm_buf[..h]);
+            let hidden2_norm = &norm_buf[..h];
             let inter = self.config.intermediate;
-            let gate = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "gate"), &hidden2_norm, h, inter);
-            let up = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "up"), &hidden2_norm, h, inter);
+            let gate = self.matvec_layer(mem, blk, |l| l.gate, &hidden2_norm, h, inter);
+            let up = self.matvec_layer(mem, blk, |l| l.up, &hidden2_norm, h, inter);
             let mut ffn_h = vec![0.0; self.config.intermediate];
             for i in 0..self.config.intermediate {
                 let g = gate[i];
                 let sig = 1.0/(1.0+(-g).exp());
                 ffn_h[i] = g * sig * up[i];
             }
-            let ffn_out = self.matvec_weight(mem, &self.config.try_get_tensor_names(blk, "down"), &ffn_h, inter, h);
+            let ffn_out = self.matvec_layer(mem, blk, |l| l.down, &ffn_h, inter, h);
             let mut hidden_next = vec![0.0; h];
             for i in 0..h { hidden_next[i] = hidden2[i] + ffn_out[i]; }
             hidden_cur = hidden_next;
         }
         let out_norm_w = self.read_tensor_f32_cached(mem, "output_norm.weight").unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
-        let hidden_norm_final = rms_norm(&hidden_cur, &out_norm_w[..]);
+        rms_norm_into(&hidden_cur, &out_norm_w[..], &mut norm_buf[..h]);
+        let hidden_norm_final = &norm_buf[..h];
         let lm_head = self.read_tensor_f32_cached(mem, "output.weight")
             .or_else(|_| self.read_tensor_f32_cached(mem, "token_embd.weight"))
             .unwrap_or_else(|_| {
@@ -1031,13 +1119,17 @@ fn apply_rope(v: &mut [f32], n_heads: usize, head_dim: usize, freqs: &[(f32, f32
     }
 }
 
-fn rms_norm(x: &[f32], gamma: &[f32]) -> Vec<f32> {
-    let eps=1e-5;
-    let mut sum=0.0;
-    for &v in x { sum+=v*v; }
-    let mean=sum/x.len() as f32;
-    let rms=(mean+eps).sqrt();
-    x.iter().enumerate().map(|(i,&v)| v / rms * gamma.get(i).cloned().unwrap_or(1.0)).collect()
+/// P0.4: RMSNorm sem alocar — escreve em `out` (arena do chamador).
+fn rms_norm_into(x: &[f32], gamma: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(x.len(), out.len());
+    let eps = 1e-5;
+    let mut sum = 0.0;
+    for &v in x { sum += v * v; }
+    let mean = sum / x.len() as f32;
+    let rms = (mean + eps).sqrt();
+    for (i, &v) in x.iter().enumerate() {
+        out[i] = v / rms * gamma.get(i).cloned().unwrap_or(1.0);
+    }
 }
 
 #[cfg(test)]
@@ -1051,7 +1143,7 @@ mod tests {
         let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: HashMap::new(), gen_history: Vec::new() };
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
         let logits = inf.forward_one(&mem, 0).unwrap();
         println!("logits len {} sample {}", logits.len(), inf.sample(&logits));
         assert_eq!(logits.len(), inf.tokenizer.vocab_size());
@@ -1102,7 +1194,7 @@ mod tests {
         let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: HashMap::new(), gen_history: Vec::new() };
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
         let logits = vec![2.0f32, 1.9];
         assert_eq!(inf.sample_with_params(&logits, 1.0, 1.0, 1, 2.0), 0);
         inf.push_gen(0);
@@ -1152,10 +1244,18 @@ mod tests {
         let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: HashMap::new(), gen_history: Vec::new() };
+        let inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
         let prompt = inf.format_chat("Hi");
         assert!(!prompt.contains("<|"), "marcador inexistente no template: {:?}", prompt);
         assert!(prompt.contains("Hi"));
+    }
+    #[test]
+    fn test_repeat_kv_extend_gqa_order() {
+        // GQA 4 heads <- 2 kv heads, dim 4: interleave [kv0×2, kv1×2]
+        let small: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let mut out = Vec::new();
+        RealInference::repeat_kv_extend(&mut out, &small, 4, 2, 4);
+        assert_eq!(out, vec![0., 1., 2., 3., 0., 1., 2., 3., 4., 5., 6., 7., 4., 5., 6., 7.]);
     }
     #[test]
     fn test_embedding_row_matches_full_matrix() {
@@ -1200,12 +1300,12 @@ mod tests {
         });
         let h = inf.config.hidden;
         let x: Vec<f32> = (0..h).map(|i| ((i as f32 * 0.017).sin() * 0.6)).collect();
-        let names = inf.config.try_get_tensor_names(0, "q");
-        let y_kernel = inf.matvec_weight(&mem, &names, &x, h, h);
+        let y_kernel = inf.matvec_layer(&mem, 0, |l| l.q, &x, h, h);
         // Kernel direto não preenche o cache f32 (prova que o bypass foi exercido)
         assert_eq!(inf.weight_cache_len(), 0, "kernel deveria bypassar o cache");
-        // Referência: cache f32 + faer
-        let w = inf.read_tensor_f32_try_cached(&mem, &names).unwrap();
+        // Referência: cache f32 + faer (mesmo índice pré-resolvido)
+        let idx = inf.layer_name(0, |l| l.q).expect("q resolvido");
+        let w = inf.read_tensor_f32_cached_idx(&mem, idx).unwrap();
         let y_ref = crate::matvec::matvec(&x, &w[..], h, h);
         assert_eq!(y_kernel.len(), y_ref.len());
         let max_ref = y_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -1223,7 +1323,7 @@ mod tests {
         let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 22, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 22], kv_cache_v: vec![Vec::new(); 22], weight_cache: HashMap::new(), gen_history: Vec::new() };
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 22], kv_cache_v: vec![Vec::new(); 22], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
         assert_eq!(inf.config.n_layers, 22);
         // Primeiro token
         let logits1 = inf.forward_one(&mem, 1).unwrap();

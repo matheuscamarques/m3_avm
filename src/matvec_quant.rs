@@ -111,6 +111,56 @@ pub fn matvec_quant(
 /// Núcleo genérico, convenção GGUF (`flat = i + j*in_dim`).
 /// Decodifica 1 bloco por vez e acumula dots por coluna: `y[j] += x[i..]·buf`.
 /// `block_elems`: elementos por bloco; `block_bytes`: bytes por bloco;
+/// P1.2: abaixo deste nº de elementos, rayon custa mais que ajuda.
+/// Tunável via env M3_PAR_MIN (default 1M: k/v 393k vão serial, q/gate/head paralelo).
+fn par_min_elems() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("M3_PAR_MIN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1_048_576)
+    })
+}
+
+/// Variante serial do núcleo (ops pequenas): mesmo runs-loop, sem rayon.
+fn matvec_blocked_serial(
+    x: &[f32],
+    raw: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+    block_elems: usize,
+    block_bytes: usize,
+    decode: impl Fn(&[u8], &mut [f32]),
+) -> Vec<f32> {
+    let n_blocks = (in_dim * out_dim) / block_elems;
+    let mut y = vec![0.0f32; out_dim];
+    let mut buf = vec![0.0f32; block_elems];
+    for b in 0..n_blocks {
+        let blk = &raw[b * block_bytes..(b + 1) * block_bytes];
+        decode(blk, &mut buf);
+        let base = b * block_elems;
+        let mut t = 0;
+        let mut j = base / in_dim;
+        let mut i = base % in_dim;
+        while t < block_elems {
+            let run = (in_dim - i).min(block_elems - t);
+            let mut s = 0.0f32;
+            for (a, &vv) in x[i..i + run].iter().zip(buf[t..t + run].iter()) {
+                s += a * vv;
+            }
+            y[j] += s;
+            t += run;
+            i += run;
+            if i == in_dim {
+                i = 0;
+                j += 1;
+            }
+        }
+    }
+    y
+}
+
+/// Núcleo genérico, convenção GGUF (`flat = i + j*in_dim`).
+/// Decodifica 1 bloco por vez e acumula dots por coluna: `y[j] += x[i..]·buf`.
+/// `block_elems`: elementos por bloco; `block_bytes`: bytes por bloco;
 /// `decode`: decodifica `&raw[b*block_bytes..]` em `buf` (len = block_elems).
 fn matvec_blocked(
     x: &[f32],
@@ -176,6 +226,12 @@ pub fn matvec_q4k(x: &[f32], raw: &[u8], in_dim: usize, out_dim: usize) -> Vec<f
 /// [`matvec_q4k`] com auto-detecção). AVX2 exige `in_dim % 256 == 0`
 /// (todo super-bloco numa coluna — caso de todos os shapes LLM: 1536, 8960).
 pub fn matvec_q4k_impl(x: &[f32], raw: &[u8], in_dim: usize, out_dim: usize, use_avx2: bool) -> Vec<f32> {
+    // P1.2: ops pequenas vão serial (rayon não se paga); resto como antes.
+    if in_dim * out_dim < par_min_elems() {
+        return matvec_blocked_serial(x, raw, in_dim, out_dim, 256, 144, |blk, buf| {
+            dequant_q4_k(blk, buf, 256);
+        });
+    }
     #[cfg(target_arch = "x86_64")]
     if use_avx2 && in_dim % 256 == 0 && (in_dim * out_dim) % 256 == 0 {
         return matvec_q4k_avx2(x, raw, in_dim, out_dim);
@@ -407,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn test_avx2_matches_scalar_q4k() {
         if !super::cpu_has_avx2() {
             eprintln!("skip sem AVX2");
@@ -431,14 +488,47 @@ mod tests {
             }
         }
         let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32 * 0.31).sin() * 1.7)).collect();
-        let a = super::matvec_q4k_impl(&x, &raw, in_dim, out_dim, false);
-        let b = super::matvec_q4k_impl(&x, &raw, in_dim, out_dim, true);
+        // Compara direto paralelo-escalar vs AVX2 (fora do gate de tamanho)
+        let a = super::matvec_blocked(&x, &raw, in_dim, out_dim, 256, 144, |blk, buf| {
+            crate::quant::dequant_q4_k(blk, buf, 256);
+        });
+        let b = super::matvec_q4k_avx2(&x, &raw, in_dim, out_dim);
         assert_eq!(a.len(), b.len());
         let max_ref = a.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         println!("avx2 vs escalar: max_ref {:.4} max_diff {:.6}", max_ref, max_diff);
         assert!(max_ref > 1e-6);
         assert!(max_diff / max_ref < 1e-4, "divergência {}", max_diff / max_ref);
+    }
+    #[test]
+    fn test_serial_matches_parallel_blocked() {
+        // P1.2: mesmo runs-loop, sem rayon — paridade exata esperada
+        let in_dim = 48;
+        let out_dim = 32; // 1536 elems; blocos de 256 cruzam linhas
+        let n = in_dim * out_dim;
+        assert_eq!(n % 256, 0);
+        let mut raw = vec![0u8; (n / 256) * 144];
+        for b in 0..n / 256 {
+            let off = b * 144;
+            raw[off] = 0x00;
+            raw[off + 1] = 0x3c;
+            raw[off + 2] = 0x00;
+            raw[off + 3] = 0x00;
+            for i in 0..12 {
+                raw[off + 4 + i] = (0x10u8).wrapping_add((b as u8).wrapping_add(i as u8));
+            }
+            for i in 0..128 {
+                raw[off + 16 + i] = (b as u8).wrapping_mul(53).wrapping_add((i as u8).wrapping_mul(29));
+            }
+        }
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32 * 0.11).sin() * 0.9)).collect();
+        let decode = |blk: &[u8], buf: &mut [f32]| crate::quant::dequant_q4_k(blk, buf, 256);
+        let a = super::matvec_blocked(&x, &raw, in_dim, out_dim, 256, 144, decode);
+        let b = super::matvec_blocked_serial(&x, &raw, in_dim, out_dim, 256, 144, decode);
+        assert_eq!(a.len(), b.len());
+        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+            assert!((va - vb).abs() < 1e-6, "idx {}: {} vs {}", i, va, vb);
+        }
     }
     #[test]
     fn test_dispatcher_fallbacks() {

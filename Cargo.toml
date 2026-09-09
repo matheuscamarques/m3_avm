@@ -35,6 +35,7 @@ tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", 
 hound = "3.5"
 wgpu = { version = "0.19", optional = true }
 pollster = { version = "0.3", optional = true }
+fxhash = "0.2.1"
 
 [features]
 default = []
