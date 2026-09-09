@@ -47,9 +47,9 @@ O escalonador usa **notificações** (via canais `tokio::sync::watch`) em vez de
 
 ---
 
-## 3. A ISA (Conjunto de Instruções) — 8 Opcodes
+## 3. A ISA (Conjunto de Instruções) — 15 Opcodes
 
-A M³-AVM possui 8 opcodes, cada um com formato de 32 bytes (opcode + flags + 3 registradores + payload). Abaixo, a especificação completa.
+A M³-AVM possui 15 opcodes, cada um com formato de 32 bytes (opcode + flags + 3 registradores + payload). Abaixo, a especificação completa.
 
 ### 3.1 `TENSOR` (0x01)
 
@@ -177,6 +177,57 @@ A M³-AVM possui 8 opcodes, cada um com formato de 32 bytes (opcode + flags + 3 
   - Projeta de volta: `output = hidden · W2 + b2`.
   - Implementação usa `ndarray` para multiplicação de matrizes.
 - **Exemplo:** `FFN R3, R1, R4, R5, R6, R7` — executa FFN sobre R1 com pesos em R4-R7.
+
+### 3.9 `EMBED` (0x09)
+
+**Sintaxe:** `EMBED Rd, Rtoken, Rtable`
+
+- **Propósito:** Lookup de embedding (linha `token_id % rows` da tabela → tensor `[1, hidden]`).
+- **Exemplo:** `EMBED R10, R11, R1` — linha do token em R11 da tabela em R1, resultado em R10.
+
+### 3.10 `ADD` (0x0A)
+
+**Sintaxe:** `ADD Rd, R1, R2`
+
+- **Propósito:** Soma elemento a elemento (residuais, fusão de ramos).
+- **Exemplo:** `ADD R10, R10, R14` — acumula em R10.
+
+### 3.11 `SAMPLE` (0x0B)
+
+**Sintaxe:** `SAMPLE Rd, Rlogits [TEMP=x]`
+
+- **Propósito:** Softmax + amostragem; guarda o token em `Rd` e em `last_sample`.
+- **Exemplo:** `SAMPLE R11, R15` — amostra dos logits em R15.
+
+### 3.12 `COMPARE` (0x0C)
+
+**Sintaxe:** `COMPARE R1, R2` ou `COMPARE R1, imm` ou `COMPARE R1, EOS_TOKEN`
+
+- **Propósito:** Define `cmp_equal = (v1 == v2)` no contexto (para `IF_EQUAL`).
+- **Exemplo:** `COMPARE R11, EOS_TOKEN` — testa fim da sequência.
+
+### 3.13 `IF_EQUAL` (0x0D)
+
+**Sintaxe:** `IF_EQUAL LABEL`
+
+- **Propósito:** Pula para o rótulo se `cmp_equal`, senão continua.
+- **Exemplo:** `IF_EQUAL PROGRAM_END` — sai do loop ao gerar EOS.
+
+### 3.14 `JUMP` (0x0E)
+
+**Sintaxe:** `JUMP LABEL`
+
+- **Propósito:** Salto incondicional (alvo validado contra os limites do programa).
+- **Exemplo:** `JUMP MAIN_LOOP` — volta ao topo do loop de geração.
+
+### 3.15 `IF_INTERRUPT` (0x0F)
+
+**Sintaxe:** `IF_INTERRUPT LABEL` ou `IF_INTERRUPT Rcond, LABEL`
+
+- **Propósito:** Pula se houver interrupção pendente: com registrador, `reg != 0`; sem, `interrupt_flag` (consumida no pulo). É o par de `SENSE Rd, USER_INPUT` no loop thinking.
+- **Exemplo:** `IF_INTERRUPT HANDLE_ABORT` — desvia para rollback sob demanda.
+
+O assembler é 2-pass com rótulos (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`), de modo que um loop de geração token a token (`SENSE → IF_INTERRUPT → EMBED → ADD → SAMPLE → COMPARE → IF_EQUAL/JUMP`) é escrito 100% na ISA, sem host-side (`programs/control_flow_demo.m3asm`).
 
 ---
 
@@ -523,7 +574,7 @@ m3_avm/
 │   ├── vm.rs                  # Loop principal, executor
 │   ├── context.rs             # Contexto, registradores, estado
 │   ├── memory.rs              # Gerenciador de memória (mmap, COW)
-│   ├── opcodes.rs             # Definição e dispatcher dos 8 opcodes
+│   ├── opcodes.rs             # Definição e dispatcher dos 15 opcodes
 │   ├── tensor.rs              # Representação de tensores (densos, esparsos)
 │   ├── bus.rs                 # Barramento de notificações (NOP)
 │   ├── llm_loop.rs            # Loop de geração token a token
@@ -614,7 +665,7 @@ done:
 - **Correção cirúrgica:** Você pode interromper o raciocínio no ponto exato do erro e injetar uma correção, preservando 90% do trabalho.
 - **Latência imperceptível:** `ABORT` em ~217µs e rollback em ~39µs — tudo em software.
 - **Hardware commodity:** Roda em qualquer laptop com Rust (ex: Ryzen 3500U).
-- **ISA aberta:** Os 8 opcodes são simples de implementar em hardware (FPGA/ASIC) no futuro.
+- **ISA aberta:** Os 15 opcodes são simples de implementar em hardware (FPGA/ASIC) no futuro.
 
 ### 9.2 Próximos passos sugeridos para implementação
 

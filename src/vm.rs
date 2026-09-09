@@ -670,6 +670,18 @@ impl Vm {
         }
     }
 
+    /// Passo único público: executa 1 instrução do contexto; retorna se o PC
+    /// deve avançar (pulos retornam `false`).
+    ///
+    /// Contrato de interpretadores: o modo `--interactive` (main.rs) delega
+    /// aqui as ops puras (TENSOR/EMBED/ADD/SAMPLE/COMPARE/JUMP/IF_EQUAL/
+    /// IF_INTERRUPT) para não duplicar a ISA. ATTN/NORM/FFN/STREAM/FORK/ABORT/
+    /// SENSE seguem stubs de demo no modo interativo (instrumentação de
+    /// preempção, outputs e checkpoints da tese).
+    pub fn step_instruction(&mut self, ctx_id: u64, instr: &Instruction) -> Result<bool> {
+        self.execute_instruction(ctx_id, instr)
+    }
+
     // -----------------------------------------------------------------------
     // Implementações dos opcodes
     // -----------------------------------------------------------------------

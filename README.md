@@ -1,7 +1,7 @@
 # M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![ISA](https://img.shields.io/badge/ISA-6%20Opcodes-blueviolet)](docs/ISA.md)
+[![ISA](https://img.shields.io/badge/ISA-15%20Opcodes-blueviolet)](docs/ISA.md)
 [![Sparse](https://img.shields.io/badge/Support-Sparse%20%26%20Dense-brightgreen)]()
 [![License](https://img.shields.io/badge/License-Apache_2.0-green)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow)]()
@@ -10,7 +10,7 @@
 
 The M³-AVM is a software emulator in Rust (`src/lib.rs:1`, `src/vm.rs:1`) exploring primitives for interactive AI: preemption and sparse memory. It implements:
 
-1. A fixed 6-opcode ISA `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`).
+1. A fixed 15-opcode ISA: `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
 2. A scheduler with strict priority `Red > Blue > Green` (`src/context.rs:15`, `src/context.rs:167`) and an optional event-driven reactor (`src/reactor.rs:1`, `src/bus.rs:20`) using `tokio::sync::watch`/`broadcast`.
 3. Dense tensors via `ndarray` and sparse CSR via `nalgebra-sparse 0.10` + `sprs 0.11` (`Cargo.toml:22`, `src/sparse.rs:1`).
 
@@ -33,7 +33,7 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 | Sparse | `CsrMatrix<f32>` `src/sparse.rs:30` | `(nnz*4)+(rows+1)*4+nnz*4` |
 
 ### Context `src/context.rs:84`
-- 16 regs `u128`, `pc: u128`, `root_version: u64`, `priority: Priority`, `state: ContextState`.
+- 16 regs `u128`, `pc: u128`, `root_version: u64`, `priority: Priority`, `state: ContextState`, plus `cmp_equal: bool` (COMPARE/IF_EQUAL) and `interrupt_flag: bool` (SENSE USER_INPUT / IF_INTERRUPT).
 - No `tensor_type` or `chunk_size` field in code — chunking is done inside `attn_sparse` per row (`src/sparse.rs:183`).
 
 ### NOP Buses `src/bus.rs:32`
@@ -49,9 +49,18 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 | `0x01` | **TENSOR** | `TENSOR Rd 32 32 f32` or `TENSOR Rd 32 32 f32 SPARSE DENSITY=0.05` | Dense: `alloc_tensor` `src/memory.rs:238`; Sparse: `alloc_sparse_tensor` `src/memory.rs:258` with `SparseTensor::random` `src/sparse.rs:54` (not `CsrMatrix::zero`). Payload `[17]=is_sparse` `src/opcodes.rs:168`. |
 | `0x02` | **ATTN** | `ATTN Rd, Q, K, V` or `ATTN Rd, Q, K, V NOTIFY_EACH_HEAD` | Sparse-aware dispatcher `src/vm.rs:418`: if any sparse → `sparse::attn_sparse` `src/sparse.rs:146` (`Q*K^T` scaled, softmax per row, `*V`, notifies `AttentionEvent::HeadCompleted` per row `src/sparse.rs:183`); else dense `ndarray` `src/vm.rs:454`. Flag `ATTN_FLAG_NOTIFY_EACH_HEAD=0b01` `src/opcodes.rs:42`. |
 | `0x03` | **STREAM** | `STREAM Rsrc, Rsink, [BLOCKING/DROP]` | `tokio::sync::mpsc` bounded 16 stub `src/vm.rs:82`; blocking uses `try_send` + warn, reactor uses `StreamSignal` `src/reactor.rs:273`. |
-| `0x04` | **FORK** | `FORK Rd, RED` or `FORK Rd, RED, NOTIFY` | CoW via `Arc::clone` `src/memory.rs:475` and `sparse_snapshots` `src/memory.rs:149`; `FORK_FLAG_NOTIFY=0b100` `src/opcodes.rs:44` publishes `SchedSignal` `src/reactor.rs:313`. |
+| `0x04` | **FORK** | `FORK Rd, RED` or `FORK Rd, RED, NOTIFY` or `FORK Rd, LABEL, GREEN` | CoW via `Arc::clone` `src/memory.rs:475` and `sparse_snapshots` `src/memory.rs:149`; `FORK_FLAG_NOTIFY=0b100` `src/opcodes.rs:44` publishes `SchedSignal` `src/reactor.rs:313`. Label form (2-pass assembler) starts the child at the label PC. |
 | `0x05` | **ABORT** | `ABORT Rs_ctx, Rs_ts` | Removes context `src/vm.rs:601`, restores snapshot `src/memory.rs:489` (`watch` publish `InterruptSignal` in reactor `src/reactor.rs:318`). |
-| `0x06` | **SENSE** | `SENSE Rd, AUDIO/VAD` | Generates white noise `rand::thread_rng` `src/vm.rs:621` or `0/1`, pushes to `TEMPORAL` `src/memory.rs:430`. |
+| `0x06` | **SENSE** | `SENSE Rd, AUDIO/VAD/TOKEN/USER_INPUT` | Generates white noise `rand::thread_rng` `src/vm.rs:621` or `0/1`, pushes to `TEMPORAL` `src/memory.rs:430`. `USER_INPUT` (non-blocking) pops the host queue (`Vm::push_input`): writes `1/0` + sets `interrupt_flag` — pairs with `IF_INTERRUPT`. |
+| `0x07` | **NORM** | `NORM Rd, Rsrc, Rgamma, Rbeta` | RMSNorm over last axis (`x/sqrt(mean(x²)+eps)*gamma+beta`). |
+| `0x08` | **FFN** | `FFN Rd, Rsrc, Rw1, Rw2[, Rb1, Rb2]` | SwiGLU feed-forward (`silu(x·W1+b1)*up`, `·W2+b2`). |
+| `0x09` | **EMBED** | `EMBED Rd, Rtoken, Rtable` | Embedding lookup: row `token_id % rows` of dense 2D table → new `[1, hidden]` tensor. |
+| `0x0A` | **ADD** | `ADD Rd, R1, R2` | Elementwise `f32` add, shapes must match. |
+| `0x0B` | **SAMPLE** | `SAMPLE Rd, Rlogits [TEMP=x]` | Softmax + weighted sampling (temp from payload, default 1.0); writes token id to `Rd` and `last_sample`. |
+| `0x0C` | **COMPARE** | `COMPARE R1, R2` or `COMPARE R1, imm` or `COMPARE R1, EOS_TOKEN` | Sets `cmp_equal = (v1 == v2)`. |
+| `0x0D` | **IF_EQUAL** | `IF_EQUAL LABEL` | Jumps to label PC if `cmp_equal`, else falls through. |
+| `0x0E` | **JUMP** | `JUMP LABEL` | Unconditional jump (target validated against program bounds). |
+| `0x0F` | **IF_INTERRUPT** | `IF_INTERRUPT LABEL` or `IF_INTERRUPT Rcond, LABEL` | With reg: jumps if `reg != 0`. Without: jumps if `interrupt_flag` (consumed on jump). |
 
 All instructions are 32 bytes `src/opcodes.rs:82`.
 
@@ -64,7 +73,7 @@ All instructions are 32 bytes `src/opcodes.rs:82`.
 - `ndarray` dense path only `f32`.
 - `watch`/`broadcast` are Tokio channels, not hardware crossbar.
 
-Tests that pass on this host: `cargo test --lib` 67 tests `src/qa.rs:800` + `src/sparse.rs:240` + `src/bus.rs:120` + `src/reactor.rs:377`.
+Tests that pass on this host: `cargo test --lib` 124 tests (ISA, sparse, bus, reactor, inference, TUI, VM control-flow).
 
 ## 5. Benchmarking — Measured (not claimed)
 
@@ -74,7 +83,7 @@ All measurements on this host are for small matrices; large 2048x2048 numbers in
 | :--- | :--- | :--- | :--- | :--- |
 | `ATTN` dense | 32x32 | `attn_sparse` 1.0 density | ~5 ms iter `cargo bench sparse_nop` | |
 | `ATTN` sparse | 32x32 5% | `attn_sparse` + `NOTIFY_EACH_HEAD` | ~5 ms + overhead <3x per head `src/qa.rs:860` | overhead measured with `watch` |
-| Program `sparse_nop.m3asm` | 6 tensors 32x32 | 2x ATTN + 2x STREAM | 45 ms debug `cargo run -- run examples/sparse_nop.m3asm` | dense 4x4 part ~similar |
+| Program `sparse_nop.m3asm` | 6 tensors 32x32 | 2x ATTN + 2x STREAM | 45 ms debug `cargo run --bin m3_avm -- run examples/sparse_nop.m3asm` | dense 4x4 part ~similar |
 | Scheduler IPS | NOP loop | 100k `NOP` | 240k IPS debug, 2.1M IPS release (`cargo run --release -- bench --nops 1000000`) | target 1M met in release |
 | FORK CoW | 100x1MiB | `snapshot` | <1 ms `src/qa.rs:270` | `Arc` clone |
 | ABORT | 1 sparse ATTN 32x32 under load | `ABORT` | 25 ms measured `src/qa.rs:664` (not 50µs; 50µs is hypothetical HW) | watch publish <1ms `src/bus.rs:130` |
@@ -114,12 +123,13 @@ Prerequisites: Rust 1.75+ (`rustc 1.93` tested), `cargo`, `cmake` for `whisper.c
 ```bash
 git clone <repo> && cd m3_avm
 cargo build
-cargo run -- run examples/minimal.m3asm        # dense 2x2
-cargo run -- run examples/sparse_nop.m3asm     # sparse 32x32 5% + NOTIFY_EACH_HEAD
-cargo run -- run examples/nop_demo.m3asm
-cargo run -- assemble examples/minimal.m3asm -o /tmp/minimal.m3bin
-cargo run -- disassemble /tmp/minimal.m3bin
-cargo test --lib                               # 67 tests
+cargo run --bin m3_avm -- run examples/minimal.m3asm        # dense 2x2
+cargo run --bin m3_avm -- run examples/sparse_nop.m3asm     # sparse 32x32 5% + NOTIFY_EACH_HEAD
+cargo run --bin m3_avm -- run examples/nop_demo.m3asm
+cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm  # EMBED/ADD/SAMPLE + labels/jumps (both modes)
+cargo run --bin m3_avm -- assemble examples/minimal.m3asm -o /tmp/minimal.m3bin
+cargo run --bin m3_avm -- disassemble /tmp/minimal.m3bin
+cargo test --lib                               # 124 tests
 cargo test --lib sparse_nop -- --nocapture
 cargo test --lib bus -- --nocapture
 cargo test --lib reactor -- --nocapture
@@ -134,6 +144,23 @@ TENSOR r0 32 32 f32 SPARSE DENSITY=0.05
 TENSOR r1 32 32 f32 SPARSE DENSITY=0.10
 ATTN r3 r0 r1 r2 NOTIFY_EACH_HEAD
 STREAM r3 r15 BLOCKING
+```
+
+Thinking loop with the new opcodes (`programs/control_flow_demo.m3asm:1`, runs to `HALT` in both `run` and `--interactive` modes):
+```asm
+    TENSOR r0 2 2 f32
+    ADD r2, r0, r1
+    SAMPLE r3, r2
+    COMPARE r2, r2
+    IF_EQUAL DO_ADD
+    JUMP DONE
+DO_ADD:
+    ADD r5, r0, r0
+    SENSE r6, USER_INPUT
+    IF_INTERRUPT DONE
+    JUMP DONE
+DONE:
+    HALT
 ```
 
 ## 10. Immediate Roadmap

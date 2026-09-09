@@ -522,32 +522,19 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
             _ => {}
         }
 
-        // 3. Executa instrução (host-side step, sem Vm::execute_instruction privado)
-        // Reusa lógica de Vm mas aqui inline para capturar FORK checkpoint e STREAM output
+        // 3. Executa instrução via stepping compartilhado da VM quando a
+        // semântica é pura (uma implementação só — ver Vm::step_instruction).
+        // ATTN/NORM/FFN/STREAM/FORK/ABORT/SENSE seguem stubs de demo abaixo
+        // (instrumentação de preempção/outputs/checkpoints da tese).
         let exec_res = match instr.opcode {
-            opcodes::OP_TENSOR => {
-                // Duplica src/vm.rs exec_tensor minimal
-                let (rows, cols) = instr.tensor_shape();
-                let dtype = crate::memory::DType::from_u8(instr.tensor_dtype());
-                let shape = vec![rows, cols];
-                let addr = if instr.is_sparse() {
-                    vm.memory.alloc_sparse_tensor(&shape, dtype, instr.sparse_density()).unwrap()
-                } else {
-                    let a = vm.memory.alloc_tensor(&shape, dtype).unwrap();
-                    let elems = rows*cols;
-                    match dtype {
-                        crate::memory::DType::F32 => {
-                            let data: Vec<f32> = (0..elems).map(|i| (i as f32 + 1.0)*0.5).collect();
-                            let _ = vm.memory.write_f32_tensor(a, &data);
-                        }
-                        _ => {}
-                    }
-                    a
-                };
-                if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { let _ = ctx.set_reg(instr.rdest, addr); }
-                vm.stats.tensor_allocs += 1;
-                Ok(true)
-            }
+            opcodes::OP_TENSOR
+            | opcodes::OP_EMBED
+            | opcodes::OP_ADD
+            | opcodes::OP_SAMPLE
+            | opcodes::OP_COMPARE
+            | opcodes::OP_JUMP
+            | opcodes::OP_IF_EQUAL
+            | opcodes::OP_IF_INTERRUPT => vm.step_instruction(ctx_id, &instr),
             opcodes::OP_ATTN => {
                 // Checa interrupção antes (watch 0 custo)
                 if let Some(sig) = bus.has_interrupt() { if sig.target_ctx == ctx_id { eprintln!("[ATTN preemptado por ABORT antes]"); } }
@@ -789,127 +776,6 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
                 }
                 vm.stats.senses += 1;
                 Ok(true)
-                }
-            }
-            opcodes::OP_EMBED => {
-                let (tok_val, table_addr) = {
-                    let ctx = vm.scheduler.get(ctx_id).unwrap();
-                    (ctx.reg(instr.rsrc1).unwrap_or(0), ctx.reg(instr.rsrc2).unwrap_or(0))
-                };
-                let token_id = if tok_val < 1_000_000 { tok_val as usize } else {
-                    vm.memory.read(tok_val, 4).ok()
-                        .and_then(|b| if b.len() >= 4 { Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) } else { None })
-                        .unwrap_or(0)
-                };
-                let meta = vm.memory.get_tensor_meta(table_addr).cloned();
-                match meta {
-                    Some(m) if m.shape.len() == 2 && !m.is_sparse => {
-                        let (rows, hidden) = (m.shape[0], m.shape[1]);
-                        let row = token_id % rows.max(1);
-                        let table = vm.memory.read_f32_tensor(table_addr, rows * hidden).unwrap_or(vec![0.5; hidden]);
-                        let out_vec = table.get(row * hidden..(row + 1) * hidden).unwrap_or(&[]).to_vec();
-                        let out_vec = if out_vec.len() == hidden { out_vec } else { vec![0.5; hidden] };
-                        let out_addr = vm.memory.alloc_tensor(&[1, hidden], crate::memory::DType::F32).unwrap();
-                        let _ = vm.memory.write_f32_tensor(out_addr, &out_vec);
-                        if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { let _ = ctx.set_reg(instr.rdest, out_addr); }
-                        vm.stats.embed_execs += 1;
-                        Ok(true)
-                    }
-                    _ => Err(anyhow::anyhow!("EMBED: tabela 0x{:x} inválida", table_addr)),
-                }
-            }
-            opcodes::OP_ADD => {
-                let (a1, a2) = {
-                    let ctx = vm.scheduler.get(ctx_id).unwrap();
-                    (ctx.reg(instr.rsrc1).unwrap_or(0), ctx.reg(instr.rsrc2).unwrap_or(0))
-                };
-                let m1 = vm.memory.get_tensor_meta(a1).cloned();
-                let m2 = vm.memory.get_tensor_meta(a2).cloned();
-                match (m1, m2) {
-                    (Some(x), Some(y)) if x.shape == y.shape && !x.is_sparse && !y.is_sparse => {
-                        let n: usize = x.shape.iter().product();
-                        let d1 = vm.memory.read_f32_tensor(a1, n).unwrap_or(vec![0.0; n]);
-                        let d2 = vm.memory.read_f32_tensor(a2, n).unwrap_or(vec![0.0; n]);
-                        let out_vec: Vec<f32> = d1.iter().zip(d2.iter()).map(|(a, b)| a + b).collect();
-                        let out_addr = vm.memory.alloc_tensor(&x.shape, crate::memory::DType::F32).unwrap();
-                        let _ = vm.memory.write_f32_tensor(out_addr, &out_vec);
-                        if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { let _ = ctx.set_reg(instr.rdest, out_addr); }
-                        vm.stats.add_execs += 1;
-                        Ok(true)
-                    }
-                    _ => Err(anyhow::anyhow!("ADD: tensores incompatíveis")),
-                }
-            }
-            opcodes::OP_SAMPLE => {
-                let src = {
-                    let ctx = vm.scheduler.get(ctx_id).unwrap();
-                    if instr.rsrc1 != 0xFF { ctx.reg(instr.rsrc1).unwrap_or(0) } else { 0 }
-                };
-                let logits: Vec<f32> = if let Some(meta) = vm.memory.get_tensor_meta(src).cloned() {
-                    let n: usize = meta.shape.iter().product();
-                    vm.memory.read_f32_tensor(src, n).unwrap_or_else(|_| vec![0.5; 4])
-                } else {
-                    vm.memory.read(src, 16).ok()
-                        .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                        .unwrap_or(vec![0.5; 4])
-                };
-                let tok = vm.sample_logits(&logits);
-                vm.last_sample = tok;
-                if instr.rdest != 0xFF {
-                    if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { let _ = ctx.set_reg(instr.rdest, tok as u128); }
-                }
-                vm.stats.sample_execs += 1;
-                Ok(true)
-            }
-            opcodes::OP_COMPARE => {
-                let (v1, v2) = {
-                    let ctx = vm.scheduler.get(ctx_id).unwrap();
-                    let a = ctx.reg(instr.rsrc1).unwrap_or(0);
-                    let b = if instr.rsrc2 != 0xFF { ctx.reg(instr.rsrc2).unwrap_or(0) } else {
-                        let mut ib = [0u8; 16];
-                        ib.copy_from_slice(&instr.payload[0..16]);
-                        u128::from_le_bytes(ib)
-                    };
-                    (a, b)
-                };
-                if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { ctx.cmp_equal = v1 == v2; }
-                Ok(true)
-            }
-            opcodes::OP_JUMP => {
-                let mut ib = [0u8; 16];
-                ib.copy_from_slice(&instr.payload[0..16]);
-                let target = u128::from_le_bytes(ib);
-                if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { ctx.pc = target; }
-                Ok(false)
-            }
-            opcodes::OP_IF_EQUAL => {
-                let take = vm.scheduler.get(ctx_id).map(|c| c.cmp_equal).unwrap_or(false);
-                if take {
-                    let mut ib = [0u8; 16];
-                    ib.copy_from_slice(&instr.payload[0..16]);
-                    if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { ctx.pc = u128::from_le_bytes(ib); }
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            }
-            opcodes::OP_IF_INTERRUPT => {
-                vm.stats.interrupt_checks += 1;
-                let take = if instr.rsrc1 != 0xFF {
-                    vm.scheduler.get(ctx_id).map(|c| c.reg(instr.rsrc1).unwrap_or(0) != 0).unwrap_or(false)
-                } else {
-                    vm.scheduler.get(ctx_id).map(|c| c.interrupt_flag).unwrap_or(false)
-                };
-                if take {
-                    if instr.rsrc1 == 0xFF {
-                        if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { ctx.interrupt_flag = false; }
-                    }
-                    let mut ib = [0u8; 16];
-                    ib.copy_from_slice(&instr.payload[0..16]);
-                    if let Some(ctx) = vm.scheduler.get_mut(ctx_id) { ctx.pc = u128::from_le_bytes(ib); }
-                    Ok(false)
-                } else {
-                    Ok(true)
                 }
             }
             _ => Err(anyhow::anyhow!("opcode 0x{:02x}", instr.opcode)),

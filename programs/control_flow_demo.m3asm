@@ -1,0 +1,21 @@
+; control_flow_demo.m3asm — Demonstra os opcodes novos (ISA 15) e controle de fluxo.
+; Roda fim-a-fim nos dois modos:
+;   cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm
+;   cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm --interactive --max-steps 40
+; Sem input enfileirado, SENSE USER_INPUT retorna 0 e o programa termina em HALT.
+
+    TENSOR r0 2 2 f32
+    TENSOR r1 2 2 f32
+    ADD r2, r0, r1
+    SAMPLE r3, r2
+    EMBED r4, r7, r0
+    COMPARE r2, r2
+    IF_EQUAL DO_ADD
+    JUMP DONE
+DO_ADD:
+    ADD r5, r0, r0
+    SENSE r6, USER_INPUT
+    IF_INTERRUPT DONE
+    JUMP DONE
+DONE:
+    HALT
