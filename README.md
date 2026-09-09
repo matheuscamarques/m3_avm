@@ -3,7 +3,7 @@
 > **Author: Matheus de Camargo Marques** — Máquina Abstrata de Matheus de Camargo Marques · https://github.com/matheuscamarques/m3_avm · If you use this work, please cite it (see [CITATION.cff](CITATION.cff) / [How to cite](#license--citation)).
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![ISA](https://img.shields.io/badge/ISA-15%20Opcodes-blueviolet)](docs/ISA.md)
+[![ISA](https://img.shields.io/badge/ISA-22%20Opcodes-blueviolet)](docs/ISA_OPCODES_0x13_0x19.md)
 [![Sparse](https://img.shields.io/badge/Support-Sparse%20%26%20Dense-brightgreen)]()
 [![License](https://img.shields.io/badge/License-AGPL_v3.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow)]()
@@ -12,7 +12,7 @@
 
 The M³-AVM is a software emulator in Rust (`src/lib.rs:1`, `src/vm.rs:1`) exploring primitives for interactive AI: preemption and sparse memory. It implements:
 
-1. A fixed 15-opcode ISA: `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
+1. A fixed 22-opcode ISA: `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) + `MATVEC, MUL, SILU` (GEMV blocks) + `SSM_SCAN, SSM_RESET` (Mamba) + `CODEC_ENC, CODEC_DEC, AUDIO_ALIGN` (Mimi full-duplex) + `CTX_SWITCH, ROPE` (hybrid control) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`, spec `docs/ISA_OPCODES_0x13_0x19.md`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
 2. A scheduler with strict priority `Red > Blue > Green` (`src/context.rs:15`, `src/context.rs:167`) and an optional event-driven reactor (`src/reactor.rs:1`, `src/bus.rs:20`) using `tokio::sync::watch`/`broadcast`.
 3. Dense tensors via `ndarray` + `faer` SIMD and sparse CSR via `nalgebra-sparse 0.10` + `sprs 0.11` (`Cargo.toml:22`, `src/sparse.rs:1`), plus quantized dequant `Q4_0/Q4_K/Q6_K/Q8_0` `src/quant.rs:1` and fused `matvec_q4k` `AVX2` `src/matvec_quant.rs:1`.
 4. Real inference from GGUF (`src/inference.rs:1`, `src/gguf.rs:1`) with `mmap` zero-copy in `PERSISTENTE 0x20` (`src/memory.rs:15`), `KV_CACHE 0x30` per-layer (`src/memory.rs:27`) and `AsmEmitter` (`src/asm_emitter.rs:1`) that lowers a model to `.m3asm` desenrolado.
@@ -24,6 +24,8 @@ The M³-AVM is a software emulator in Rust (`src/lib.rs:1`, `src/vm.rs:1`) explo
 Sparsity (MoE routing, pruning, long-context KV cache) is common, but current stacks treat it as an optimization, not a primitive. GPU kernels, once launched, run to completion and cannot be preempted per row. The prototype tests whether exposing progress per row-chunk via notifications allows finer preemption, at the cost of scheduler complexity.
 
 ## 2. Architecture — Implemented
+
+> Full target vision (diagram + heterogeneous engines + distributed roadmap): see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### Address Space (u128 virtual) `src/memory.rs:21`
 - `GLOBAL (0x00…)` — `global_heap: HashMap<u128, Arc<Vec<u8>>>` + `sparse_heap: HashMap<u128, SparseTensor>` `src/memory.rs:122` (dense aligned to 64B `src/memory.rs:221`, sparse CSR).
@@ -75,6 +77,15 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 | `0x0D` | **IF_EQUAL** | `IF_EQUAL LABEL` | Jumps if `cmp_equal` `src/vm.rs:1330`. |
 | `0x0E` | **JUMP** | `JUMP LABEL` | Unconditional `src/vm.rs:1315`, target validated. |
 | `0x0F` | **IF_INTERRUPT** | `IF_INTERRUPT LABEL` or `IF_INTERRUPT Rcond, LABEL` | With reg `reg!=0`, without `interrupt_flag` (consumed) `src/vm.rs:1335`. |
+| `0x10-0x12` | **MATVEC/MUL/SILU** | `MATVEC Rd, Rx, Rw` / `MUL Rd, R1, R2` / `SILU Rd, Rsrc` | GEMV `x·W` (`faer`), elementwise mul, SiLU `x·sigmoid(x)` — building blocks for SwiGLU/heads. |
+| `0x13` | **SSM_SCAN** | `SSM_SCAN rY, rX, rH, rP [D_INNER=n D_STATE=n LAYER=n]` | Selective scan `h*=exp(dt·A)+x·B·dt; y=h·C+D·x` (`src/ssm.rs`); `rH=_` uses `Vm::ssm_states[layer]`; full spec `docs/ISA_OPCODES_0x13_0x19.md`. |
+| `0x14` | **SSM_RESET** | `SSM_RESET rH [D_INNER=n D_STATE=n LAYER=n]` | Zeroes `h_t` (tensor or `ssm_states[layer]`); pairs with `ABORT` (auto pop of `FORK` snapshot) for Mamba rollback. |
+| `0x15` | **CODEC_ENC** | `CODEC_ENC rD, rS [TENSOR]` | PCM `1920xf32` (tensor or `TEMPORAL`) → Mimi codes 32B / `[1,16]` (`src/mimi.rs`). |
+| `0x16` | **CODEC_DEC** | `CODEC_DEC rD, rS [TENSOR]` | Inverse: codes → PCM frame. |
+| `0x17` | **AUDIO_ALIGN** | `AUDIO_ALIGN rD, rU, rA` | `[t_user, t_ai, delta, frame_id]` for barge-in `t_interrupção` (80ms frames). |
+| `0x18` | **CTX_SWITCH** | `CTX_SWITCH MAMBA\|TRANSFORMER\|AUDIO [,RED\|BLUE\|GREEN]` | Sets `ctx.pipeline` + priority + memory fence + `maybe_preempt()` (`src/context.rs`). |
+| `0x19` | **ROPE** | `ROPE rD, rS POS=n HDIM=n NHEADS=n` | Native rotary embedding via `inference::apply_rope`; `pos=0` is identity. |
+| `SENSE 6/7` | **AUDIO_PCM/CODEC_FRAME** | `SENSE Rd, AUDIO_PCM` / `SENSE Rd, CODEC_FRAME` | Deterministic 24kHz synth frame (7680B PCM) or its 32B codes — feeds `CODEC_ENC` directly. |
 
 All instructions are 32 bytes `src/opcodes.rs:82`.
 
