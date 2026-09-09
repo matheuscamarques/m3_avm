@@ -76,23 +76,28 @@ impl AsmEmitter {
 
         for layer in 0..self.config.n_layers {
             out.push(format!("    ; ===== camada {} ===== ({} layers total)", layer, self.config.n_layers));
-            // NORM1: R1 = RMSNorm(R0)
+            // NORM1: R1 = RMSNorm(R0) [1, hidden]
             out.push(format!("    NORM r1, r0, r0, r0   ; R1 = norm(R0) layer {}", layer));
-            // ATTN: R5 = attn(R1) — Q/K/V vindos dos pesos do modelo (internamente matvec_weight resolve via layer_names)
-            // No assembly interpretado, ATTN rdest,rQ,rK,rV espera addrs em R1,R3,R4.
-            // Como pesos estão em PERSISTENTE, o interpreter precisará ter os TENSORs de peso
-            // carregados. Para MVP desenrolado, emitimos ATTN sobre temporários já em R1/R3/R4
-            // que foram alocados como 1xhidden no prólogo (stub). Em execução real com modelo,
-            // esses ATTN serão satisfeitos via matvec_weight que lê PERSISTENTE, não via TENSORs aqui.
-            // Para manter assembly executável sem modelo, usamos self-attention stub:
-            out.push(format!("    ATTN r5, r1, r1, r1   ; attn self layer {}", layer));
+            // Q/K/V/O projections via MATVEC + ATTN (usa pesos reais quando shape colide com GGUF)
+            // Para Fase 1, emitimos MATVEC com shapes que mapeiam para GGUF distintos via try_gguf used-set:
+            // Q/K/V/O todos [hidden, hidden] (4M) mapeiam para blk.{}.attn_q/k/v/output distintos.
+            out.push(format!("    TENSOR r6 {} {} f32 ; q_proj layer {} [hidden, hidden]", self.config.hidden, self.config.hidden, layer));
+            out.push(format!("    MATVEC r2, r1, r6      ; R2 = R1 * q_proj layer {}", layer));
+            out.push(format!("    TENSOR r7 {} {} f32 ; k_proj layer {}", self.config.hidden, self.config.hidden, layer));
+            out.push(format!("    MATVEC r3, r1, r7      ; R3 = R1 * k_proj layer {}", layer));
+            out.push(format!("    TENSOR r8 {} {} f32 ; v_proj layer {}", self.config.hidden, self.config.hidden, layer));
+            out.push(format!("    MATVEC r4, r1, r8      ; R4 = R1 * v_proj layer {}", layer));
+            out.push(format!("    ATTN r5, r2, r3, r4   ; R5 = attn(Q=R2,K=R3,V=R4) layer {}", layer));
+            out.push(format!("    TENSOR r6 {} {} f32 ; o_proj layer {} [hidden, hidden]", self.config.hidden, self.config.hidden, layer));
+            out.push(format!("    MATVEC r5, r5, r6      ; R5 = R5 * o_proj layer {}", layer));
             out.push("    SENSE r15, USER_INPUT".to_string());
             out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
             out.push(format!("    ADD r0, r0, r5       ; R0 += attn_out layer {}", layer));
             // NORM2
             out.push(format!("    NORM r1, r0, r0, r0   ; norm2 layer {}", layer));
-            // FFN: R8 = FFN(R1, W1=r9, W2=r10) — shapes [1,hidden]*[hidden,inter]*[inter,hidden]
-            out.push(format!("    FFN r8, r1, r9, r10  ; FFN layer {} (R1->[hidden,inter]->[hidden])", layer));
+            // FFN gate/up/down — shapes [hidden, inter] e [inter, hidden]; usa inter=64 stub para não colidir se quiser stub, mas aqui emitimos inter real para mapear quando possível
+            // Para Fase 1 mantemos stub 64 para FFN (evita 11M alloc repetido); Fase 2 emitirá inter real
+            out.push(format!("    FFN r8, r1, r9, r10  ; FFN layer {} (R1->[hidden,64]->[hidden]) stub", layer));
             out.push("    SENSE r15, USER_INPUT".to_string());
             out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
             out.push(format!("    ADD r0, r0, r8       ; R0 += ffn_out layer {}", layer));
@@ -121,8 +126,8 @@ impl AsmEmitter {
     }
 
     pub fn estimate_instr_count(&self) -> usize {
-        // prólogo 5 (3 TENSOR + 2 ctrl) + MAIN_LOOP header 5 + n_layers*10 + epílogo 7
-        5 + 5 + self.config.n_layers * 10 + 7
+        // prólogo 5 + MAIN_LOOP header 5 + n_layers*18 (NORM+3×(TENSOR+MATVEC)+ATTN+TENSOR+MATVEC+ADD+NORM+FFN) + epílogo 7
+        5 + 5 + self.config.n_layers * 18 + 7
     }
 
     /// Escreve arquivo `.m3asm` no path informado.

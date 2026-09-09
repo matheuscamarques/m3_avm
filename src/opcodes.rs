@@ -42,6 +42,7 @@ pub const OP_COMPARE: u8 = 0x0C;
 pub const OP_IF_EQUAL: u8 = 0x0D;
 pub const OP_JUMP: u8 = 0x0E;
 pub const OP_IF_INTERRUPT: u8 = 0x0F;
+pub const OP_MATVEC: u8 = 0x10;
 pub const OP_HALT: u8 = 0x00; // não oficial, usado para encerrar programa
 pub const OP_NOP: u8 = 0xFF;
 
@@ -216,6 +217,7 @@ impl Instruction {
             OP_IF_EQUAL => "IF_EQUAL",
             OP_JUMP => "JUMP",
             OP_IF_INTERRUPT => "IF_INTERRUPT",
+            OP_MATVEC => "MATVEC",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -368,6 +370,10 @@ pub fn instr_if_interrupt(rcond: u8, target_pc: u128) -> Instruction {
     let mut instr = Instruction::new(OP_IF_INTERRUPT, 0, 0xFF, rcond, 0xFF, 0xFF);
     instr.set_imm_u128(target_pc);
     instr
+}
+
+pub fn instr_matvec(rdest: u8, r_x: u8, r_w: u8) -> Instruction {
+    Instruction::new(OP_MATVEC, 0, rdest, r_x, r_w, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +778,15 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             } else {
                 Err(anyhow!("IF_INTERRUPT precisa de rótulo ou rcond, rótulo"))
             }
+        }
+        "MATVEC" => {
+            if parts.len() < 4 {
+                return Err(anyhow!("MATVEC precisa de rdest, r_x, r_w — ex: MATVEC r2, r0, r1"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rx = parse_reg(parts[2])?;
+            let rw = parse_reg(parts[3])?;
+            Ok(instr_matvec(rdest, rx, rw))
         }
         "HALT" => Ok(instr_halt()),
         "NOP" => Ok(instr_nop()),

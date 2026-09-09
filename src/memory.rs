@@ -415,6 +415,11 @@ impl MemoryManager {
             if shape_match {
                 let file_offset = gg.data_offset + t.offset;
                 let addr = make_persistent_addr(file_offset as u128);
+                // Evita mapear mesmo tensor duas vezes para shapes iguais (Q/K/V/O todos 2048x2048)
+                // — cada TENSOR com mesma shape deve pegar o próximo tensor livre com mesma shape
+                if self.tensor_meta.contains_key(&addr) {
+                    continue;
+                }
                 // byte_len depende do dtype real do GGUF
                 let byte_len = match gg_dtype {
                     DType::F32 => elems*4,

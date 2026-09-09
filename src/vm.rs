@@ -57,6 +57,7 @@ pub struct VmStats {
     pub embed_execs: u64,
     pub add_execs: u64,
     pub sample_execs: u64,
+    pub matvec_execs: u64,
     pub interrupt_checks: u64,
     pub streams: u64,
     pub forks: u64,
@@ -665,6 +666,10 @@ impl Vm {
             OP_IF_INTERRUPT => {
                 let jumped = self.exec_if_interrupt(ctx_id, instr)?;
                 Ok(!jumped)
+            }
+            OP_MATVEC => {
+                self.exec_matvec(ctx_id, instr)?;
+                Ok(true)
             }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
         }
@@ -1650,6 +1655,50 @@ impl Vm {
 
         self.stats.senses += 1;
         log_debug("sense", &format!("ctx {} SENSE periph {} -> 0x{:032x} {} bytes", ctx_id, peripheral, addr, data.len()));
+        Ok(())
+    }
+
+    fn exec_matvec(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        // MATVEC Rd, Rx, Rw — GEMV: y = x · W
+        // x: [M, K] ou [K], W: [K, N] → y: [M, N] ou [N]
+        let (x_addr, w_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let meta_x = self.memory.get_tensor_meta(x_addr).cloned()
+            .ok_or_else(|| anyhow!("MATVEC: x tensor não encontrado 0x{:x}", x_addr))?;
+        let meta_w = self.memory.get_tensor_meta(w_addr).cloned()
+            .ok_or_else(|| anyhow!("MATVEC: W tensor não encontrado 0x{:x}", w_addr))?;
+        if meta_x.shape.len() != 2 || meta_w.shape.len() != 2 {
+            return Err(anyhow!("MATVEC: apenas 2D suportado x{:?} w{:?}", meta_x.shape, meta_w.shape));
+        }
+        let m = meta_x.shape[0];
+        let k = meta_x.shape[1];
+        let k_w = meta_w.shape[0];
+        let n = meta_w.shape[1];
+        if k != k_w {
+            return Err(anyhow!("MATVEC incompatível: x cols {} != W rows {}", k, k_w));
+        }
+        let n_x = m * k;
+        let n_w = k * n;
+        let x_data = self.memory.read_f32_tensor(x_addr, n_x)?;
+        let w_data = self.memory.read_f32_tensor(w_addr, n_w)?;
+        // Usa faer/matvec_quant path: para M==1 usa matvec direto, senão batched via ndarray
+        let out_vec: Vec<f32> = if m == 1 {
+            crate::matvec::matvec(&x_data, &w_data, k, n)
+        } else {
+            let x_arr = Array2::from_shape_vec((m, k), x_data).map_err(|e| anyhow!("matvec x reshape: {}", e))?;
+            let w_arr = Array2::from_shape_vec((k, n), w_data).map_err(|e| anyhow!("matvec w reshape: {}", e))?;
+            x_arr.dot(&w_arr).iter().cloned().collect()
+        };
+        let out_shape = vec![m, n];
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out_vec)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.matvec_execs += 1;
+        log_debug("matvec", &format!("ctx {} MATVEC r{} <- matvec(x 0x{:x} {:?} * W 0x{:x} {:?}) => 0x{:x} {:?}", ctx_id, instr.rdest, x_addr, meta_x.shape, w_addr, meta_w.shape, out_addr, out_shape));
         Ok(())
     }
 
