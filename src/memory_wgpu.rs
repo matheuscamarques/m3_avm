@@ -150,6 +150,16 @@ impl WgpuMemoryManager {
         self.cpu_fallback.persistent_flush()
     }
 
+    /// GGUF via fallback CPU (mmap lazy; GPU usa buffers próprios via upload).
+    /// Faltava no dispatch de `MemBackend` e quebrava `--features wgpu`.
+    pub fn load_gguf_model(&mut self, path: &str) -> Result<u128> {
+        self.cpu_fallback.load_gguf_model(path)
+    }
+
+    pub fn load_gguf_bytes(&mut self, bytes: &[u8]) -> Result<u128> {
+        self.cpu_fallback.load_gguf_bytes(bytes)
+    }
+
     pub fn write(&mut self, addr: u128, data: &[u8]) -> Result<()> {
         if let Some(buf) = self.gpu_buffers.get(&addr) {
             self.queue.write_buffer(buf, 0, data);
