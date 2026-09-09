@@ -7,6 +7,7 @@
 > The [status table](#status-implemented-vs-vision) marks what is already implemented
 > in this repo, what is experimental, and what is roadmap. Numbers cited as measured
 > come from `cargo test`/`cargo bench` on the author's host (see `README.md` §5).
+> The mathematical viability models and proofs are in [MATH_MVP.md](MATH_MVP.md).
 
 ```text
 ==================================================================================================
