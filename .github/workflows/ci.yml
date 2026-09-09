@@ -12,10 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run -- assemble examples/minimal.m3asm -o /tmp/minimal.m3bin
-      - run: cargo run -- assemble examples/test.m3asm -o /tmp/test.m3bin
-      - run: cargo run -- assemble examples/nop_demo.m3asm -o /tmp/nop.m3bin
-      - run: cargo run -- disassemble /tmp/minimal.m3bin
+      # NB: o pacote tem 7 bins (m3_avm + tools); `cargo run` exige --bin.
+      - run: cargo run --bin m3_avm -- assemble examples/minimal.m3asm -o /tmp/minimal.m3bin
+      - run: cargo run --bin m3_avm -- assemble examples/test.m3asm -o /tmp/test.m3bin
+      - run: cargo run --bin m3_avm -- assemble examples/nop_demo.m3asm -o /tmp/nop.m3bin
+      - run: cargo run --bin m3_avm -- disassemble /tmp/minimal.m3bin
       - run: test -f /tmp/minimal.m3bin && echo "✅ assembly ok"
 
   unit-isa:
@@ -68,7 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --lib bus::tests::test_bus_zero_overhead_idle -- --nocapture
       - run: cargo test --lib reactor -- --nocapture
-      - run: cargo run -- run examples/nop_demo.m3asm 2>&1 | head -n 30
+      - run: cargo run --bin m3_avm -- run examples/nop_demo.m3asm 2>&1 | head -n 30
 
   wasm-immortality:
     name: "Teste de Fogo — WASM (50 anos)"
@@ -83,7 +84,7 @@ jobs:
       - run: |
           # Prova de portabilidade: a ISA não depende de OS, apenas de buses
           echo "✅ ISA invariante: TENSOR/ATTN/STREAM/FORK/ABORT/SENSE codificam 32 bytes em qualquer arch"
-          cargo run -- disassemble /tmp/minimal.m3bin 2>/dev/null || echo "✅ binário 32 bytes portável"
+          cargo run --bin m3_avm -- disassemble /tmp/minimal.m3bin 2>/dev/null || echo "✅ binário 32 bytes portável"
 
   bench-daily:
     name: "Benchmark Diário — baseline"

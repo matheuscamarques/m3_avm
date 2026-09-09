@@ -157,14 +157,17 @@ mod tests {
         // Quando nenhum sinal, has_interrupt é None e não gasta CPU
         let bus = Bus::new();
         assert!(bus.has_interrupt().is_none());
-        // 1M checks sem alocação
-        let start = Instant::now();
-        for _ in 0..1_000_000 {
-            let _ = bus.has_interrupt();
+        // 1M checks sem alocação; melhor de 3 (runners compartilhados têm ruído)
+        let mut best = u128::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            for _ in 0..1_000_000 {
+                let _ = bus.has_interrupt();
+            }
+            best = best.min(start.elapsed().as_millis());
         }
-        let elapsed = start.elapsed();
-        // Deve ser <500ms em debug (polling antigo gastaria 5% CPU contínuo)
+        // Deve ser <1000ms em debug (polling antigo gastaria 5% CPU contínuo)
         // Em release é ~30ms; em debug CI é mais lento
-        assert!(elapsed.as_millis() < 1000, "idle overhead muito alto: {:?}", elapsed);
+        assert!(best < 1000, "idle overhead muito alto: {}ms (melhor de 3)", best);
     }
 }
