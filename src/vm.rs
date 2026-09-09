@@ -22,8 +22,9 @@ use crate::memory_wgpu::WgpuMemoryManager;
 #[cfg(feature = "wgpu")]
 use pollster;
 use crate::opcodes::{
-    Instruction, INSTR_SIZE, OP_ABORT, OP_ATTN, OP_FFN, OP_FORK, OP_HALT, OP_NOP, OP_NORM, OP_SENSE, OP_STREAM,
-    OP_TENSOR, SENSE_AUDIO, SENSE_VAD, SENSE_TOKEN, STREAM_FLAG_BLOCKING,
+    Instruction, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_COMPARE, OP_EMBED, OP_FFN, OP_FORK, OP_HALT, OP_IF_EQUAL,
+    OP_IF_INTERRUPT, OP_JUMP, OP_NOP, OP_NORM, OP_SAMPLE, OP_SENSE, OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_TOKEN,
+    SENSE_USER_INPUT, SENSE_VAD, STREAM_FLAG_BLOCKING,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -53,6 +54,10 @@ pub struct VmStats {
     pub attn_execs: u64,
     pub norm_execs: u64,
     pub ffn_execs: u64,
+    pub embed_execs: u64,
+    pub add_execs: u64,
+    pub sample_execs: u64,
+    pub interrupt_checks: u64,
     pub streams: u64,
     pub forks: u64,
     pub aborts: u64,
