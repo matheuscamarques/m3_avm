@@ -25,6 +25,11 @@ pub mod quant;
 pub mod inference;
 pub mod matvec;
 pub mod matvec_quant;
+pub mod mimi;
+pub mod moshi;
+pub mod ssm;
+#[cfg(feature = "wgpu")]
+pub mod inference_gpu;
 pub mod tui;
 pub mod utils;
 pub mod vm;
@@ -227,7 +232,20 @@ async fn run_file(path: PathBuf, max_steps: u64, trace: bool, model: Option<Path
             println!("Digite prompt inicial + ENTER. Durante geração, digite novo prompt + ENTER para rollback.\n");
             let gguf_path = model_for_tok.as_ref().map(|p| p.to_str().unwrap_or("").to_string()).unwrap_or_default();
             if gguf_path.is_empty() { return Err(anyhow!("--real precisa de --model GGUF")); }
-            let real_inf = crate::inference::RealInference::new(&gguf_path)?;
+            #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
+            let mut real_inf = crate::inference::RealInference::new(&gguf_path)?;
+            if real_inf.config.is_mamba() {
+                println!("[mamba] arch={} layers={} hidden={} d_inner={} d_state={} d_conv={} dt_rank={} rms={} — forward_one_mamba + estado constante",
+                    real_inf.config.arch, real_inf.config.n_layers, real_inf.config.hidden,
+                    real_inf.config.d_inner, real_inf.config.d_state, real_inf.config.d_conv,
+                    real_inf.config.dt_rank, real_inf.config.dt_b_c_rms);
+            }
+            // Offload híbrido GPU (só com --features wgpu; M3_GPU=0 desliga)
+            #[cfg(feature = "wgpu")]
+            {
+                let n = real_inf.offload_gpu(&vm.memory);
+                println!("[gpu] {n} tensores offloaded (gate/up/down/head); resto no CPU");
+            }
             // Real inference não usa o programa m3asm dummy, mas carrega para manter compat
             vm.load_program(prog);
             let (s, v) = run_real_interactive(vm, real_inf, max_steps, trace).await?;
@@ -763,7 +781,7 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
                     Ok(true)
                 } else {
                 let data: Vec<u8> = match periph {
-                    opcodes::SENSE_AUDIO => (0..256).map(|_| rand::random::<f32>()*2.0-1.0).collect::<Vec<f32>>().iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    opcodes::SENSE_AUDIO => crate::mimi::pcm_to_bytes(&crate::mimi::synth_frame_440hz()),
                     opcodes::SENSE_VAD => vec![if rand::random::<bool>(){1}else{0}],
                     opcodes::SENSE_TOKEN => vm.last_sample.to_le_bytes().to_vec(),
                     _ => b"sense".to_vec(),
@@ -861,7 +879,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                             output_buffer.truncate(tok_idx);
                             entropy_tracker.clear();
                             checkpoints.retain(|c| c.token_idx <= tok_idx);
-                            real.truncate_kv_cache(tok_idx);
+                            real.truncate_caches(tok_idx);
                             real.truncate_gen(tok_idx);
                             let _ = vm.memory.temporal_push(new_prompt.as_bytes());
                             let _ = bus.publish_interrupt(crate::bus::InterruptSignal{ target_ctx: 1, layer: 0, timestamp_ns: crate::utils::now_ns() });
@@ -894,7 +912,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                         repl.print_line("[Real Sem checkpoint — prompt injetado]")?;
                         let prompt_fmt = if new_prompt.contains("<|im_start|>") || new_prompt.contains("<|user|>") { new_prompt.clone() } else { real.format_chat(&new_prompt) };
                         let prompt_tokens = real.tokenize(&prompt_fmt);
-                        real.clear_kv_cache();
+                        real.clear_caches();
                         real.clear_gen();
                         match real.prefill_logits(&vm.memory, &prompt_tokens) {
                             Ok(logits) => {
@@ -921,7 +939,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                     output_buffer.clear();
                     checkpoints.clear();
                     entropy_tracker.clear();
-                    real.clear_kv_cache();
+                    real.clear_caches();
                     real.clear_gen();
                     // Prefill: alimenta KV com todos os tokens do prompt sem amostrar
                     if !prompt_tokens.is_empty() {
@@ -978,7 +996,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
         let token_to_feed = if !token_queue.is_empty() {
             let t = token_queue.remove(0);
             // Prefill: alimenta KV sem gerar output humano
-            let logits = match real.forward_one(&vm.memory, t) {
+            let logits = match real.forward_one_auto(&vm.memory, t) {
                 Ok(l) => l,
                 Err(e) => { eprintln!("[Real prefill fallback falhou: {}]", e); continue; }
             };
@@ -1017,7 +1035,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
         };
 
         // Forward real
-        let logits = match real.forward_one(&vm.memory, token_to_feed) {
+        let logits = match real.forward_one_auto(&vm.memory, token_to_feed) {
             Ok(l) => l,
             Err(e) => { eprintln!("[Real forward falhou: {}]", e); tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; continue; }
         };

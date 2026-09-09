@@ -22,9 +22,11 @@ use crate::memory_wgpu::WgpuMemoryManager;
 #[cfg(feature = "wgpu")]
 use pollster;
 use crate::opcodes::{
-    Instruction, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_COMPARE, OP_EMBED, OP_FFN, OP_FORK, OP_HALT, OP_IF_EQUAL,
-    OP_IF_INTERRUPT, OP_JUMP, OP_NOP, OP_NORM, OP_SAMPLE, OP_SENSE, OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_TOKEN,
-    SENSE_USER_INPUT, SENSE_VAD, STREAM_FLAG_BLOCKING,
+    Instruction, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
+    OP_COMPARE, OP_CTX_SWITCH, OP_EMBED, OP_FFN, OP_FORK, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
+    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
+    OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_AUDIO_PCM, SENSE_CODEC_FRAME, SENSE_TOKEN, SENSE_USER_INPUT,
+    SENSE_VAD, STREAM_FLAG_BLOCKING,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -63,6 +65,13 @@ pub struct VmStats {
     pub forks: u64,
     pub aborts: u64,
     pub senses: u64,
+    pub ssm_scans: u64,
+    pub ssm_resets: u64,
+    pub codec_encs: u64,
+    pub codec_decs: u64,
+    pub audio_aligns: u64,
+    pub ctx_switches: u64,
+    pub ropes: u64,
     pub start_ns: u64,
 }
 
@@ -294,6 +303,11 @@ pub struct Vm {
     pub last_sample: u32,
     /// Fila de entrada do usuário (SENSE USER_INPUT consome sem bloquear)
     pub user_input: VecDeque<String>,
+    /// Estado recorrente Mamba por camada (fase 2 híbrida; MVP usa tensores,
+    /// Rh==0xFF endereça este vetor via payload layer_id).
+    pub ssm_states: Vec<crate::ssm::MambaState>,
+    /// Pilha de snapshots SSM para ABORT/rollback (CoW manual).
+    ssm_snapshots: Vec<Vec<crate::ssm::MambaState>>,
 }
 
 impl Vm {
@@ -302,16 +316,24 @@ impl Vm {
     }
 
     pub fn new_with_persistent_size(config: VmConfig, persistent_bytes: usize) -> Result<Self> {
-        // Auto-detecta Vega 8 se feature wgpu ativa — fallback para CPU
+        // Auto-detecta Vega 8 se feature wgpu ativa — fallback para CPU.
+        // M3_GPU=0 força CPU (útil p/ comparar e em CI sem GPU).
         #[cfg(feature = "wgpu")]
-        let memory = match pollster::block_on(WgpuMemoryManager::new()) {
-            Ok(gpu) => {
-                eprintln!("[vm] Vega 8 detectada — usando WgpuMemoryManager (Vulkan RADV)");
-                MemBackend::Gpu(gpu)
-            }
-            Err(e) => {
-                eprintln!("[vm] wgpu não disponível ({}), fallback CPU", e);
-                MemBackend::Cpu(MemoryManager::new_with_size(persistent_bytes)?)
+        let gpu_off = std::env::var("M3_GPU").map(|v| v == "0").unwrap_or(false);
+        #[cfg(feature = "wgpu")]
+        let memory = if gpu_off {
+            eprintln!("[vm] M3_GPU=0 — backend CPU forçado");
+            MemBackend::Cpu(MemoryManager::new_with_size(persistent_bytes)?)
+        } else {
+            match pollster::block_on(WgpuMemoryManager::new()) {
+                Ok(gpu) => {
+                    eprintln!("[vm] Vega 8 detectada — usando WgpuMemoryManager (Vulkan RADV)");
+                    MemBackend::Gpu(gpu)
+                }
+                Err(e) => {
+                    eprintln!("[vm] wgpu não disponível ({}), fallback CPU", e);
+                    MemBackend::Cpu(MemoryManager::new_with_size(persistent_bytes)?)
+                }
             }
         };
         #[cfg(not(feature = "wgpu"))]
@@ -329,17 +351,15 @@ impl Vm {
             tokenizer: None,
             last_sample: 0,
             user_input: VecDeque::new(),
+            ssm_states: Vec::new(),
+            ssm_snapshots: Vec::new(),
         })
     }
 
-    /// Construtor sem persistência (testes) — tenta Vega 8 se feature wgpu
+    /// Construtor sem persistência (testes) — sempre CPU para determinismo
+    /// (init de device ~800ms na Raven quebraria thresholds de timing; o path
+    /// GPU tem testes próprios via WgpuMemoryManager::new_blocking).
     pub fn new_in_memory(config: VmConfig) -> Self {
-        #[cfg(feature = "wgpu")]
-        let memory = match pollster::block_on(WgpuMemoryManager::new()) {
-            Ok(gpu) => MemBackend::Gpu(gpu),
-            Err(_) => MemBackend::Cpu(MemoryManager::new_in_memory()),
-        };
-        #[cfg(not(feature = "wgpu"))]
         let memory = MemBackend::Cpu(MemoryManager::new_in_memory());
         Self {
             memory,
@@ -353,6 +373,8 @@ impl Vm {
             tokenizer: None,
             last_sample: 0,
             user_input: VecDeque::new(),
+            ssm_states: Vec::new(),
+            ssm_snapshots: Vec::new(),
         }
     }
 
@@ -370,6 +392,8 @@ impl Vm {
             tokenizer: None,
             last_sample: 0,
             user_input: VecDeque::new(),
+            ssm_states: Vec::new(),
+            ssm_snapshots: Vec::new(),
         })
     }
 
@@ -679,6 +703,34 @@ impl Vm {
                 self.exec_silu(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_SSM_SCAN => {
+                self.exec_ssm_scan(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SSM_RESET => {
+                self.exec_ssm_reset(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CODEC_ENC => {
+                self.exec_codec_enc(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CODEC_DEC => {
+                self.exec_codec_dec(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_AUDIO_ALIGN => {
+                self.exec_audio_align(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CTX_SWITCH => {
+                self.exec_ctx_switch(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ROPE => {
+                self.exec_rope(ctx_id, instr)?;
+                Ok(true)
+            }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
         }
     }
@@ -885,17 +937,21 @@ impl Vm {
             return Ok(());
         }
 
-        // Caminho Vega 8 (wgpu) — tenta GPU se backend for Gpu e shapes <=64
+        // Caminho Vega 8 (wgpu) — só para ATTN grande: medido que GPU perde
+        // feio abaixo de ~10M elems (launch+buffers+readback) e só vence no
+        // grande (bench_gpu_gemv). Demos 64x64 ficam no CPU (rápido e testado).
         #[cfg(feature = "wgpu")]
         if self.memory.is_gpu() {
-            // Só tenta GPU para denso e shapes pequenos (Vega 8: 8 CUs, workgroup 8x8)
             let meta_q = self.memory.get_tensor_meta(addr_q).cloned();
             let meta_k = self.memory.get_tensor_meta(addr_k).cloned();
             let meta_v = self.memory.get_tensor_meta(addr_v).cloned();
             let shape_q = meta_q.as_ref().map(|m| m.shape.clone()).unwrap_or(vec![2,2]);
             let shape_k = meta_k.as_ref().map(|m| m.shape.clone()).unwrap_or(vec![2,2]);
             let shape_v = meta_v.as_ref().map(|m| m.shape.clone()).unwrap_or(vec![2,2]);
-            if shape_q[0] <= 64 && shape_q[1] <= 64 {
+            // FLOPs aprox: QK^T (2*m*n*d) + SM*V (2*m*n*p)
+            let flops = 2 * shape_q[0] * shape_k[0] * shape_q[1]
+                + 2 * shape_q[0] * shape_k[0] * shape_v[1];
+            if flops >= 8_000_000 {
                 // Tenta ATTN na Vega 8 — extrai shapes antes do borrow mutável
                 let q_sh = (shape_q[0], shape_q[1]);
                 let k_sh = (shape_k[0], shape_k[1]);
@@ -1615,11 +1671,12 @@ impl Vm {
         let peripheral = instr.rsrc1;
         let data: Vec<u8> = match peripheral {
             SENSE_AUDIO => {
-                // Simula ruído branco: 1024 samples f32 aleatórios -> bytes
-                let mut rng = rand::thread_rng();
-                let samples: Vec<f32> = (0..256).map(|_| rng.gen_range(-1.0..1.0)).collect();
-                let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
-                bytes
+                // F2 Mimi: frame determinístico 24kHz/80ms (1920 samples senoide
+                // 440Hz) em vez de white-noise rand. Mesmo bytes por chamada,
+                // codificável via `crate::mimi::encode_frame` (16cb@12.5Hz).
+                let frame = crate::mimi::synth_frame_440hz();
+                debug_assert_eq!(frame.len(), crate::mimi::MIMI_SAMPLES_PER_FRAME);
+                crate::mimi::pcm_to_bytes(&frame)
             }
             SENSE_VAD => {
                 // VAD stub: 1 byte 0/1 aleatório + timestamp

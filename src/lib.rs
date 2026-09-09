@@ -16,6 +16,11 @@ pub mod quant;
 pub mod inference;
 pub mod matvec;
 pub mod matvec_quant;
+pub mod mimi;
+pub mod moshi;
+pub mod ssm;
+#[cfg(feature = "wgpu")]
+pub mod inference_gpu;
 pub mod tui;
 pub mod utils;
 pub mod vm;

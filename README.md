@@ -1,9 +1,11 @@
 # M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation
 
+> **Author: Matheus de Camargo Marques** — Máquina Abstrata de Matheus de Camargo Marques · https://github.com/matheuscamarques/m3_avm · If you use this work, please cite it (see [CITATION.cff](CITATION.cff) / [How to cite](#license--citation)).
+
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
 [![ISA](https://img.shields.io/badge/ISA-15%20Opcodes-blueviolet)](docs/ISA.md)
 [![Sparse](https://img.shields.io/badge/Support-Sparse%20%26%20Dense-brightgreen)]()
-[![License](https://img.shields.io/badge/License-Apache_2.0-green)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL_v3.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow)]()
 
 ## Abstract — What This Emulator Actually Is
@@ -223,6 +225,22 @@ PROGRAM_END:
 - [ ] Validate 1024+ dims (tested up to 64 for sparse, 2048 for dense).
 - [ ] Re-introduce JusrisOS adapter when `TARGET` defined.
 
-## License
+## License — Citation
 
-Apache 2.0. Contributions welcome, especially sparse-dense matmul optimizations.
+**© 2026 Matheus de Camargo Marques. Licensed under AGPL-3.0-or-later — see [LICENSE](LICENSE).**
+
+Network use of a modified version (e.g. hosted inference) requires offering the Corresponding Source to users (AGPL §13). For a proprietary/commercial license without copyleft obligations, contact the author.
+
+**How to cite:**
+
+```bibtex
+@software{m3_avm_2026,
+  author  = {Marques, Matheus de Camargo},
+  title   = {M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation},
+  year    = {2026},
+  url     = {https://github.com/matheuscamarques/m3_avm},
+  license = {AGPL-3.0-or-later}
+}
+```
+
+Or use the machine-readable [CITATION.cff](CITATION.cff) (GitHub "Cite this repository"). Contributions welcome, especially sparse-dense matmul optimizations — by contributing you agree your code is licensed under the same AGPL-3.0-or-later.

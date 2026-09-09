@@ -45,6 +45,14 @@ pub const OP_IF_INTERRUPT: u8 = 0x0F;
 pub const OP_MATVEC: u8 = 0x10;
 pub const OP_MUL: u8 = 0x11;
 pub const OP_SILU: u8 = 0x12;
+// Mamba / SSM + Audio Codec + controle híbrido (ISA 0x13..0x19)
+pub const OP_SSM_SCAN: u8 = 0x13; // h*=exp(dt*A)+x*B*dt; y=h·C+D*x (ssm.rs)
+pub const OP_SSM_RESET: u8 = 0x14; // zera/restaura h_t O(1)
+pub const OP_CODEC_ENC: u8 = 0x15; // PCM 1920xf32 -> 16xu16 (mimi.rs)
+pub const OP_CODEC_DEC: u8 = 0x16; // 16xu16 -> PCM 1920xf32
+pub const OP_AUDIO_ALIGN: u8 = 0x17; // t_user/t_ai/delta/frame_id p/ barge-in
+pub const OP_CTX_SWITCH: u8 = 0x18; // troca pipeline + fence + prioridade
+pub const OP_ROPE: u8 = 0x19; // Rotary Position Embedding nativo
 pub const OP_HALT: u8 = 0x00; // não oficial, usado para encerrar programa
 pub const OP_NOP: u8 = 0xFF;
 
@@ -67,6 +75,20 @@ pub const SENSE_AUDIO: u8 = 0;
 pub const SENSE_VAD: u8 = 1;
 pub const SENSE_TOKEN: u8 = 3; // PERIPHERAL_TOKEN lido via SENSE Rtoken, TOKEN
 pub const SENSE_USER_INPUT: u8 = 5; // PERIPHERAL_USER_INPUT lido via SENSE Rd, USER_INPUT
+pub const SENSE_AUDIO_PCM: u8 = 6; // PCM bruto 24kHz/80ms (1920xf32) p/ CODEC_ENC
+pub const SENSE_CODEC_FRAME: u8 = 7; // Frame já codificado Mimi (32B, 16xu16)
+
+// Flags — SSM_SCAN
+pub const SSM_SCAN_FLAG_CONV: u8 = 0b01; // (reservado) aplica conv causal antes do scan
+pub const SSM_SCAN_FLAG_GATE: u8 = 0b10; // (reservado) aplica gating silu(z) após scan
+// Flags — CODEC_ENC/DEC
+pub const CODEC_FLAG_AS_TENSOR: u8 = 0b01; // Rd/Rpcm como tensor em vez de TEMPORAL bytes
+// Flags — ROPE
+pub const ROPE_FLAG_INPLACE: u8 = 0b01; // Rd == Rsrc1, atualiza in-place
+// Pipeline ids — CTX_SWITCH (em rsrc1)
+pub const PIPE_MAMBA: u8 = 0;
+pub const PIPE_TRANSFORMER: u8 = 1;
+pub const PIPE_AUDIO: u8 = 2;
 // STREAM sinks periféricos (valor do registrador Rsink ou imediato Rsink==periph id)
 pub const STREAM_PERIPHERAL_SAMPLE: u128 = 2; // sink 2 = amostra logits -> token
 pub const STREAM_PERIPHERAL_OUTPUT_DECODED: u128 = 4; // sink 4 = decodifica token e imprime
@@ -222,6 +244,13 @@ impl Instruction {
             OP_MATVEC => "MATVEC",
             OP_MUL => "MUL",
             OP_SILU => "SILU",
+            OP_SSM_SCAN => "SSM_SCAN",
+            OP_SSM_RESET => "SSM_RESET",
+            OP_CODEC_ENC => "CODEC_ENC",
+            OP_CODEC_DEC => "CODEC_DEC",
+            OP_AUDIO_ALIGN => "AUDIO_ALIGN",
+            OP_CTX_SWITCH => "CTX_SWITCH",
+            OP_ROPE => "ROPE",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -238,6 +267,63 @@ impl Instruction {
     pub fn set_ffn_bias_regs(&mut self, rb1: u8, rb2: u8) {
         self.payload[0] = rb1;
         self.payload[1] = rb2;
+    }
+
+    /// Helpers SSM_SCAN/RESET: payload[0..2]=d_inner u16 LE, [2..4]=d_state u16 LE,
+    /// [4]=layer_id, [5..8]=reserved. Fase 2 usa layer_id p/ Vm.ssm_states.
+    pub fn ssm_dims(&self) -> (usize, usize, u8) {
+        let di = u16::from_le_bytes([self.payload[0], self.payload[1]]) as usize;
+        let ds = u16::from_le_bytes([self.payload[2], self.payload[3]]) as usize;
+        (if di == 0 { 1 } else { di }, if ds == 0 { 1 } else { ds }, self.payload[4])
+    }
+
+    pub fn set_ssm_dims(&mut self, d_inner: usize, d_state: usize, layer_id: u8) {
+        self.payload[0..2].copy_from_slice(&(d_inner.min(65535) as u16).to_le_bytes());
+        self.payload[2..4].copy_from_slice(&(d_state.min(65535) as u16).to_le_bytes());
+        self.payload[4] = layer_id;
+    }
+
+    /// Helpers ROPE: payload[0..4]=pos u32 LE, [4..6]=head_dim u16, [6..8]=n_heads u16,
+    /// [8..12]=theta f32 LE.
+    pub fn rope_params(&self) -> (u32, usize, usize, f32) {
+        let mut b4 = [0u8; 4];
+        b4.copy_from_slice(&self.payload[0..4]);
+        let pos = u32::from_le_bytes(b4);
+        let hd = u16::from_le_bytes([self.payload[4], self.payload[5]]) as usize;
+        let nh = u16::from_le_bytes([self.payload[6], self.payload[7]]) as usize;
+        let mut bt = [0u8; 4];
+        bt.copy_from_slice(&self.payload[8..12]);
+        let theta = f32::from_le_bytes(bt);
+        (pos, if hd == 0 { 2 } else { hd }, if nh == 0 { 1 } else { nh }, if theta <= 0.0 { 10_000.0 } else { theta })
+    }
+
+    pub fn set_rope_params(&mut self, pos: u32, head_dim: usize, n_heads: usize, theta: f32) {
+        self.payload[0..4].copy_from_slice(&pos.to_le_bytes());
+        self.payload[4..6].copy_from_slice(&(head_dim.min(65535) as u16).to_le_bytes());
+        self.payload[6..8].copy_from_slice(&(n_heads.min(65535) as u16).to_le_bytes());
+        self.payload[8..12].copy_from_slice(&theta.to_le_bytes());
+    }
+
+    /// Helpers AUDIO_ALIGN: payload[0..4]=sample_rate u32, [4..8]=samples_per_frame u32,
+    /// [8..12]=frame_hz_x100 u32, [12..16]=delay_ms_x100 u32.
+    pub fn audio_align_params(&self) -> (u32, u32, f32, f32) {
+        let sr = u32::from_le_bytes([self.payload[0], self.payload[1], self.payload[2], self.payload[3]]);
+        let spf = u32::from_le_bytes([self.payload[4], self.payload[5], self.payload[6], self.payload[7]]);
+        let fh100 = u32::from_le_bytes([self.payload[8], self.payload[9], self.payload[10], self.payload[11]]);
+        let dl100 = u32::from_le_bytes([self.payload[12], self.payload[13], self.payload[14], self.payload[15]]);
+        (
+            if sr == 0 { 24_000 } else { sr },
+            if spf == 0 { 1920 } else { spf },
+            if fh100 == 0 { 12.5 } else { fh100 as f32 / 100.0 },
+            if dl100 == 0 { 160.0 } else { dl100 as f32 / 100.0 },
+        )
+    }
+
+    pub fn set_audio_align_params(&mut self, sample_rate: u32, samples_per_frame: u32, frame_hz: f32, delay_ms: f32) {
+        self.payload[0..4].copy_from_slice(&sample_rate.to_le_bytes());
+        self.payload[4..8].copy_from_slice(&samples_per_frame.to_le_bytes());
+        self.payload[8..12].copy_from_slice(&((frame_hz * 100.0).round() as u32).to_le_bytes());
+        self.payload[12..16].copy_from_slice(&((delay_ms * 100.0).round() as u32).to_le_bytes());
     }
 }
 
@@ -386,6 +472,47 @@ pub fn instr_mul(rdest: u8, rsrc1: u8, rsrc2: u8) -> Instruction {
 
 pub fn instr_silu(rdest: u8, rsrc: u8) -> Instruction {
     Instruction::new(OP_SILU, 0, rdest, rsrc, 0xFF, 0xFF)
+}
+
+/// SSM_SCAN Rd,Rx,Rh,Rp — y = scan(x, h, dt/A/B/C/D). Rp = pack TEMPORAL/GLOBAL
+/// com dt[d_inner]+A[d_inner*d_state]+B[d_state]+C[d_state]+D[d_inner] f32 LE.
+/// Se Rh == 0xFF, usa Vm.ssm_states[layer_id] (fase 2 híbrida).
+pub fn instr_ssm_scan(rdest: u8, r_x: u8, r_h: u8, r_params: u8, d_inner: usize, d_state: usize, layer_id: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_SSM_SCAN, 0, rdest, r_x, r_h, r_params);
+    instr.set_ssm_dims(d_inner, d_state, layer_id);
+    instr
+}
+
+pub fn instr_ssm_reset(r_h: u8, d_inner: usize, d_state: usize, layer_id: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_SSM_RESET, 0, 0xFF, r_h, 0xFF, 0xFF);
+    instr.set_ssm_dims(d_inner, d_state, layer_id);
+    instr
+}
+
+pub fn instr_codec_enc(rdest: u8, r_pcm: u8, as_tensor: bool) -> Instruction {
+    let flags = if as_tensor { CODEC_FLAG_AS_TENSOR } else { 0 };
+    Instruction::new(OP_CODEC_ENC, flags, rdest, r_pcm, 0xFF, 0xFF)
+}
+
+pub fn instr_codec_dec(rdest: u8, r_codes: u8, as_tensor: bool) -> Instruction {
+    let flags = if as_tensor { CODEC_FLAG_AS_TENSOR } else { 0 };
+    Instruction::new(OP_CODEC_DEC, flags, rdest, r_codes, 0xFF, 0xFF)
+}
+
+pub fn instr_audio_align(rdest: u8, r_user: u8, r_ai: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_AUDIO_ALIGN, 0, rdest, r_user, r_ai, 0xFF);
+    instr.set_audio_align_params(24_000, 1920, 12.5, 160.0);
+    instr
+}
+
+pub fn instr_ctx_switch(pipe_id: u8, priority_flag: u8) -> Instruction {
+    Instruction::new(OP_CTX_SWITCH, priority_flag, 0xFF, pipe_id, 0xFF, 0xFF)
+}
+
+pub fn instr_rope(rdest: u8, r_src: u8, pos: u32, head_dim: usize, n_heads: usize, theta: f32) -> Instruction {
+    let mut instr = Instruction::new(OP_ROPE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_rope_params(pos, head_dim, n_heads, theta);
+    instr
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +782,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
         }
         "SENSE" => {
             if parts.len() < 3 {
-                return Err(anyhow!("SENSE precisa de rdest, periférico (AUDIO/VAD/TOKEN/USER_INPUT/0/1/3/5)"));
+                return Err(anyhow!("SENSE precisa de rdest, periférico (AUDIO/VAD/TOKEN/USER_INPUT/AUDIO_PCM/CODEC_FRAME/0/1/3/5/6/7)"));
             }
             let rdest = parse_reg(parts[1])?;
             let periph = match parts[2].to_ascii_uppercase().as_str() {
@@ -663,6 +790,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 "VAD" | "1" => SENSE_VAD,
                 "TOKEN" | "3" => SENSE_TOKEN,
                 "USER_INPUT" | "PERIPHERAL_USER_INPUT" | "5" => SENSE_USER_INPUT,
+                "AUDIO_PCM" | "PCM" | "6" => SENSE_AUDIO_PCM,
+                "CODEC_FRAME" | "MIMI" | "7" => SENSE_CODEC_FRAME,
                 _ => {
                     if let Ok(n) = parts[2].parse::<u8>() {
                         n
@@ -816,6 +945,127 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             let rdest = parse_reg(parts[1])?;
             let rsrc = parse_reg(parts[2])?;
             Ok(instr_silu(rdest, rsrc))
+        }
+        "SSM_SCAN" => {
+            // SSM_SCAN rY, rX, rH, rP [D_INNER=n D_STATE=n LAYER=n] [CONV] [GATE]
+            if parts.len() < 5 {
+                return Err(anyhow!("SSM_SCAN precisa de rdest, r_x, r_h, r_params — ex: SSM_SCAN r5, r0, r1, r2 D_INNER=8 D_STATE=4"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rx = parse_reg(parts[2])?;
+            let rh = parse_reg(parts[3])?;
+            let rp = parse_reg(parts[4])?;
+            let (mut di, mut ds, mut layer) = (1usize, 1usize, 0u8);
+            let mut flags = 0u8;
+            for p in &parts[5..] {
+                let up = p.to_ascii_uppercase();
+                if up == "CONV" { flags |= SSM_SCAN_FLAG_CONV; }
+                else if up == "GATE" { flags |= SSM_SCAN_FLAG_GATE; }
+                else if let Some(v) = up.strip_prefix("D_INNER=") { if let Ok(n) = v.parse::<usize>() { di = n; } }
+                else if let Some(v) = up.strip_prefix("D_STATE=") { if let Ok(n) = v.parse::<usize>() { ds = n; } }
+                else if let Some(v) = up.strip_prefix("LAYER=") { if let Ok(n) = v.parse::<u8>() { layer = n; } }
+            }
+            let mut instr = instr_ssm_scan(rdest, rx, rh, rp, di, ds, layer);
+            instr.flags = flags;
+            Ok(instr)
+        }
+        "SSM_RESET" => {
+            // SSM_RESET rH [D_INNER=n D_STATE=n LAYER=n]
+            if parts.len() < 2 {
+                return Err(anyhow!("SSM_RESET precisa de r_h — ex: SSM_RESET r1"));
+            }
+            let rh = parse_reg(parts[1])?;
+            let (mut di, mut ds, mut layer) = (1usize, 1usize, 0u8);
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("D_INNER=") { if let Ok(n) = v.parse::<usize>() { di = n; } }
+                else if let Some(v) = up.strip_prefix("D_STATE=") { if let Ok(n) = v.parse::<usize>() { ds = n; } }
+                else if let Some(v) = up.strip_prefix("LAYER=") { if let Ok(n) = v.parse::<u8>() { layer = n; } }
+            }
+            Ok(instr_ssm_reset(rh, di, ds, layer))
+        }
+        "CODEC_ENC" => {
+            // CODEC_ENC rD, rS [TENSOR]
+            if parts.len() < 3 {
+                return Err(anyhow!("CODEC_ENC precisa de rdest, r_pcm — ex: CODEC_ENC r2, r0"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rpcm = parse_reg(parts[2])?;
+            let as_tensor = parts[3..].iter().any(|p| p.to_ascii_uppercase() == "TENSOR");
+            Ok(instr_codec_enc(rdest, rpcm, as_tensor))
+        }
+        "CODEC_DEC" => {
+            // CODEC_DEC rD, rS [TENSOR]
+            if parts.len() < 3 {
+                return Err(anyhow!("CODEC_DEC precisa de rdest, r_codes — ex: CODEC_DEC r3, r2"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rc = parse_reg(parts[2])?;
+            let as_tensor = parts[3..].iter().any(|p| p.to_ascii_uppercase() == "TENSOR");
+            Ok(instr_codec_dec(rdest, rc, as_tensor))
+        }
+        "AUDIO_ALIGN" => {
+            // AUDIO_ALIGN rD, rU, rA [SR=24000 FRAME=1920 HZ=12.5 DELAY=160]
+            if parts.len() < 4 {
+                return Err(anyhow!("AUDIO_ALIGN precisa de rdest, r_user, r_ai — ex: AUDIO_ALIGN r4, r0, r1"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let ru = parse_reg(parts[2])?;
+            let ra = parse_reg(parts[3])?;
+            let (mut sr, mut spf, mut hz, mut dl) = (24_000u32, 1920u32, 12.5f32, 160.0f32);
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("SR=") { if let Ok(n) = v.parse::<u32>() { sr = n; } }
+                else if let Some(v) = up.strip_prefix("FRAME=") { if let Ok(n) = v.parse::<u32>() { spf = n; } }
+                else if let Some(v) = up.strip_prefix("HZ=") { if let Ok(n) = v.parse::<f32>() { hz = n; } }
+                else if let Some(v) = up.strip_prefix("DELAY=") { if let Ok(n) = v.parse::<f32>() { dl = n; } }
+            }
+            let mut instr = instr_audio_align(rdest, ru, ra);
+            instr.set_audio_align_params(sr, spf, hz, dl);
+            Ok(instr)
+        }
+        "CTX_SWITCH" => {
+            // CTX_SWITCH MAMBA|TRANSFORMER|AUDIO [RED|BLUE|GREEN]
+            if parts.len() < 2 {
+                return Err(anyhow!("CTX_SWITCH precisa de pipeline — ex: CTX_SWITCH MAMBA, RED"));
+            }
+            let pipe = match parts[1].to_ascii_uppercase().as_str() {
+                "MAMBA" | "SSM" | "0" => PIPE_MAMBA,
+                "TRANSFORMER" | "LLM" | "1" => PIPE_TRANSFORMER,
+                "AUDIO" | "MOSHI" | "DEPFORMER" | "2" => PIPE_AUDIO,
+                _ => parse_reg(parts[1]).unwrap_or(PIPE_TRANSFORMER),
+            };
+            let mut prio = 0u8;
+            for p in &parts[2..] {
+                match p.to_ascii_uppercase().as_str() {
+                    "RED" | "2" => prio = 0b10,
+                    "BLUE" | "1" => prio = 0b01,
+                    "GREEN" | "0" => prio = 0b00,
+                    _ => {}
+                }
+            }
+            Ok(instr_ctx_switch(pipe, prio))
+        }
+        "ROPE" => {
+            // ROPE rD, rS POS=n HDIM=n NHEADS=n [THETA=n] [INPLACE]
+            if parts.len() < 3 {
+                return Err(anyhow!("ROPE precisa de rdest, rsrc — ex: ROPE r2, r0 POS=0 HDIM=8 NHEADS=2"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rsrc = parse_reg(parts[2])?;
+            let (mut pos, mut hd, mut nh, mut theta) = (0u32, 2usize, 1usize, 10_000.0f32);
+            let mut inplace = false;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if up == "INPLACE" { inplace = true; }
+                else if let Some(v) = up.strip_prefix("POS=") { if let Ok(n) = v.parse::<u32>() { pos = n; } }
+                else if let Some(v) = up.strip_prefix("HDIM=") { if let Ok(n) = v.parse::<usize>() { hd = n; } }
+                else if let Some(v) = up.strip_prefix("NHEADS=") { if let Ok(n) = v.parse::<usize>() { nh = n; } }
+                else if let Some(v) = up.strip_prefix("THETA=") { if let Ok(n) = v.parse::<f32>() { theta = n; } }
+            }
+            let mut instr = instr_rope(rdest, rsrc, pos, hd, nh, theta);
+            if inplace { instr.flags |= ROPE_FLAG_INPLACE; }
+            Ok(instr)
         }
         "HALT" => Ok(instr_halt()),
         "NOP" => Ok(instr_nop()),
@@ -971,5 +1221,67 @@ mod tests {
 
         // PROGRAM_END está no índice 10 (PC = 0x1000 + 10 * 32 = 0x1140)
         assert_eq!(prog[6].imm_u128(), 0x1000 + 10 * 32);
+    }
+
+    #[test]
+    fn test_new_isa_0x13_0x19_roundtrip() {
+        let s = instr_ssm_scan(5, 0, 1, 2, 8, 4, 3);
+        assert_eq!(s.opcode, OP_SSM_SCAN);
+        assert_eq!(s.ssm_dims(), (8, 4, 3));
+        let dec = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(dec.opcode, OP_SSM_SCAN);
+        assert_eq!(dec.ssm_dims(), (8, 4, 3));
+
+        let r = instr_rope(2, 0, 7, 8, 2, 10_000.0);
+        assert_eq!(r.opcode, OP_ROPE);
+        let (pos, hd, nh, th) = r.rope_params();
+        assert_eq!((pos, hd, nh), (7, 8, 2));
+        assert!((th - 10_000.0).abs() < 1e-3);
+
+        let a = instr_audio_align(4, 0, 1);
+        let (sr, spf, hz, dl) = a.audio_align_params();
+        assert_eq!((sr, spf), (24_000, 1920));
+        assert!((hz - 12.5).abs() < 1e-3 && (dl - 160.0).abs() < 1e-3);
+
+        for (op, mk) in [
+            (OP_SSM_RESET, instr_ssm_reset(1, 4, 4, 0)),
+            (OP_CODEC_ENC, instr_codec_enc(2, 0, false)),
+            (OP_CODEC_DEC, instr_codec_dec(3, 2, false)),
+            (OP_CTX_SWITCH, instr_ctx_switch(PIPE_MAMBA, 0b10)),
+        ] {
+            assert_eq!(mk.opcode, op);
+            let d = Instruction::decode(&mk.encode()).unwrap();
+            assert_eq!(d.opcode, op);
+            assert_eq!(d.mnemonic(), mk.mnemonic());
+        }
+    }
+
+    #[test]
+    fn test_new_isa_assemble() {
+        let src = r#"
+            SSM_SCAN r5, r0, r1, r2 D_INNER=2 D_STATE=2 LAYER=0
+            SSM_RESET r1 D_INNER=2 D_STATE=2
+            CODEC_ENC r2, r0
+            CODEC_DEC r3, r2
+            AUDIO_ALIGN r4, r0, r1
+            CTX_SWITCH MAMBA, RED
+            ROPE r2, r0 POS=0 HDIM=4 NHEADS=1
+            SENSE r6, AUDIO_PCM
+            SENSE r7, CODEC_FRAME
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        assert_eq!(prog[0].opcode, OP_SSM_SCAN);
+        assert_eq!(prog[0].ssm_dims(), (2, 2, 0));
+        assert_eq!(prog[1].opcode, OP_SSM_RESET);
+        assert_eq!(prog[2].opcode, OP_CODEC_ENC);
+        assert_eq!(prog[3].opcode, OP_CODEC_DEC);
+        assert_eq!(prog[4].opcode, OP_AUDIO_ALIGN);
+        assert_eq!(prog[5].opcode, OP_CTX_SWITCH);
+        assert_eq!(prog[5].rsrc1, PIPE_MAMBA);
+        assert_eq!(prog[6].opcode, OP_ROPE);
+        assert_eq!(prog[7].opcode, OP_SENSE);
+        assert_eq!(prog[7].rsrc1, SENSE_AUDIO_PCM);
+        assert_eq!(prog[8].rsrc1, SENSE_CODEC_FRAME);
     }
 }

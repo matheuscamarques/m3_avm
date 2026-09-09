@@ -80,6 +80,13 @@ impl std::fmt::Display for ContextState {
     }
 }
 
+/// Pipeline de execução ativo do contexto (CTX_SWITCH 0x18).
+/// 0=Mamba/SSM, 1=Transformer (default), 2=Áudio/Depformer.
+pub type PipelineId = u8;
+pub const PIPE_MAMBA_CTX: PipelineId = 0;
+pub const PIPE_TRANSFORMER_CTX: PipelineId = 1;
+pub const PIPE_AUDIO_CTX: PipelineId = 2;
+
 #[derive(Debug, Clone)]
 pub struct Context {
     pub id: u64,
@@ -94,6 +101,8 @@ pub struct Context {
     pub cmp_equal: bool,
     /// Flag de interrupção específica do contexto
     pub interrupt_flag: bool,
+    /// Pipeline ativo (CTX_SWITCH). Default Transformer para compat.
+    pub pipeline: PipelineId,
 }
 
 impl Context {
@@ -108,6 +117,7 @@ impl Context {
             created_at_ns: crate::utils::now_ns(),
             cmp_equal: false,
             interrupt_flag: false,
+            pipeline: PIPE_TRANSFORMER_CTX,
         }
     }
 

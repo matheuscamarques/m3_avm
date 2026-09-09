@@ -30,7 +30,6 @@ fn gemv_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> x_q4: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y_q4: array<f32>;
 @group(0) @binding(3) var<uniform> params_q4: Params;
-
 fn get_u8_at(word_idx: u32, byte_in_word: u32) -> u32 {
     return (w_u32[word_idx] >> (byte_in_word * 8u)) & 0xFFu;
 }
@@ -120,4 +119,75 @@ fn gemv_q4k(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     y_q4[j] = acc;
+}
+
+// ---- Q6_K fundido: 210B/bloco (ql[128], qh[64], scales[16] int8, d f16) ----
+@group(0) @binding(0) var<storage, read> w6_u32: array<u32>;
+@group(0) @binding(1) var<storage, read> x_q6: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y_q6: array<f32>;
+@group(0) @binding(3) var<uniform> params_q6: Params;
+
+// byte absoluto k do tensor -> valor
+fn raw6_byte(base: u32, k: u32) -> u32 {
+    let abs = base + k;
+    return (w6_u32[abs / 4u] >> ((abs % 4u) * 8u)) & 0xFFu;
+}
+
+fn f16_6(bits: u32) -> f32 {
+    let exp = (bits >> 10u) & 0x1Fu;
+    let mant = bits & 0x3FFu;
+    if (exp == 0u) { return 0.0; }
+    if (exp == 31u) { return 3.402823466e+38; }
+    let e = i32(exp) - 15 + 127;
+    return bitcast<f32>((u32(e) << 23u) | (mant << 13u));
+}
+
+fn i8_6(v: u32) -> f32 {
+    // scales int8 com sinal
+    if (v >= 128u) {
+        return f32(i32(v) - 256);
+    }
+    return f32(v);
+}
+
+@compute @workgroup_size(64)
+fn gemv_q6k(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let j = gid.x;
+    if (j >= params_q6.out_dim) { return; }
+    let in_dim = params_q6.in_dim;
+    let blocks_per_col = in_dim / 256u;
+    let first_block = (j * in_dim) / 256u;
+    let i0col = (j * in_dim) % 256u; // == 0 quando 256 | in_dim
+    var acc: f32 = 0.0;
+    for (var bb: u32 = 0u; bb < blocks_per_col; bb = bb + 1u) {
+        let base = (first_block + bb) * 210u; // byte base do bloco
+        let d = f16_6(raw6_byte(base, 208u) | (raw6_byte(base, 209u) << 8u));
+        let i0 = i0col + bb * 256u;
+        // duas metades de 128
+        for (var nn: u32 = 0u; nn < 2u; nn = nn + 1u) {
+            let ql0 = base + nn * 64u;   // ql da metade (64B usados: l e l+32)
+            let qh0 = base + 128u + nn * 32u;
+            let sc0 = base + 192u + nn * 8u;
+            for (var l: u32 = 0u; l < 32u; l = l + 1u) {
+                let is = l / 16u;
+                let ql_a = raw6_byte(0u, ql0 + l);
+                let ql_b = raw6_byte(0u, ql0 + l + 32u);
+                let qh = raw6_byte(0u, qh0 + l);
+                let q1 = f32(i32((ql_a & 0xFu) | (((qh >> 0u) & 3u) << 4u)) - 32);
+                let q2 = f32(i32((ql_b & 0xFu) | (((qh >> 2u) & 3u) << 4u)) - 32);
+                let q3 = f32(i32((ql_a >> 4u) | (((qh >> 4u) & 3u) << 4u)) - 32);
+                let q4 = f32(i32((ql_b >> 4u) | (((qh >> 6u) & 3u) << 4u)) - 32);
+                let s0 = i8_6(raw6_byte(0u, sc0 + is));
+                let s2 = i8_6(raw6_byte(0u, sc0 + is + 2u));
+                let s4 = i8_6(raw6_byte(0u, sc0 + is + 4u));
+                let s6 = i8_6(raw6_byte(0u, sc0 + is + 6u));
+                let base_e = i0 + nn * 128u;
+                acc = acc + d * s0 * q1 * x_q6[base_e + l];
+                acc = acc + d * s2 * q2 * x_q6[base_e + l + 32u];
+                acc = acc + d * s4 * q3 * x_q6[base_e + l + 64u];
+                acc = acc + d * s6 * q4 * x_q6[base_e + l + 96u];
+            }
+        }
+    }
+    y_q6[j] = acc;
 }

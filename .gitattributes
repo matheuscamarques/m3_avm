@@ -1,0 +1,14 @@
+# GitHub linguist + line-ending hygiene for a public systems repo
+* text=auto eol=lf
+
+# Generated / vendored — don't count as your code
+Cargo.lock linguist-generated=false
+target/** linguist-vendored=true
+whisper.cpp/** linguist-vendored=true
+
+# Assembly sources are first-class code here
+*.m3asm linguist-language=Assembly
+*.m3bin linguist-vendored=true
+*.gguf linguist-vendored=true
+*.bin linguist-vendored=true
+*.dat linguist-vendored=true

@@ -23,6 +23,14 @@ pub struct ModelConfig {
     pub context_length: usize,
     pub rope_theta: f32,
     pub norm_eps: f32,
+    // --- Mamba (spike: arch=mamba / falcon_mamba) ---
+    // GGUF KV: {arch}.ssm.{conv_kernel,inner_size,state_size,time_step_rank,dt_b_c_rms}
+    // Ref: llama.cpp gguf-py/gguf/constants.py (Keys.SSM) + conversion/mamba.py
+    pub d_inner: usize,         // ssm.inner_size (default 2*hidden)
+    pub d_state: usize,         // ssm.state_size (default 16)
+    pub d_conv: usize,          // ssm.conv_kernel (default 4)
+    pub dt_rank: usize,         // ssm.time_step_rank (default ceil(hidden/16))
+    pub dt_b_c_rms: bool,       // Falcon-Mamba aplica RMS em dt/B/C
 }
 
 impl ModelConfig {
@@ -46,12 +54,13 @@ impl ModelConfig {
         };
         let arch = get("general.architecture");
         // hidden: qwen2.embedding_length vs llama.embedding_length vs general
-        let hidden = get_parse(&["qwen2.embedding_length", "llama.embedding_length", "mistral.embedding_length", "general.embedding_length", "hidden_size"], 2048);
+        // (+mamba/falcon_mamba para o spike SSM)
+        let hidden = get_parse(&["qwen2.embedding_length", "llama.embedding_length", "mistral.embedding_length", "mamba.embedding_length", "falcon_mamba.embedding_length", "general.embedding_length", "hidden_size"], 2048);
         let hidden = if hidden == 2048 && arch == "qwen2" { get_parse(&["qwen2.embedding_length"], 1536) } else { hidden };
         // intermediate
         let intermediate = get_parse(&["qwen2.feed_forward_length", "qwen2.intermediate_size", "llama.feed_forward_length", "mistral.feed_forward_length", "intermediate_size"], 5632);
         // layers
-        let n_layers = get_parse(&["qwen2.block_count", "llama.block_count", "mistral.block_count", "general.block_count", "num_hidden_layers"], 22);
+        let n_layers = get_parse(&["qwen2.block_count", "llama.block_count", "mistral.block_count", "mamba.block_count", "falcon_mamba.block_count", "general.block_count", "num_hidden_layers"], 22);
         // heads
         let n_heads = get_parse(&["qwen2.attention.head_count", "llama.attention.head_count", "mistral.attention.head_count", "num_attention_heads"], 32);
         // kv heads (GQA)
@@ -64,16 +73,28 @@ impl ModelConfig {
                 if v.starts_with("array[") { v[6..v.len()-1].parse().unwrap_or(32000) } else { 32000 }
             } else { 32000 }
         } else { vocab };
-        let context_length = get_parse(&["qwen2.context_length", "llama.context_length", "general.context_length"], 2048);
+        let context_length = get_parse(&["qwen2.context_length", "llama.context_length", "mamba.context_length", "general.context_length"], 2048);
         let rope_theta = get_f32(&["qwen2.rope.freq_base", "llama.rope.freq_base", "general.rope.freq_base"], 10000.0);
-        let norm_eps = get_f32(&["qwen2.attention.layer_norm_rms_epsilon", "llama.attention.layer_norm_rms_epsilon", "general.layer_norm_rms_epsilon"], 1e-5);
-        Self { hidden, intermediate, n_layers, n_heads, n_kv_heads, vocab, arch: arch.clone(), context_length, rope_theta, norm_eps }
+        let norm_eps = get_f32(&["qwen2.attention.layer_norm_rms_epsilon", "llama.attention.layer_norm_rms_epsilon", "mamba.attention.layer_norm_rms_epsilon", "general.layer_norm_rms_epsilon"], 1e-5);
+        // --- Mamba SSM params (só relevantes se arch contém "mamba") ---
+        let d_inner = get_parse(&["mamba.ssm.inner_size", "falcon_mamba.ssm.inner_size", "ssm.inner_size"], hidden * 2);
+        let d_state = get_parse(&["mamba.ssm.state_size", "falcon_mamba.ssm.state_size", "ssm.state_size"], 16);
+        let d_conv = get_parse(&["mamba.ssm.conv_kernel", "falcon_mamba.ssm.conv_kernel", "ssm.conv_kernel"], 4);
+        let dt_rank_default = hidden.div_ceil(16).max(1);
+        let dt_rank = get_parse(&["mamba.ssm.time_step_rank", "falcon_mamba.ssm.time_step_rank", "ssm.time_step_rank"], dt_rank_default);
+        let dt_b_c_rms = gg.kv.get("mamba.ssm.dt_b_c_rms")
+            .or_else(|| gg.kv.get("falcon_mamba.ssm.dt_b_c_rms"))
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or_else(|| arch.contains("falcon"));
+        Self { hidden, intermediate, n_layers, n_heads, n_kv_heads, vocab, arch: arch.clone(), context_length, rope_theta, norm_eps, d_inner, d_state, d_conv, dt_rank, dt_b_c_rms }
     }
 
     pub fn head_dim(&self) -> usize {
         if self.n_heads == 0 { self.hidden } else { self.hidden / self.n_heads }
     }
     pub fn is_gqa(&self) -> bool { self.n_kv_heads < self.n_heads }
+    /// Spike Mamba: arch=mamba / falcon_mamba / mamba2 (contém "mamba").
+    pub fn is_mamba(&self) -> bool { self.arch.contains("mamba") }
 }
 
 /// Abstração para nomes de tensores por arquitetura (llama, qwen2, mistral, deepseek, phi)
@@ -129,6 +150,56 @@ impl ModelConfig {
             format!("blk.{}.attn.q.weight", layer),
         ]
     }
+    /// Nomes Mamba-1 (GGUF `blk.{i}.ssm_*` + fallback HF `mixer.*`).
+    /// Ref: llama.cpp `MODEL_TENSOR::{SSM_IN,SSM_CONV1D,SSM_X,SSM_DT,SSM_A,SSM_D,SSM_OUT}`
+    /// + `ATTN_NORM` reusada como norm da camada.
+    pub fn try_get_mamba_tensor_names(&self, layer: usize, kind: &str) -> Vec<String> {
+        match kind {
+            "mamba_norm" => vec![
+                format!("blk.{}.attn_norm.weight", layer),
+                format!("model.layers.{}.input_layernorm.weight", layer),
+            ],
+            "ssm_in" => vec![
+                format!("blk.{}.ssm_in.weight", layer),
+                format!("model.layers.{}.mixer.in_proj.weight", layer),
+            ],
+            "conv_w" => vec![
+                format!("blk.{}.ssm_conv1d.weight", layer),
+                format!("model.layers.{}.mixer.conv1d.weight", layer),
+            ],
+            "conv_b" => vec![
+                format!("blk.{}.ssm_conv1d.bias", layer),
+                format!("model.layers.{}.mixer.conv1d.bias", layer),
+            ],
+            "ssm_x" => vec![
+                format!("blk.{}.ssm_x.weight", layer),
+                format!("model.layers.{}.mixer.x_proj.weight", layer),
+            ],
+            "ssm_dt" => vec![
+                format!("blk.{}.ssm_dt.weight", layer),
+                format!("model.layers.{}.mixer.dt_proj.weight", layer),
+            ],
+            "ssm_dt_bias" => vec![
+                format!("blk.{}.ssm_dt.bias", layer),
+                format!("model.layers.{}.mixer.dt_proj.bias", layer),
+            ],
+            // ssm_a/d no GGUF não têm sufixo `.weight` (ver jamba.cpp/mamba.py)
+            "ssm_a" => vec![
+                format!("blk.{}.ssm_a", layer),
+                format!("blk.{}.ssm_a.weight", layer),
+                format!("model.layers.{}.mixer.A_log", layer),
+            ],
+            "ssm_d" => vec![
+                format!("blk.{}.ssm_d", layer),
+                format!("blk.{}.ssm_d.weight", layer),
+            ],
+            "ssm_out" => vec![
+                format!("blk.{}.ssm_out.weight", layer),
+                format!("model.layers.{}.mixer.out_proj.weight", layer),
+            ],
+            _ => vec![],
+        }
+    }
     pub fn try_get_tensor_names(&self, layer: usize, kind: &str) -> Vec<String> {
         match kind {
             "q" => self.attn_q_names(layer),
@@ -168,6 +239,22 @@ pub struct LayerNames {
     pub vbias: Option<usize>,
 }
 
+/// Índices pré-resolvidos dos pesos Mamba-1 por camada (`None` = ausente/dummy).
+/// Espelha `LayerNames` do caminho Transformer para o mesmo padrão P0.1.
+#[derive(Debug, Clone, Default)]
+pub struct MambaLayerNames {
+    pub norm: Option<usize>,
+    pub ssm_in: Option<usize>,
+    pub conv_w: Option<usize>,
+    pub conv_b: Option<usize>,
+    pub ssm_x: Option<usize>,
+    pub ssm_dt: Option<usize>,
+    pub ssm_dt_bias: Option<usize>,
+    pub ssm_a: Option<usize>,
+    pub ssm_d: Option<usize>,
+    pub ssm_out: Option<usize>,
+}
+
 pub struct RealInference {
     pub config: ModelConfig,
     pub tokenizer: M3Tokenizer,
@@ -182,8 +269,16 @@ pub struct RealInference {
     gen_history: Vec<u32>,
     // P0.1: nomes resolvidos por camada (índice em gguf.tensors)
     layer_names: Vec<LayerNames>,
+    // Spike Mamba: nomes + estados recorrentes (conv + SSM) por camada.
+    // Estado O(d_inner*d_state) constante — sem KV crescente.
+    pub mamba_names: Vec<MambaLayerNames>,
+    pub ssm_states: Vec<crate::ssm::MambaState>,
     // P0.2: profiler lido 1× (env M3_PROFILE), não por token
     profile: bool,
+    // GPU híbrida (llama.cpp-style): offload persistente gate/up/down/head.
+    // None = CPU puro (default; também quando M3_GPU=0 ou sem adapter).
+    #[cfg(feature = "wgpu")]
+    gpu: Option<crate::inference_gpu::GpuOffload>,
 }
 
 impl RealInference {
@@ -194,8 +289,13 @@ impl RealInference {
         eprintln!("[inference] config {:?} vocab {} tensors {}", cfg, tok.vocab_size(), gg.n_tensors);
         let n_layers = cfg.n_layers;
         let profile = std::env::var("M3_PROFILE").map(|v| v == "1").unwrap_or(false);
-        let mut inf = Self { config: cfg, tokenizer: tok, gguf: gg, gguf_path: gguf_path.to_string(), kv_cache_k: vec![Vec::new(); n_layers], kv_cache_v: vec![Vec::new(); n_layers], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile };
+        let mut inf = Self { config: cfg.clone(), tokenizer: tok, gguf: gg, gguf_path: gguf_path.to_string(), kv_cache_k: vec![Vec::new(); n_layers], kv_cache_v: vec![Vec::new(); n_layers], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
         inf.resolve_layer_names();
+        inf.resolve_mamba_names();
+        inf.ensure_ssm_states();
+        let _ = cfg;
         Ok(inf)
     }
 
@@ -237,6 +337,62 @@ impl RealInference {
         }
         self.layer_names.get(blk).and_then(f)
     }
+
+    /// Resolve 1× os índices `blk.{i}.ssm_*` (GGUF) com fallback HF `mixer.*`.
+    /// Idempotente; `None` = peso ausente → caminho dummy nos testes sem modelo.
+    fn resolve_mamba_names(&mut self) {
+        let mut out = Vec::with_capacity(self.config.n_layers);
+        for blk in 0..self.config.n_layers {
+            let mut mn = MambaLayerNames::default();
+            let mut resolve = |kind: &str| -> Option<usize> {
+                for name in self.config.try_get_mamba_tensor_names(blk, kind) {
+                    if let Some(pos) = self.gguf.tensors.iter().position(|t| t.name == name) {
+                        return Some(pos);
+                    }
+                }
+                None
+            };
+            mn.norm = resolve("mamba_norm");
+            mn.ssm_in = resolve("ssm_in");
+            mn.conv_w = resolve("conv_w");
+            mn.conv_b = resolve("conv_b");
+            mn.ssm_x = resolve("ssm_x");
+            mn.ssm_dt = resolve("ssm_dt");
+            mn.ssm_dt_bias = resolve("ssm_dt_bias");
+            mn.ssm_a = resolve("ssm_a");
+            mn.ssm_d = resolve("ssm_d");
+            mn.ssm_out = resolve("ssm_out");
+            out.push(mn);
+        }
+        self.mamba_names = out;
+    }
+
+    fn mamba_layer_name(&mut self, blk: usize, f: impl Fn(&MambaLayerNames) -> Option<usize>) -> Option<usize> {
+        if self.mamba_names.len() != self.config.n_layers {
+            self.resolve_mamba_names();
+        }
+        self.mamba_names.get(blk).and_then(f)
+    }
+
+    /// Garante `ssm_states` compatível com o config (conv + SSM zerados).
+    /// Chamada em `new()` e sob demanda no `forward_one_mamba`.
+    fn ensure_ssm_states(&mut self) {
+        let (di, ds, dc, nl) = (self.config.d_inner, self.config.d_state, self.config.d_conv, self.config.n_layers);
+        if self.ssm_states.len() != nl
+            || self.ssm_states.iter().any(|s| !s.is_compatible(di, ds, dc))
+        {
+            self.ssm_states = (0..nl)
+                .map(|_| crate::ssm::MambaState::new(di, ds, dc))
+                .collect();
+        }
+    }
+
+    /// Zera estados recorrentes (equivalente a `clear_kv_cache` no Transformer).
+    pub fn clear_ssm_states(&mut self) {
+        for s in &mut self.ssm_states {
+            s.reset();
+        }
+    }
     /// Histórico p/ repetition penalty: registra prompt + gerados
     pub fn push_gen(&mut self, id: u32) { self.gen_history.push(id); }
     pub fn extend_gen(&mut self, ids: &[u32]) { self.gen_history.extend_from_slice(ids); }
@@ -255,6 +411,36 @@ impl RealInference {
         let h = self.config.hidden;
         for k in &mut self.kv_cache_k { k.truncate(seq_len * h); }
         for v in &mut self.kv_cache_v { v.truncate(seq_len * h); }
+    }
+
+    /// Despacho único CLI/testes: Mamba usa `forward_one_mamba`, resto Transformer.
+    /// Evita que `main.rs` precise conhecer a arch.
+    pub fn forward_one_auto(&mut self, mem: &crate::vm::MemBackend, token_id: u32) -> Result<Vec<f32>> {
+        if self.config.is_mamba() {
+            self.forward_one_mamba(mem, token_id)
+        } else {
+            self.forward_one(mem, token_id)
+        }
+    }
+
+    /// Limpa ambos os caches (KV do Transformer + estados SSM do Mamba).
+    /// Para prompt novo no modo `--real --interactive`.
+    pub fn clear_caches(&mut self) {
+        self.clear_kv_cache();
+        self.clear_ssm_states();
+    }
+
+    /// Trunca caches p/ rollback. KV trunca de verdade; SSM é recorrente e
+    /// não suporta truncate sem snapshot — no spike, mantém estado e avisa.
+    /// Rollback total de Mamba = `clear_caches` + `prefill` de novo (futuro:
+    /// snapshot por token dos `MambaState`).
+    pub fn truncate_caches(&mut self, seq_len: usize) {
+        self.truncate_kv_cache(seq_len);
+        if self.config.is_mamba() && seq_len == 0 {
+            self.clear_ssm_states();
+        } else if self.config.is_mamba() {
+            eprintln!("[mamba] truncate_caches({}) sem snapshot: estado SSM mantido (spike)", seq_len);
+        }
     }
 
     /// Repete KV heads para GQA (n_kv_heads < n_heads) — expande kv_hidden para hidden.
@@ -414,6 +600,285 @@ impl RealInference {
     fn matvec_layer(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&LayerNames) -> Option<usize>, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
         let idx = self.layer_name(blk, f);
         self.matvec_weight_pre(mem, idx, x, in_dim, out_dim)
+    }
+
+    /// Atalho Mamba: mesmo kernel `matvec_weight_pre`, mas com `MambaLayerNames`.
+    fn matvec_mamba_layer(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&MambaLayerNames) -> Option<usize>, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
+        let idx = self.mamba_layer_name(blk, f);
+        self.matvec_weight_pre(mem, idx, x, in_dim, out_dim)
+    }
+
+    /// Vetor Mamba por índice (norms/bias/A/D), com dummy determinístico.
+    fn cached_mamba_vec(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&MambaLayerNames) -> Option<usize>, dummy: Vec<f32>) -> std::sync::Arc<Vec<f32>> {
+        if let Some(idx) = self.mamba_layer_name(blk, f) {
+            if let Ok(w) = self.read_tensor_f32_cached_idx(mem, idx) {
+                return w;
+            }
+        }
+        std::sync::Arc::new(dummy)
+    }
+
+    /// Forward de 1 token para `arch=mamba` (spike Mamba-1 + Falcon RMS extra).
+    /// Pipeline por camada: RMSNorm → in_proj(2*d_inner) → conv1d+SiLU →
+    /// x_proj(dt/B/C) → [RMS] → dt_proj+softplus → scan → gate(SiLU z) →
+    /// out_proj + residual. Estado constante em `ssm_states` (sem KV).
+    pub fn forward_one_mamba(&mut self, mem: &crate::vm::MemBackend, token_id: u32) -> Result<Vec<f32>> {
+        self.ensure_ssm_states();
+        let h = self.config.hidden;
+        let di = self.config.d_inner.max(1);
+        let ds = self.config.d_state.max(1);
+        let dt_rank = self.config.dt_rank.max(1);
+        let eps = self.config.norm_eps;
+        // Embedding (mesmo row-slice do Transformer; dummy se sem modelo)
+        let mut hidden_cur = vec![0.0f32; h];
+        match self.embedding_row(mem, "token_embd.weight", token_id as usize, h) {
+            Ok(r) => hidden_cur.copy_from_slice(&r),
+            Err(_) => {
+                for i in 0..h {
+                    hidden_cur[i] = (token_id as f32 * 0.01 + i as f32 * 0.001).sin();
+                }
+            }
+        }
+        let mut norm_buf = vec![0.0f32; h.max(di)];
+        for blk in 0..self.config.n_layers {
+            // norm
+            let gamma = self.cached_mamba_vec(mem, blk, |l| l.norm, vec![1.0; h]);
+            rms_norm_into(&hidden_cur, &gamma[..h.min(gamma.len())], &mut norm_buf[..h]);
+            let hidden_norm = norm_buf[..h].to_vec();
+            // in_proj: h -> 2*di
+            let xz = self.matvec_mamba_layer(mem, blk, |l| l.ssm_in, &hidden_norm, h, 2 * di);
+            let (x0, z) = xz.split_at(di.min(xz.len()));
+            let mut x0 = x0.to_vec();
+            let mut z = z.to_vec();
+            x0.resize(di, 0.0);
+            z.resize(di, 0.0);
+            // conv1d depthwise + SiLU (dummy = identidade se peso ausente)
+            let conv_out = if let Some(idx) = self.mamba_layer_name(blk, |l| l.conv_w) {
+                let w = self.read_tensor_f32_cached_idx(mem, idx)
+                    .map(|a| (*a).clone())
+                    .unwrap_or_else(|_| vec![0.0f32; di * self.config.d_conv.max(1)]);
+                let b = self.mamba_layer_name(blk, |l| l.conv_b)
+                    .and_then(|bi| self.read_tensor_f32_cached_idx(mem, bi).ok())
+                    .map(|a| (*a).clone())
+                    .unwrap_or_else(|| vec![0.0f32; di]);
+                let st = &mut self.ssm_states[blk];
+                let dc = self.config.d_conv.max(1);
+                // tolera shape divergente: cai para identidade
+                if w.len() == di * dc && st.is_compatible(di, ds, dc) {
+                    let mut y = crate::ssm::conv1d_depthwise_update(&mut st.conv, &x0, &w, &b, di, dc);
+                    for v in y.iter_mut() {
+                        *v = crate::ssm::silu(*v);
+                    }
+                    y
+                } else {
+                    x0.iter().map(|&v| crate::ssm::silu(v)).collect()
+                }
+            } else {
+                x0.iter().map(|&v| crate::ssm::silu(v)).collect()
+            };
+            // x_proj: di -> dt_rank + 2*ds
+            let x_dim = dt_rank + 2 * ds;
+            let dxbc = self.matvec_mamba_layer(mem, blk, |l| l.ssm_x, &conv_out, di, x_dim);
+            let mut dxbc_r = dxbc;
+            dxbc_r.resize(x_dim, 0.0);
+            let (dt_raw, rest) = dxbc_r.split_at(dt_rank);
+            let (b_raw, c_raw) = rest.split_at(ds.min(rest.len()));
+            let mut dt_raw = dt_raw.to_vec();
+            let mut b_raw = b_raw.to_vec();
+            let mut c_raw = c_raw.to_vec();
+            b_raw.resize(ds, 0.0);
+            c_raw.resize(ds, 0.01);
+            if self.config.dt_b_c_rms {
+                dt_raw = crate::ssm::rms_norm_plain(&dt_raw, eps);
+                b_raw = crate::ssm::rms_norm_plain(&b_raw, eps);
+                c_raw = crate::ssm::rms_norm_plain(&c_raw, eps);
+            }
+            // dt_proj: dt_rank -> di + bias + softplus
+            let mut dt_pre = self.matvec_mamba_layer(mem, blk, |l| l.ssm_dt, &dt_raw, dt_rank, di);
+            dt_pre.resize(di, 0.0);
+            if let Some(bi) = self.mamba_layer_name(blk, |l| l.ssm_dt_bias) {
+                if let Ok(bias) = self.read_tensor_f32_cached_idx(mem, bi) {
+                    for (a, bb) in dt_pre.iter_mut().zip(bias.iter()) {
+                        *a += *bb;
+                    }
+                }
+            }
+            let dt: Vec<f32> = dt_pre.iter().map(|&v| crate::ssm::softplus(v)).collect();
+            // A/D (dummy estável se ausente: A=-0.5, D=0.5)
+            let a_w = self.cached_mamba_vec(mem, blk, |l| l.ssm_a, vec![-0.5; di * ds]);
+            let d_w = self.cached_mamba_vec(mem, blk, |l| l.ssm_d, vec![0.5; di]);
+            let mut a_full = (*a_w).clone();
+            a_full.resize(di * ds, -0.5);
+            let mut d_full = (*d_w).clone();
+            d_full.resize(di, 0.5);
+            // scan
+            let st = &mut self.ssm_states[blk];
+            let mut y = crate::ssm::selective_scan_update(
+                &mut st.ssm, &conv_out, &dt, &a_full, &b_raw, &c_raw, &d_full, di, ds,
+            );
+            crate::ssm::apply_gate(&mut y, &z);
+            // out_proj: di -> h + residual
+            let out = self.matvec_mamba_layer(mem, blk, |l| l.ssm_out, &y, di, h);
+            for i in 0..h {
+                hidden_cur[i] += out.get(i).cloned().unwrap_or(0.0);
+            }
+        }
+        // head (mesmo do Transformer)
+        let out_norm_w = self.read_tensor_f32_cached(mem, "output_norm.weight").unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
+        rms_norm_into(&hidden_cur, &out_norm_w[..h.min(out_norm_w.len())], &mut norm_buf[..h]);
+        let hidden_norm_final = norm_buf[..h].to_vec();
+        let vocab = self.tokenizer.vocab_size();
+        Ok(self.logits_from_head_cached(mem, &hidden_norm_final, h, vocab))
+    }
+
+    /// LM head via cache f32 (caminho CPU legado): norm final + output.weight.
+    fn logits_from_head_cached(
+        &mut self,
+        mem: &crate::vm::MemBackend,
+        hidden_norm_final: &[f32],
+        h: usize,
+        vocab: usize,
+    ) -> Vec<f32> {
+        let lm_head = self.read_tensor_f32_cached(mem, "output.weight")
+            .or_else(|_| self.read_tensor_f32_cached(mem, "token_embd.weight"))
+            .unwrap_or_else(|_| {
+                let h_dummy = self.config.hidden;
+                let mut dummy = vec![0.0f32; vocab * h_dummy];
+                for i in 0..dummy.len() { dummy[i] = ((i as f32 * 0.002).sin() * 0.3); }
+                std::sync::Arc::new(dummy)
+            }); // tied
+        // lm_head shape [vocab, hidden] ou [hidden, vocab] — tenta ambos
+        let mut logits = vec![0.0; vocab];
+        // Se lm_head len == vocab*h, assume [vocab, hidden]
+        if lm_head.len() == vocab * h {
+            for i in 0..vocab {
+                let mut sum = 0.0;
+                for j in 0..h { sum += hidden_norm_final[j] * lm_head[i * h + j]; }
+                logits[i] = sum;
+            }
+        } else {
+            // fallback dummy
+            for i in 0..vocab.min(16) { logits[i % vocab] = (i as f32 * 0.1).sin(); }
+        }
+        logits
+    }
+
+    /// GPU híbrida: tenta o tensor offloaded; cai no `matvec_layer` (CPU).
+    /// Sem feature wgpu = direto CPU (zero custo).
+    fn matvec_layer_gpu(&mut self, mem: &crate::vm::MemBackend, blk: usize, f: impl Fn(&LayerNames) -> Option<usize>, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
+        #[cfg(feature = "wgpu")]
+        {
+            if let Some(y) = self.gpu_layer(blk, &f, x, in_dim, out_dim) {
+                return y;
+            }
+        }
+        self.matvec_layer(mem, blk, f, x, in_dim, out_dim)
+    }
+
+    /// GPU híbrida, 1 chamada por peso (gate/up/down). `None` = CPU.
+    #[cfg(feature = "wgpu")]
+    fn gpu_layer(&mut self, blk: usize, f: &impl Fn(&LayerNames) -> Option<usize>, x: &[f32], in_dim: usize, out_dim: usize) -> Option<Vec<f32>> {
+        let idx = self.layer_name(blk, f)?;
+        let gpu = self.gpu.as_mut()?;
+        gpu.matvec(idx, x, in_dim, out_dim)
+    }
+
+    /// Logits via head offloaded (output.weight Q4K/Q6K). `None` = CPU.
+    #[cfg(feature = "wgpu")]
+    fn gpu_logits(&mut self, hidden_norm_final: &[f32]) -> Option<Vec<f32>> {
+        let h = self.config.hidden;
+        let vocab = self.tokenizer.vocab_size();
+        let hi = self.gpu.as_ref()?.head?;
+        self.gpu.as_mut()?.matvec(hi, hidden_norm_final, h, vocab)
+    }
+
+    /// Offload híbrido (llama.cpp-style): gate/up/down + head para buffers
+    /// persistentes da GPU, 1×. Retorna nº de tensores offloaded (0 = CPU puro).
+    /// `M3_GPU=0` desliga. Idempotente para chamadas repetidas (re-sobe).
+    #[cfg(feature = "wgpu")]
+    pub fn offload_gpu(&mut self, mem: &crate::vm::MemBackend) -> usize {
+        if std::env::var("M3_GPU").map(|v| v == "0").unwrap_or(false) {
+            eprintln!("[gpu] desligada via M3_GPU=0");
+            return 0;
+        }
+        if self.layer_names.len() != self.config.n_layers {
+            self.resolve_layer_names();
+        }
+        let h = self.config.hidden;
+        let inter = self.config.intermediate;
+        let vocab = self.tokenizer.vocab_size();
+        let max_in = h.max(inter);
+        let max_out = inter.max(h).max(vocab);
+        let mut gpu = match crate::inference_gpu::GpuOffload::try_new(max_in, max_out) {
+            Some(g) => g,
+            None => return 0,
+        };
+        let mut n = 0;
+        // gate/up/down de todas as camadas (só Q4K/Q6K alinhados sobem)
+        for blk in 0..self.config.n_layers {
+            let ln = &self.layer_names[blk];
+            for (tidx, (idim, odim)) in [
+                (ln.gate, (h, inter)),
+                (ln.up, (h, inter)),
+                (ln.down, (inter, h)),
+            ] {
+                if let Some(idx) = tidx {
+                    if self.gguf_offload_one(mem, &mut gpu, idx, idim, odim) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        // head: output.weight (ou token_embd amarrado); só Q4K/Q6K sobem
+        let head_name = if self.gguf.find_tensor("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        if let Some(hi) = self.gguf.tensors.iter().position(|t| t.name == head_name) {
+            if self.gguf_offload_one(mem, &mut gpu, hi, h, vocab) {
+                gpu.head = Some(hi);
+                n += 1;
+            }
+        }
+        eprintln!("[gpu] offload: {} tensores (+head={}) em buffers persistentes", gpu.tensor_count(), gpu.head.is_some());
+        self.gpu = Some(gpu);
+        n
+    }
+
+    /// Sobe 1 tensor (Q4K/Q6K) lendo zero-copy quando possível.
+    #[cfg(feature = "wgpu")]
+    fn gguf_offload_one(
+        &self,
+        mem: &crate::vm::MemBackend,
+        gpu: &mut crate::inference_gpu::GpuOffload,
+        idx: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> bool {
+        let info = match self.gguf.tensors.get(idx) {
+            Some(t) => t,
+            None => return false,
+        };
+        let n = info.n_elements;
+        if n != in_dim * out_dim {
+            return false;
+        }
+        let raw_len = match crate::matvec_quant::quant_raw_len(info.dtype, n) {
+            Some(l) => l,
+            None => return false,
+        };
+        let fo = self.gguf.data_offset + info.offset;
+        if let Some(raw) = mem.read_model_raw(fo, raw_len) {
+            if gpu.upload(idx, info.dtype, raw, in_dim, out_dim) {
+                return true;
+            }
+        }
+        let paddr = crate::memory::make_persistent_addr(fo as u128);
+        match mem.read(paddr, raw_len) {
+            Ok(raw) => gpu.upload(idx, info.dtype, &raw, in_dim, out_dim),
+            Err(_) => false,
+        }
     }
 
     /// Atalho P0.1: vetor de camada (norms/bias) por índice, com dummy.
@@ -626,15 +1091,15 @@ impl RealInference {
             rms_norm_into(&hidden2, &gamma_ffn[..], &mut norm_buf[..h]);
             let hidden2_norm = &norm_buf[..h];
             let inter = self.config.intermediate;
-            let gate = self.matvec_layer(mem, blk, |l| l.gate, &hidden2_norm, h, inter);
-            let up = self.matvec_layer(mem, blk, |l| l.up, &hidden2_norm, h, inter);
+            let gate = self.matvec_layer_gpu(mem, blk, |l| l.gate, &hidden2_norm, h, inter);
+            let up = self.matvec_layer_gpu(mem, blk, |l| l.up, &hidden2_norm, h, inter);
             let mut ffn_h = vec![0.0; self.config.intermediate];
             for i in 0..self.config.intermediate {
                 let g = gate[i];
                 let sig = 1.0/(1.0+(-g).exp());
                 ffn_h[i] = g * sig * up[i];
             }
-            let ffn_out = self.matvec_layer(mem, blk, |l| l.down, &ffn_h, inter, h);
+            let ffn_out = self.matvec_layer_gpu(mem, blk, |l| l.down, &ffn_h, inter, h);
             if profile { t_matvec += t1.elapsed().as_micros(); t_norm_ffn += t_blk.elapsed().as_micros(); }
             let mut hidden_next = vec![0.0; h];
             for i in 0..h { hidden_next[i] = hidden2[i] + ffn_out[i]; }
@@ -646,29 +1111,15 @@ impl RealInference {
         let out_norm_w = self.read_tensor_f32_cached(mem, "output_norm.weight").unwrap_or_else(|_| std::sync::Arc::new(vec![1.0; h]));
         rms_norm_into(&hidden_cur, &out_norm_w[..], &mut norm_buf[..h]);
         let hidden_norm_final = &norm_buf[..h];
-        let lm_head = self.read_tensor_f32_cached(mem, "output.weight")
-            .or_else(|_| self.read_tensor_f32_cached(mem, "token_embd.weight"))
-            .unwrap_or_else(|_| {
-                let vocab = self.tokenizer.vocab_size();
-                let h_dummy = self.config.hidden;
-                let mut dummy = vec![0.0f32; vocab * h_dummy];
-                for i in 0..dummy.len() { dummy[i] = ((i as f32 * 0.002).sin() * 0.3); }
-                std::sync::Arc::new(dummy)
-            }); // tied
-        // lm_head shape [vocab, hidden] ou [hidden, vocab] — tenta ambos
+        // Head: GPU offloaded primeiro; senão caminho f32 legado.
         let vocab = self.tokenizer.vocab_size();
-        let mut logits = vec![0.0; vocab];
-        // Se lm_head len == vocab*h, assume [vocab, hidden]
-        if lm_head.len() == vocab * h {
-            for i in 0..vocab {
-                let mut sum=0.0;
-                for j in 0..h { sum += hidden_norm_final[j] * lm_head[i*h + j]; }
-                logits[i]=sum;
-            }
-        } else {
-            // fallback dummy
-            for i in 0..vocab.min(16) { logits[i%vocab] = (i as f32 * 0.1).sin(); }
-        }
+        #[cfg(feature = "wgpu")]
+        let logits = match self.gpu_logits(hidden_norm_final) {
+            Some(g) => g,
+            None => self.logits_from_head_cached(mem, hidden_norm_final, h, vocab),
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let logits = self.logits_from_head_cached(mem, hidden_norm_final, h, vocab);
         if profile {
             // t_norm_ffn inclui t_matvec+t_attn (tempo de bloco); fases em ms
             // + sanidade dos logits: top1/entropia denunciam pico sistemático
@@ -923,7 +1374,7 @@ impl RealInference {
         if tokens.is_empty() { return Ok(()); }
         // Garante cache limpo se for novo prompt
         for &tid in tokens {
-            let _ = self.forward_one(mem, tid)?;
+            let _ = self.forward_one_auto(mem, tid)?;
             self.push_gen(tid);
         }
         // Remove último token do cache? Não, prefill deixa todos no cache; próximo forward será o próximo token
@@ -938,7 +1389,7 @@ impl RealInference {
         if tokens.is_empty() { return Ok(vec![0.0; self.tokenizer.vocab_size()]); }
         let mut last_logits = Vec::new();
         for (idx, &tid) in tokens.iter().enumerate() {
-            let logits = self.forward_one(mem, tid)?;
+            let logits = self.forward_one_auto(mem, tid)?;
             self.push_gen(tid);
             if idx == tokens.len() - 1 {
                 last_logits = logits;
@@ -1099,7 +1550,7 @@ impl RealInference {
 /// RoPE estilo HF Llama/Qwen2 (split-half, `rotate_half` — mesma convenção que
 /// o modo NEOX do ggml): par (i, i+half) gira pelo ângulo da freq i.
 /// `v` tem `n_heads * head_dim` elementos; `freqs` tem `head_dim/2` (cos, sin).
-fn apply_rope(v: &mut [f32], n_heads: usize, head_dim: usize, freqs: &[(f32, f32)]) {
+pub(crate) fn apply_rope(v: &mut [f32], n_heads: usize, head_dim: usize, freqs: &[(f32, f32)]) {
     if head_dim == 0 || head_dim % 2 != 0 || freqs.len() * 2 != head_dim {
         return;
     }
@@ -1120,7 +1571,7 @@ fn apply_rope(v: &mut [f32], n_heads: usize, head_dim: usize, freqs: &[(f32, f32
 }
 
 /// P0.4: RMSNorm sem alocar — escreve em `out` (arena do chamador).
-fn rms_norm_into(x: &[f32], gamma: &[f32], out: &mut [f32]) {
+pub(crate) fn rms_norm_into(x: &[f32], gamma: &[f32], out: &mut [f32]) {
     debug_assert_eq!(x.len(), out.len());
     let eps = 1e-5;
     let mut sum = 0.0;
@@ -1140,10 +1591,12 @@ mod tests {
         // Testa com dummy mem (sem GGUF) — deve usar fallback e não panicar (rápido, hidden 32)
         let mem_mgr = crate::memory::MemoryManager::new_in_memory();
         let mem = crate::vm::MemBackend::Cpu(mem_mgr);
-        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
+        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5, d_inner: 64, d_state: 16, d_conv: 4, dt_rank: 2, dt_b_c_rms: false };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile: false,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
         let logits = inf.forward_one(&mem, 0).unwrap();
         println!("logits len {} sample {}", logits.len(), inf.sample(&logits));
         assert_eq!(logits.len(), inf.tokenizer.vocab_size());
@@ -1191,10 +1644,12 @@ mod tests {
         // histórico e penalty 2.0, id 1 assume o topo.
         let mem_mgr = crate::memory::MemoryManager::new_in_memory();
         let _mem = crate::vm::MemBackend::Cpu(mem_mgr);
-        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
+        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5, d_inner: 64, d_state: 16, d_conv: 4, dt_rank: 2, dt_b_c_rms: false };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile: false,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
         let logits = vec![2.0f32, 1.9];
         assert_eq!(inf.sample_with_params(&logits, 1.0, 1.0, 1, 2.0), 0);
         inf.push_gen(0);
@@ -1241,10 +1696,12 @@ mod tests {
     fn test_chat_template_plain_without_markers() {
         // Vocab sem <|user|>/<|assistant|> (mock): template não deve emitir
         // marcadores que fragmentariam em peças (caso TinyLlama Q4_K_M).
-        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
+        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5, d_inner: 64, d_state: 16, d_conv: 4, dt_rank: 2, dt_b_c_rms: false };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
+        let inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile: false,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
         let prompt = inf.format_chat("Hi");
         assert!(!prompt.contains("<|"), "marcador inexistente no template: {:?}", prompt);
         assert!(prompt.contains("Hi"));
@@ -1320,10 +1777,12 @@ mod tests {
         let mem_mgr = crate::memory::MemoryManager::new_in_memory();
         let mem = crate::vm::MemBackend::Cpu(mem_mgr);
         // Usa config artificial 22 layers com hidden 32 para teste rápido (sem 1GB mmap)
-        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 22, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5 };
+        let cfg = ModelConfig { hidden: 32, intermediate: 64, n_layers: 22, n_heads: 4, n_kv_heads: 4, vocab: 32000, arch: "llama".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5, d_inner: 64, d_state: 16, d_conv: 4, dt_rank: 2, dt_b_c_rms: false };
         let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
         let tok = crate::tokenizer::M3Tokenizer::mock();
-        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 22], kv_cache_v: vec![Vec::new(); 22], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), profile: false };
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 22], kv_cache_v: vec![Vec::new(); 22], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile: false,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
         assert_eq!(inf.config.n_layers, 22);
         // Primeiro token
         let logits1 = inf.forward_one(&mem, 1).unwrap();
@@ -1339,5 +1798,180 @@ mod tests {
         inf.clear_kv_cache();
         assert_eq!(inf.kv_cache_k[0].len(), 0);
         assert!(logits1.len() > 0);
+    }
+
+    /// GPU híbrida: offload sobe 84 pesos + head; gate via GPU == via CPU.
+    /// Pula graciosamente sem modelo, sem feature ou sem adapter.
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn test_gpu_offload_gate_parity() {        let gg_path = "./models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf";
+        if !std::path::Path::new(gg_path).exists() {
+            eprintln!("skip sem modelo");
+            return;
+        }
+        // Sem adapter (CI sem GPU) → offload retorna 0, sem falhar
+        let mut inf = RealInference::new(gg_path).unwrap();
+        let mut mem_mgr = crate::memory::MemoryManager::new_in_memory();
+        let mem = crate::vm::MemBackend::Cpu({
+            mem_mgr.load_gguf_model(gg_path).unwrap();
+            mem_mgr
+        });
+        let n = inf.offload_gpu(&mem);
+        if n == 0 {
+            eprintln!("skip sem adapter GPU");
+            return;
+        }
+        // 28 layers × (gate/up/down) + head
+        assert_eq!(n, 28 * 3 + 1, "offload count {}", n);
+        let h = inf.config.hidden;
+        let inter = inf.config.intermediate;
+        let x: Vec<f32> = (0..h).map(|i| ((i as f32 * 0.021).sin() * 0.4)).collect();
+        let y_gpu = inf.gpu_layer(0, &|l: &LayerNames| l.gate, &x, h, inter).expect("gate na GPU");
+        let y_cpu = inf.matvec_layer(&mem, 0, |l| l.gate, &x, h, inter);
+        assert_eq!(y_gpu.len(), y_cpu.len());
+        let max_ref = y_cpu.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let max_diff = y_gpu.iter().zip(y_cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("gpu gate blk0: max_ref {:.4} max_diff {:.6}", max_ref, max_diff);
+        assert!(max_ref > 1e-6);
+        assert!(max_diff / max_ref < 1e-2, "divergência {}", max_diff / max_ref);
+        // Q6K real (down de um blk Q6_K): exercita scales int8 negativos
+        let mut down6: Option<usize> = None;
+        for blk in 0..inf.config.n_layers {
+            if let Some(idx) = inf.layer_name(blk, |l| l.down) {
+                if inf.gguf.tensors[idx].dtype == 14 {
+                    down6 = Some(blk);
+                    break;
+                }
+            }
+        }
+        if let Some(blk) = down6 {
+            let h = inf.config.hidden;
+            let inter = inf.config.intermediate;
+            let xd: Vec<f32> = (0..inter).map(|i| ((i as f32 * 0.043).sin() * 0.3)).collect();
+            let yg = inf.gpu_layer(blk, &|l: &LayerNames| l.down, &xd, inter, h).expect("down Q6K na GPU");
+            let yc = inf.matvec_layer(&mem, blk, |l| l.down, &xd, inter, h);
+            let mr = yc.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let md = yg.iter().zip(yc.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("gpu down-Q6K blk{}: max_ref {:.4} max_diff {:.6}", blk, mr, md);
+            assert!(mr > 1e-6);
+            assert!(md / mr < 1e-2, "divergência Q6K {}", md / mr);
+        } else {
+            eprintln!("(sem down Q6K neste modelo — skip)");
+        }
+    }
+
+    // --- Spike Mamba (130M-scale sintético + real se presente) ---
+
+    fn mock_mamba_cfg() -> ModelConfig {
+        ModelConfig { hidden: 16, intermediate: 0, n_layers: 2, n_heads: 0, n_kv_heads: 0, vocab: 32000, arch: "mamba".to_string(), context_length: 2048, rope_theta: 10000.0, norm_eps: 1e-5, d_inner: 32, d_state: 8, d_conv: 4, dt_rank: 2, dt_b_c_rms: false }
+    }
+
+    #[test]
+    fn test_mamba_config_parses_ssm_kv() {
+        let mut kv = std::collections::HashMap::new();
+        kv.insert("general.architecture".to_string(), "mamba".to_string());
+        kv.insert("mamba.embedding_length".to_string(), "768".to_string());
+        kv.insert("mamba.block_count".to_string(), "24".to_string());
+        kv.insert("mamba.ssm.inner_size".to_string(), "1536".to_string());
+        kv.insert("mamba.ssm.state_size".to_string(), "16".to_string());
+        kv.insert("mamba.ssm.conv_kernel".to_string(), "4".to_string());
+        kv.insert("mamba.ssm.time_step_rank".to_string(), "48".to_string());
+        let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 7, tensors: Vec::new(), kv, data_offset: 0 };
+        let cfg = ModelConfig::from_gguf(&gg);
+        assert!(cfg.is_mamba());
+        assert_eq!(cfg.hidden, 768);
+        assert_eq!(cfg.n_layers, 24);
+        assert_eq!(cfg.d_inner, 1536);
+        assert_eq!(cfg.d_state, 16);
+        assert_eq!(cfg.d_conv, 4);
+        assert_eq!(cfg.dt_rank, 48);
+        // Falcon liga dt_b_c_rms via arch
+        let mut kv2 = std::collections::HashMap::new();
+        kv2.insert("general.architecture".to_string(), "falcon_mamba".to_string());
+        let gg2 = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 1, tensors: Vec::new(), kv: kv2, data_offset: 0 };
+        let cfg2 = ModelConfig::from_gguf(&gg2);
+        assert!(cfg2.is_mamba());
+        assert!(cfg2.dt_b_c_rms, "falcon_mamba implica RMS em dt/B/C");
+        assert_eq!(cfg2.d_inner, cfg2.hidden * 2);
+    }
+
+    #[test]
+    fn test_mamba_names_resolve_blk_ssm() {
+        use crate::gguf::GgufTensorInfo;
+        let mk = |name: &str| GgufTensorInfo { name: name.to_string(), dims: vec![8, 8], shape: vec![8, 8], dtype: 0, offset: 0, n_elements: 64 };
+        let gg = crate::gguf::GgufFile {
+            version: 3, n_tensors: 10, n_kv: 1,
+            tensors: vec![
+                mk("blk.0.attn_norm.weight"), mk("blk.0.ssm_in.weight"),
+                mk("blk.0.ssm_conv1d.weight"), mk("blk.0.ssm_conv1d.bias"),
+                mk("blk.0.ssm_x.weight"), mk("blk.0.ssm_dt.weight"),
+                mk("blk.0.ssm_dt.bias"), mk("blk.0.ssm_a"),
+                mk("blk.0.ssm_d"), mk("blk.0.ssm_out.weight"),
+            ],
+            kv: std::collections::HashMap::new(), data_offset: 0,
+        };
+        let cfg = mock_mamba_cfg();
+        let tok = crate::tokenizer::M3Tokenizer::mock();
+        let mut inf = RealInference { config: ModelConfig { n_layers: 1, ..cfg }, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 1], kv_cache_v: vec![Vec::new(); 1], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile: false,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
+        inf.resolve_mamba_names();
+        assert_eq!(inf.mamba_names.len(), 1);
+        let mn = &inf.mamba_names[0];
+        assert!(mn.norm.is_some() && mn.ssm_in.is_some() && mn.conv_w.is_some());
+        assert!(mn.conv_b.is_some() && mn.ssm_x.is_some() && mn.ssm_dt.is_some());
+        assert!(mn.ssm_dt_bias.is_some() && mn.ssm_a.is_some() && mn.ssm_d.is_some() && mn.ssm_out.is_some());
+    }
+
+    #[test]
+    fn test_forward_one_mamba_dummy_state_constant() {
+        let mem_mgr = crate::memory::MemoryManager::new_in_memory();
+        let mem = crate::vm::MemBackend::Cpu(mem_mgr);
+        let cfg = mock_mamba_cfg();
+        let gg = crate::gguf::GgufFile { version: 3, n_tensors: 0, n_kv: 0, tensors: Vec::new(), kv: std::collections::HashMap::new(), data_offset: 0 };
+        let tok = crate::tokenizer::M3Tokenizer::mock();
+        let mut inf = RealInference { config: cfg, tokenizer: tok, gguf: gg, gguf_path: "".to_string(), kv_cache_k: vec![Vec::new(); 2], kv_cache_v: vec![Vec::new(); 2], weight_cache: fxhash::FxHashMap::default(), gen_history: Vec::new(), layer_names: Vec::new(), mamba_names: Vec::new(), ssm_states: Vec::new(), profile: false,
+            #[cfg(feature = "wgpu")]
+            gpu: None };
+        let l1 = inf.forward_one_mamba(&mem, 1).unwrap();
+        assert_eq!(l1.len(), inf.tokenizer.vocab_size());
+        assert!(l1.iter().all(|v| v.is_finite()));
+        // estado recorrente alocado e constante (não cresce como KV)
+        assert_eq!(inf.ssm_states.len(), 2);
+        let (c0, s0) = (inf.ssm_states[0].conv.len(), inf.ssm_states[0].ssm.len());
+        assert_eq!((c0, s0), (32 * 4, 32 * 8));
+        assert!(inf.ssm_states[0].ssm.iter().any(|&v| v != 0.0), "scan deveria sujar o estado");
+        let _ = inf.forward_one_mamba(&mem, 2).unwrap();
+        assert_eq!(inf.ssm_states[0].conv.len(), c0);
+        assert_eq!(inf.ssm_states[0].ssm.len(), s0);
+        inf.clear_ssm_states();
+        assert!(inf.ssm_states.iter().all(|s| s.ssm.iter().all(|&v| v == 0.0)));
+    }
+
+    #[test]
+    fn test_mamba_real_file_if_present() {
+        // mamba-130M / Falcon-Mamba Q4_K_M se baixado em ./models (skip gracioso).
+        let cands = [
+            "./models/mamba-130m-hf.Q4_K_M.gguf",
+            "./models/mamba-130m-hf-Q4_K_M.gguf",
+            "./models/mamba-130m-Q4_K_M.gguf",
+            "./models/falcon-mamba-7b-Q4_K_M.gguf",
+            "./models/Falcon-Mamba-7B-Q4_K_M.gguf",
+        ];
+        let path = cands.iter().find(|p| std::path::Path::new(p).exists());
+        let Some(gg_path) = path else {
+            eprintln!("skip mamba real ausente (baixe um Q4_K_M em ./models)");
+            return;
+        };
+        let inf = RealInference::new(gg_path).unwrap();
+        assert!(inf.config.is_mamba(), "arch={}", inf.config.arch);
+        assert!(inf.config.d_inner == inf.config.hidden * 2, "d_inner={} hidden={}", inf.config.d_inner, inf.config.hidden);
+        assert!(!inf.mamba_names.is_empty());
+        let resolved = inf.mamba_names.iter().filter(|m| m.ssm_in.is_some()).count();
+        assert!(resolved > 0, "nenhum ssm_in resolvido em {}", gg_path);
+        eprintln!("[mamba-real] {} layers={} hidden={} d_inner={} d_state={} d_conv={} dt_rank={} rms={} ssm_in={}/{}",
+            gg_path, inf.config.n_layers, inf.config.hidden, inf.config.d_inner,
+            inf.config.d_state, inf.config.d_conv, inf.config.dt_rank,
+            inf.config.dt_b_c_rms, resolved, inf.config.n_layers);
     }
 }

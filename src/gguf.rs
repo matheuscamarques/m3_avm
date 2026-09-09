@@ -1,6 +1,7 @@
-//! gguf.rs — parser mínimo GGUF para f32 + vocab
+//! gguf.rs — parser mínimo GGUF para f32 + vocab + quantizados
 //! Lê header, KV (para tokenizer) e tensor_infos (nome, dims, dtype, offset)
-//! Suporta apenas F32 (0) e F16 (1) para VM; Q4_* é rejeitado com erro claro.
+//! dtypes: F32 (0), F16 (1), Q4_0 (2), Q8_0 (8), Q4_K (12/13), Q6_K (14).
+//! Dequantização em `crate::quant`, kernels fused em `crate::matvec_quant`.
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

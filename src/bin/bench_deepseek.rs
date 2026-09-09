@@ -28,6 +28,13 @@ fn main() -> anyhow::Result<()> {
     let mem = MemBackend::Cpu(mem_mgr);
     eprintln!("[bench] rss após mmap: {} MiB", rss_mb());
 
+    // Offload híbrido (só com --features wgpu; M3_GPU=0 desliga)
+    #[cfg(feature = "wgpu")]
+    {
+        let n = inf.offload_gpu(&mem);
+        eprintln!("[bench] gpu offload: {} tensores", n);
+    }
+
     let t0 = std::time::Instant::now();
     let logits1 = inf.forward_one(&mem, 1)?;
     let d0 = t0.elapsed();

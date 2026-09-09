@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Marques"
+    given-names: "Matheus de Camargo"
+    email: "matheuscamarques@gmail.com"
+repository-code: "https://github.com/matheuscamarques/m3_avm"
+url: "https://github.com/matheuscamarques/m3_avm"
+abstract: "M³-AVM (Máquina Abstrata de Matheus de Camargo Marques) is a deterministic virtual machine prototype in Rust for sparse event-driven tensor computation: fixed 15-opcode ISA (32-byte instructions), strict-priority scheduler with preemption (FORK/ABORT), CSR sparse tensors, GGUF mmap inference with KV-cache rollback, and optional wgpu acceleration."
+keywords:
+  - virtual-machine
+  - tensor
+  - sparse-computation
+  - rust
+  - ai-infrastructure
+  - preemption
+  - kv-cache
+license: AGPL-3.0-or-later
+version: 0.1.0
+date-released: "2026-09-09"

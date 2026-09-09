@@ -151,6 +151,11 @@ mod tests {
             context_length: 2048,
             rope_theta: 10000.0,
             norm_eps: 1e-5,
+            d_inner: 64,
+            d_state: 16,
+            d_conv: 4,
+            dt_rank: 2,
+            dt_b_c_rms: false,
         }
     }
 

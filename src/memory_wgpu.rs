@@ -26,6 +26,13 @@ pub struct WgpuMemoryManager {
     gpu_buffers: HashMap<u128, Buffer>,
     sparse_heap: HashMap<u128, SparseTensor>,
     next_offset: u128,
+    // P2.1: pipelines do ATTN criados 1× (criar por chamada custava ~100ms+).
+    // attn_shader mantido vivo de propósito (propriedade do módulo).
+    #[allow(dead_code)]
+    attn_shader: Option<wgpu::ShaderModule>,
+    pipe_qkt: Option<wgpu::ComputePipeline>,
+    pipe_softmax: Option<wgpu::ComputePipeline>,
+    pipe_smv: Option<wgpu::ComputePipeline>,
 }
 
 impl WgpuMemoryManager {
@@ -67,7 +74,36 @@ impl WgpuMemoryManager {
             gpu_buffers: HashMap::new(),
             sparse_heap: HashMap::new(),
             next_offset: 0x1000,
+            attn_shader: None,
+            pipe_qkt: None,
+            pipe_softmax: None,
+            pipe_smv: None,
         })
+    }
+
+    /// Garante shader + 3 pipelines do ATTN (cria 1×, reusa sempre).
+    fn ensure_attn_pipelines(&mut self) -> Result<()> {
+        if self.pipe_qkt.is_some() {
+            return Ok(());
+        }
+        let device = self.device.clone();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("m3-attn"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("attn.wgsl").into()),
+        });
+        let mk = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &shader,
+                entry_point: entry,
+            })
+        };
+        self.pipe_qkt = Some(mk("qkt"));
+        self.pipe_softmax = Some(mk("softmax"));
+        self.pipe_smv = Some(mk("sm_v"));
+        self.attn_shader = Some(shader);
+        Ok(())
     }
 
     pub fn new_blocking() -> Result<Self> {
@@ -204,11 +240,11 @@ impl WgpuMemoryManager {
         let k_data = self.read_f32_tensor(k_addr, n*d)?;
         let v_data = self.read_f32_tensor(v_addr, n*p)?;
 
-        let shader_src = include_str!("attn.wgsl");
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("m3-attn"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        // Pipelines em cache (P2.1); refs compartilhadas (ComputePipeline não é Clone)
+        self.ensure_attn_pipelines()?;
+        let qkt_pipeline = self.pipe_qkt.as_ref().unwrap();
+        let sm_pipeline = self.pipe_softmax.as_ref().unwrap();
+        let smv_pipeline = self.pipe_smv.as_ref().unwrap();
 
         // Helper para criar STORAGE buffer inicializado
         let create_storage = |label: &str, data: &[f32]| {
@@ -282,13 +318,7 @@ impl WgpuMemoryManager {
         });
         self.queue.write_buffer(&param2_buf, 0, &param2_bytes);
 
-        // Pipeline 1: QKT
-        let qkt_pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("qkt"),
-            layout: None,
-            module: &shader,
-            entry_point: "qkt",
-        });
+        // Bind groups (baratos; buffers variam por chamada)
         let qkt_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("qkt_bind"),
             layout: &qkt_pipeline.get_bind_group_layout(0),
@@ -300,13 +330,6 @@ impl WgpuMemoryManager {
             ],
         });
 
-        // Pipeline 2: softmax
-        let sm_pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("softmax"),
-            layout: None,
-            module: &shader,
-            entry_point: "softmax",
-        });
         let sm_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sm_bind"),
             layout: &sm_pipeline.get_bind_group_layout(0),
@@ -316,13 +339,6 @@ impl WgpuMemoryManager {
             ],
         });
 
-        // Pipeline 3: scores*V
-        let smv_pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sm_v"),
-            layout: None,
-            module: &shader,
-            entry_point: "sm_v",
-        });
         let smv_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("smv_bind"),
             layout: &smv_pipeline.get_bind_group_layout(0),

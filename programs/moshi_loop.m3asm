@@ -1,0 +1,42 @@
+; moshi_loop.m3asm — skeleton full-duplex Moshi/PersonaPlex (F1/F4 do PLANO_MOSHI_NATIVO)
+; Status: skeleton montável; forward real (Temporal 32x4096 + Depformer 6x1024 + Mimi 16cb)
+; entra em F2/F3. Shapes aqui são demo 8-dim para não OOM; reais via --emit-asm futuro.
+; Uso:
+;   cargo run --bin m3_avm -- run programs/moshi_loop.m3asm
+;   cargo run --bin m3_avm -- run programs/moshi_loop.m3asm --interactive --max-steps 50
+; Futuro:
+;   cargo run --bin m3_avm -- run programs/moshi_loop.m3asm --model models/personaplex-7b-v1-q4_k.gguf --real --interactive-audio
+
+; --- tensores demo (reais: 4096 hidden, ff 11264, dep 1024 — ver docs/MOSHI_MAP.md) ---
+TENSOR r0 1 8 f32
+TENSOR r1 1 8 f32
+TENSOR r2 1 8 f32
+TENSOR r3 8 8 f32
+TENSOR r5 8 16 f32
+TENSOR r6 16 8 f32
+
+MAIN_LOOP:
+    ; 12.5Hz frame Mimi (80ms) — hoje SENSE mock, F2 liga PCM 24kHz real
+    SENSE r11, TOKEN
+    SENSE r15, USER_INPUT
+    ; GREEN = inference pesada, RED = barge-in (tese §5, ctx Red>Blue>Green)
+    FORK r12, GREEN, NOTIFY
+    ; 1 layer temporal demo: NORM -> ATTN -> residual -> NORM -> FFN -> residual
+    NORM r1, r0, r0, r0
+    ATTN r4, r1, r1, r1, NOTIFY_EACH_HEAD
+    ADD r0, r0, r4
+    FFN r8, r1, r5, r6
+    ADD r0, r0, r8
+    ; depformer + sample (F3: 16 codebooks, weights_per_step)
+    SAMPLE r11, r0
+    STREAM r11, 4 BLOCKING
+    COMPARE r11, EOS_TOKEN
+    IF_EQUAL PROGRAM_END
+    ; barge-in: SENSE USER_INPUT seta interrupt_flag, IF_INTERRUPT desvia
+    IF_INTERRUPT HANDLE_ABORT
+    JUMP MAIN_LOOP
+HANDLE_ABORT:
+    ; F4: rollback KV 17 streams + truncar + prefill novo prompt (igual run_real_interactive)
+    JUMP MAIN_LOOP
+PROGRAM_END:
+    HALT

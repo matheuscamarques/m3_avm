@@ -58,6 +58,7 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let pipe_f32 = mk_pipeline("gemv_f32");
     let pipe_q4k = mk_pipeline("gemv_q4k");
+    let pipe_q6k = mk_pipeline("gemv_q6k");
 
     for (tag, in_dim, out_dim) in [("qproj", 1536usize, 1536usize), ("gate", 1536usize, 8960usize)] {
         println!("=== {} {}x{} ===", tag, in_dim, out_dim);
@@ -208,8 +209,86 @@ async fn async_main() -> anyhow::Result<()> {
             tg.push(t1.elapsed().as_micros());
         }
         println!("cpu_q4k med {}us | gpu_q4k med {}us | speedup {:.2}x", median(&tc), median(&tg), median(&tc) as f64 / median(&tg).max(1) as f64);
+
+        // ---- Q6K fundido (head + alguns down) ----
+        let raw6 = synth_q6k(n);
+        let mut w6 = vec![0.0f32; n];
+        assert!(m3_avm::quant::dequantize(&raw6, 14, &mut w6, n));
+        let y_cpu_6 = m3_avm::matvec::matvec(&x, &w6, in_dim, out_dim);
+        let w6_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("w6"),
+            contents: &raw6,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let y6_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("y6"),
+            size: (out_dim * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let bind_6 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("b6"),
+            layout: &pipe_q6k.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w6_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: y6_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: p_buf.as_entire_binding() },
+            ],
+        });
+        let run_gpu_6 = || -> Vec<f32> {
+            run_pipe(&device, &queue, &pipe_q6k, &bind_6, &y6_buf, &staging, out_dim)
+        };
+        let y_gpu_6 = run_gpu_6();
+        let md6 = max_rel_diff(&y_cpu_6, &y_gpu_6);
+        println!("q6k parity max_rel_diff={:.2e} (cpu[0]={:.4} gpu[0]={:.4})", md6, y_cpu_6[0], y_gpu_6[0]);
+        let mut t6c = vec![];
+        let mut t6g = vec![];
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            let mut w6t = vec![0.0f32; n];
+            m3_avm::quant::dequantize(&raw6, 14, &mut w6t, n);
+            let _ = m3_avm::matvec::matvec(&x, &w6t, in_dim, out_dim);
+            t6c.push(t0.elapsed().as_micros());
+            let t1 = std::time::Instant::now();
+            let _ = run_gpu_6();
+            t6g.push(t1.elapsed().as_micros());
+        }
+        println!("cpu_q6k med {}us | gpu_q6k med {}us | speedup {:.2}x", median(&t6c), median(&t6g), median(&t6c) as f64 / median(&t6g).max(1) as f64);
     }
     Ok(())
+}
+
+/// Roda 1 dispatch + readback (genérico p/ os 3 kernels).
+#[cfg(feature = "wgpu")]
+fn run_pipe(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipe: &wgpu::ComputePipeline,
+    bg: &wgpu::BindGroup,
+    y_buf: &wgpu::Buffer,
+    staging: &wgpu::Buffer,
+    out_dim: usize,
+) -> Vec<f32> {
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(out_dim.div_ceil(64) as u32, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(y_buf, 0, staging, 0, (out_dim * 4) as u64);
+    queue.submit(Some(enc.finish()));
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |v| { let _ = tx.send(v); });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().unwrap();
+    let data = slice.get_mapped_range();
+    let out: Vec<f32> = data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    drop(data);
+    staging.unmap();
+    out
 }
 
 /// Q4K sintético com semântica exata (d=1, dmin=0, sc variado, qs variado).
@@ -229,6 +308,29 @@ fn synth_q4k(n: usize) -> Vec<u8> {
         for i in 0..128 {
             raw[off + 16 + i] = (b as u8).wrapping_mul(37).wrapping_add((i as u8).wrapping_mul(11));
         }
+    }
+    raw
+}
+
+/// Q6K sintético (d=1, scales ±, qs variados).
+#[cfg(feature = "wgpu")]
+fn synth_q6k(n: usize) -> Vec<u8> {
+    assert!(n % 256 == 0);
+    let mut raw = vec![0u8; (n / 256) * 210];
+    for b in 0..n / 256 {
+        let off = b * 210;
+        for i in 0..128 {
+            raw[off + i] = (b as u8).wrapping_mul(17).wrapping_add((i as u8).wrapping_mul(7));
+        }
+        for i in 0..64 {
+            raw[off + 128 + i] = (b as u8).wrapping_mul(31).wrapping_add((i as u8).wrapping_mul(3));
+        }
+        for i in 0..16 {
+            // alterna scales +1/-1 (exercita o sinal int8)
+            raw[off + 192 + i] = if (i + b) % 2 == 0 { 1 } else { 0xFF };
+        }
+        raw[off + 208] = 0x00;
+        raw[off + 209] = 0x3c; // d = 1.0
     }
     raw
 }
