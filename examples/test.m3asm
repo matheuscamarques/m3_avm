@@ -1,0 +1,25 @@
+; M³-AVM — Exemplo canônico (spec §4)
+; Aloca tensor 2x2, executa ATTN nele e faz STREAM para stdout
+; Uso: cargo run -- run examples/test.m3asm --trace
+
+; --- Aloca Q, K, V como 2x2 f32 ---
+; payload 2 2 f32 inicializa com dados incrementais (0.5, 1.0, 1.5, 2.0)
+TENSOR r0 2 2 f32        ; Q
+TENSOR r1 2 2 f32        ; K
+TENSOR r2 2 2 f32        ; V
+
+; --- Atenção escalonada: out = softmax(Q*K^T / sqrt(dk)) * V ---
+ATTN r3, r0, r1, r2      ; r3 = ATTN(Q,K,V) -> 2x2 f32
+
+; --- Stream resultado para stdout (sink 0 = stdout stub) ---
+STREAM r3, r0 BLOCKING   ; simula fluxo Q->stdout com backpressure BLOCKING
+
+; --- Teste de FORK + SENSE ---
+FORK r4, RED             ; clona contexto com prioridade RED, r4 = child_id
+SENSE r5, AUDIO          ; lê áudio (ruído branco) -> TEMPORAL, r5 = addr
+SENSE r6, VAD            ; lê VAD -> TEMPORAL, r6 = addr
+
+; --- Demonstra ABORT (mata filho) ---
+; ABORT r4, r5           ; opcional: aborta filho e restaura snapshot r5 (comentado para não matar antes de testar)
+
+HALT

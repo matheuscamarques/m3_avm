@@ -1,0 +1,26 @@
+; sparse_nop.m3asm — Demonstração NOP + Matrizes Esparsas (CSR)
+; Uso: cargo run -- run examples/sparse_nop.m3asm
+; Docs: src/sparse.rs e docs/PLANO_NOP.md
+
+; Aloca 3 matrizes esparsas 32x32 com densidades diferentes
+; 5% densidade = ~51 nnz de 1024 (10x economia vs denso 4KB)
+TENSOR r0 32 32 f32 SPARSE DENSITY=0.05   ; Q esparsa (5%)
+TENSOR r1 32 32 f32 SPARSE DENSITY=0.10   ; K esparsa (10%)
+TENSOR r2 32 32 f32 SPARSE DENSITY=0.10   ; V esparsa (10%)
+
+; ATTN esparsa com notificação por head (preempção granular)
+; Cada head (linha) notifica via watch::Sender<AttentionEvent>
+; Se VAD disparar, ABORT preempta entre heads (<10ns)
+ATTN r3 r0 r1 r2 NOTIFY_EACH_HEAD
+
+; STREAM do resultado (pode ser esparso ou denso dependendo da densidade)
+STREAM r3 r15 BLOCKING   ; r15=0 => stdout
+
+; Também aloca versão densa para comparação de paridade
+TENSOR r4 4 4 f32
+TENSOR r5 4 4 f32
+TENSOR r6 4 4 f32
+ATTN r7 r4 r5 r6
+STREAM r7 r15 BLOCKING
+
+HALT

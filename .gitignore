@@ -1,0 +1,8 @@
+/target
+m3_persistent.dat
+/models
+*.gguf
+*.bin
+/whisper.cpp
+*.m3bin
+*.log

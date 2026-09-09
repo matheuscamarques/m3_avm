@@ -1,0 +1,33 @@
+; transcribe.m3asm — Programa STT com 6 opcodes (sem TRANSCRIBE)
+; Áudio entra via SENSE (periférico AUDIO → TEMPORAL),
+; serviço host (tokio::spawn_blocking) lê TEMPORAL, chama whisper-rs,
+; escreve texto em PERSISTENTE e notifica via Bus, programa lê via STREAM.
+; Compatível com ISA mínima. Uso:
+;   cargo run -- run examples/transcribe.m3asm
+;   cargo run --features whisper -- run examples/transcribe.m3asm --model ggml-tiny-q5_0.bin
+; Para teste real: gere WAV 16kHz mono 5s: ffmpeg -f lavfi -i "sine=frequency=440:duration=5" -ar 16000 -ac 1 test.wav
+
+; 1. SENSE publica áudio na região TEMPORAL (0x10...)
+;    Emulador gera ruído branco 256 amostras f32 → 1024 bytes em TEMPORAL
+;    Host lê via temporal_read e converte para PCM f32
+SENSE r0, AUDIO
+
+; 2. Aloca buffer de texto em PERSISTENTE (0x20... 512 bytes = até 512 chars)
+;    No VM real, serviço host escreve texto aqui via make_persistent_addr
+TENSOR r1 1 512 u8
+
+; 3. Simula processamento: ATTN denso como placeholder de carga
+;    (em prod, este ATTN seria o encoder do Whisper; aqui valida NOP)
+TENSOR r2 4 4 f32
+TENSOR r3 4 4 f32
+TENSOR r4 4 4 f32
+ATTN r5 r2 r3 r4
+
+; 4. STREAM do buffer de texto para saída (IDE/terminal)
+;    r1 contém endereço do texto em PERSISTENTE (escrito pelo serviço host)
+STREAM r1 r15 BLOCKING
+
+; 5. SENSE VAD para demonstrar preempção durante STT
+SENSE r6, VAD
+
+HALT

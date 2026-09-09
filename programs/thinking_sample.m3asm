@@ -1,0 +1,69 @@
+; thinking_sample.m3asm — demo texto legível com SAMPLE+TOKEN (Item 2+3)
+; Usa periféricos host-side:
+;   STREAM Rlogits, 2  -> PERIPHERAL_SAMPLE (2) softmax+argmax -> vm.last_sample
+;   SENSE  Rtoken, 3   -> PERIPHERAL_TOKEN (3) lê last_sample
+;   STREAM Rtoken, 4   -> PERIPHERAL_OUTPUT_DECODED (4) decodifica via M3Tokenizer e imprime
+; Vocab real vem do GGUF tokenizer.ggml.tokens, fallback mock ["Olá","mundo","M³","AVM",...] se GGUF não tiver
+; Uso:
+;   ./target/release/m3_avm run programs/thinking_sample.m3asm --model ./models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf --persistent-mib 2048 --interactive
+;   ./target/release/m3_avm run programs/thinking_sample.m3asm --model ./models/ggml-tiny-q8_0.bin --persistent-mib 64
+
+; --- tensores base ---
+TENSOR r0 2 8 f32
+TENSOR r1 1 8 f32
+TENSOR r2 1 8 f32
+TENSOR r3 8 8 f32
+TENSOR r4 8 8 f32
+TENSOR r5 8 16 f32
+TENSOR r6 16 8 f32
+
+; --- iteração 0 ---
+SENSE r10, VAD
+SENSE r11, AUDIO
+FORK r12, GREEN, NOTIFY
+FORK r13, RED, NOTIFY
+NORM r7, r0, r1, r2
+ATTN r8, r7, r3, r3
+NORM r9, r8, r1, r2
+FFN r10, r9, r5, r6
+STREAM r10, 2 BLOCKING  ; SAMPLE logits -> token
+SENSE r14, 3            ; TOKEN -> R14
+STREAM r14, 4 BLOCKING  ; OUTPUT_DECODED -> texto
+SENSE r15, VAD
+ABORT r13, r12
+ABORT r12, r15
+
+; --- iteração 1 ---
+SENSE r10, VAD
+SENSE r11, AUDIO
+FORK r12, GREEN, NOTIFY
+FORK r13, RED, NOTIFY
+NORM r7, r0, r1, r2
+ATTN r8, r7, r3, r3
+NORM r9, r8, r1, r2
+FFN r10, r9, r5, r6
+STREAM r10, 2
+SENSE r14, 3
+STREAM r14, 4
+SENSE r15, VAD
+ABORT r13, r12
+
+; --- iteração 2 ---
+NORM r7, r0, r1, r2
+ATTN r8, r7, r3, r3
+NORM r9, r8, r1, r2
+FFN r10, r9, r5, r6
+STREAM r10, 2
+SENSE r14, 3
+STREAM r14, 4
+
+; --- iteração 3 ---
+NORM r7, r0, r1, r2
+ATTN r8, r7, r3, r3
+NORM r9, r8, r1, r2
+FFN r10, r9, r5, r6
+STREAM r10, 2
+SENSE r14, 3
+STREAM r14, 4
+
+HALT

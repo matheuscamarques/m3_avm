@@ -1,0 +1,30 @@
+; M³-AVM: Loop de Geração com Interrupção Implícita — versão do PROMPT (corrigida para assembler real)
+; O prompt original usa sintaxe TENSOR R1, 32000, 4096, FP16, PERSIST que não existe.
+; Abaixo está a tradução válida para a ISA real (8 opcodes) mantendo a semântica.
+; Para rodar o GGUF de 1.1GB, use --persistent-mib 2048 (não 128, pois 1065 > 64).
+
+; Pesos mapeados da região PERSISTENTE (em prod: mmap zero-copy, aqui TENSOR aloca minimal)
+; O modelo real está em PERSISTENTE 0x20 via --model, não precisa TENSOR explícito para pesos
+TENSOR r0 2 8 f32          ; embedding minimal (prod seria 32000x4096)
+TENSOR r1 1 8 f32          ; gamma
+TENSOR r2 1 8 f32          ; beta
+TENSOR r3 8 8 f32          ; Q_proj
+TENSOR r4 8 8 f32          ; K_proj placeholder (ATTN usa 2 tensores em minimal)
+TENSOR r5 8 16 f32         ; FFN W1
+TENSOR r6 16 8 f32         ; FFN W2
+TENSOR r8 2 8 f32          ; dummy output
+
+; Loop equivalente ao MAIN_LOOP do prompt (simplificado, sem COMPARE/JUMP — controle fica no host)
+SENSE r10, VAD
+SENSE r11, AUDIO
+FORK r12, GREEN, NOTIFY
+FORK r13, RED, NOTIFY
+NORM r7, r0, r1, r2
+ATTN r8, r7, r3, r3
+NORM r9, r8, r1, r2
+FFN r10, r9, r5, r6
+STREAM r10, r15 BLOCKING
+SENSE r14, VAD
+ABORT r13, r12
+ABORT r12, r15
+HALT

@@ -1,0 +1,10 @@
+; minimal.m3asm — Exemplo mínimo requisitado no prompt §4
+; Aloca tensor 2x2, executa ATTN e faz STREAM para stdout
+; Uso: cargo run -- run examples/minimal.m3asm --trace
+
+TENSOR r0 2 2 f32        ; aloca tensor 2x2 f32 em GLOBAL -> r0
+TENSOR r1 2 2 f32        ; aloca tensor 2x2 f32 -> r1
+TENSOR r2 2 2 f32        ; aloca tensor 2x2 f32 -> r2
+ATTN r3, r0, r1, r2      ; r3 = FlashAttention(Q=r0, K=r1, V=r2)
+STREAM r3, r15 BLOCKING ; r15 == 0 => stdout (backpressure BLOCKING)
+HALT

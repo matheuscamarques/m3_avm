@@ -1,0 +1,30 @@
+; nop_demo.m3asm — Demonstração do Paradigma Orientado a Notificações (NOP)
+; 3 buses: Interrupt (watch), Stream (broadcast), Sched (broadcast)
+; Uso: cargo run -- run examples/nop_demo.m3asm
+;      cargo run -- run examples/nop_demo.m3asm --nop  (modo reator)
+
+; --- Aloca Q,K,V 2x2 ---
+TENSOR r0 2 2 f32
+TENSOR r1 2 2 f32
+TENSOR r2 2 2 f32
+
+; --- FORK com NOTIFY: scheduler acorda em 1 ciclo (NOP) ---
+; Sem NOTIFY, scheduler veria novo contexto só no próximo tick
+FORK r4, RED, NOTIFY      ; r4 = child_id, flag NOTIFY=0b100
+
+; --- SENSE publica PERIPHERAL_UPDATED no StreamBus ---
+SENSE r5, AUDIO           ; ruído branco -> TEMPORAL, publica no bus
+SENSE r6, VAD             ; VAD -> TEMPORAL
+
+; --- ATTN escuta InterruptBus (watch) entre heads ---
+; Se VAD notificar, ATTN aborta sem polling entre camadas
+ATTN r3, r0, r1, r2        ; 2x2 flash-attention com checagem NOP
+
+; --- STREAM com backpressure por notificação (sem sleep) ---
+STREAM r3, r15 BLOCKING   ; r15=0 => stdout, BLOCKING via StreamBus
+
+; --- ABORT via crossbar (watch) — <10ns simulado ---
+; ABORT publica InterruptSignal direto para ATTN, sem passar pelo scheduler
+ABORT r4, r5
+
+HALT

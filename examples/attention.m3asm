@@ -1,0 +1,13 @@
+; attention.m3asm — Teste de ATTN 4x4 com FORK concorrente
+; Demonstra CoW: pai aloca, fork, filho faz ATTN separado
+
+TENSOR r0 4 4 f32
+TENSOR r1 4 4 f32
+TENSOR r2 4 4 f32
+
+FORK r10, BLUE           ; filho BLUE
+
+ATTN r3, r0, r1, r2       ; pai faz ATTN
+STREAM r3, r10 BLOCKING
+
+HALT

@@ -1,0 +1,10 @@
+; abort.m3asm — Demonstra FORK + ABORT preemptivo
+; O pai faz FORK RED, depois ABORT no filho em <100µs (na VM é imediato)
+
+TENSOR r0 2 2 f32
+TENSOR r1 2 2 f32
+FORK r5, RED          ; r5 = child_id (RED)
+; Filho começa em PC seguinte e compete; pai imediatamente aborta
+ABORT r5, r0          ; r0 contém 0 (versão) — aqui só mata, sem restore
+SENSE r6, AUDIO       ; prova que após ABORT a VM continua
+HALT
