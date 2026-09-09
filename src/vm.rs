@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use ndarray::{Array2, Axis};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 use crate::context::{Context, Priority, Scheduler};
@@ -291,6 +291,8 @@ pub struct Vm {
     /// Tokenizer GGUF (opcional) e último token amostrado (host-side SAMPLE)
     pub tokenizer: Option<crate::tokenizer::M3Tokenizer>,
     pub last_sample: u32,
+    /// Fila de entrada do usuário (SENSE USER_INPUT consome sem bloquear)
+    pub user_input: VecDeque<String>,
 }
 
 impl Vm {
@@ -325,6 +327,7 @@ impl Vm {
             meter: ThroughputMeter::new(),
             tokenizer: None,
             last_sample: 0,
+            user_input: VecDeque::new(),
         })
     }
 
@@ -348,6 +351,7 @@ impl Vm {
             meter: ThroughputMeter::new(),
             tokenizer: None,
             last_sample: 0,
+            user_input: VecDeque::new(),
         }
     }
 
@@ -364,11 +368,17 @@ impl Vm {
             meter: ThroughputMeter::new(),
             tokenizer: None,
             last_sample: 0,
+            user_input: VecDeque::new(),
         })
     }
 
     pub fn set_tokenizer(&mut self, tok: crate::tokenizer::M3Tokenizer) {
         self.tokenizer = Some(tok);
+    }
+
+    /// Enfileira entrada do usuário (consumida por SENSE USER_INPUT).
+    pub fn push_input(&mut self, text: String) {
+        self.user_input.push_back(text);
     }
 
     /// Host-side SAMPLE: softmax + random weighted sampling (temperatura 1.0)
@@ -626,6 +636,35 @@ impl Vm {
             OP_FFN => {
                 self.exec_ffn(ctx_id, instr)?;
                 Ok(true)
+            }
+            OP_EMBED => {
+                self.exec_embed(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ADD => {
+                self.exec_add(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SAMPLE => {
+                self.exec_sample(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_COMPARE => {
+                self.exec_compare(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_JUMP => {
+                self.exec_jump(ctx_id, instr)?;
+                // JUMP define PC diretamente — sem avanço automático
+                Ok(false)
+            }
+            OP_IF_EQUAL => {
+                let jumped = self.exec_if_equal(ctx_id, instr)?;
+                Ok(!jumped)
+            }
+            OP_IF_INTERRUPT => {
+                let jumped = self.exec_if_interrupt(ctx_id, instr)?;
+                Ok(!jumped)
             }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
         }
@@ -1103,7 +1142,17 @@ impl Vm {
         let parent = self.scheduler.get(ctx_id).cloned().ok_or_else(|| anyhow!("ctx {} não encontrado para FORK", ctx_id))?;
         let child_prio = Priority::from_flags(instr.flags);
         let snap_version = self.memory.snapshot();
-        let new_id = self.scheduler.create_context(child_prio, parent.pc.wrapping_add(32), snap_version);
+        // Forma com rótulo (FORK Rd, LABEL): filho começa no alvo; senão PC+32
+        let child_pc = {
+            let label_pc = instr.imm_u128();
+            if label_pc != 0 {
+                self.check_jump_target(label_pc)?;
+                label_pc
+            } else {
+                parent.pc.wrapping_add(32)
+            }
+        };
+        let new_id = self.scheduler.create_context(child_prio, child_pc, snap_version);
         // Copia registradores do pai para filho
         if let Some(child) = self.scheduler.get_mut(new_id) {
             child.regs = parent.regs;
@@ -1116,6 +1165,184 @@ impl Vm {
         self.stats.forks += 1;
         log_info("fork", &format!("ctx {} FORK -> child {} prio {} (snap v{})", ctx_id, new_id, child_prio, snap_version));
         Ok(())
+    }
+
+    /// EMBED rdest, rtoken, rtable — lookup de embedding: linha `token_id` da
+    /// tabela [rows, hidden] vira tensor [1, hidden] em rdest.
+    /// rtoken com valor < 1M é id direto; senão lê u32 LE do endereço.
+    fn exec_embed(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (tok_val, table_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let token_id: usize = if tok_val < 1_000_000 {
+            tok_val as usize
+        } else {
+            let b = self.memory.read(tok_val, 4)?;
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+        };
+        let meta = self.memory.get_tensor_meta(table_addr).cloned()
+            .ok_or_else(|| anyhow!("EMBED: tabela não encontrada 0x{:x}", table_addr))?;
+        if meta.shape.len() != 2 {
+            return Err(anyhow!("EMBED: tabela precisa ser 2D, shape {:?}", meta.shape));
+        }
+        if meta.is_sparse {
+            return Err(anyhow!("EMBED: tabela esparsa não suportada"));
+        }
+        let (rows, hidden) = (meta.shape[0], meta.shape[1]);
+        let row = token_id % rows.max(1);
+        let table = self.memory.read_f32_tensor(table_addr, rows * hidden)?;
+        let out_vec = table[row * hidden..(row + 1) * hidden].to_vec();
+        let out_addr = self.memory.alloc_tensor(&[1, hidden], DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out_vec)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.embed_execs += 1;
+        log_debug("embed", &format!("ctx {} EMBED r{} <- tok {} tabela 0x{:x} => 0x{:x} [1,{}]", ctx_id, instr.rdest, token_id, table_addr, out_addr, hidden));
+        Ok(())
+    }
+
+    /// ADD rdest, r1, r2 — soma elemento a elemento (f32 denso, shapes iguais).
+    fn exec_add(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (a1, a2) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let m1 = self.memory.get_tensor_meta(a1).cloned()
+            .ok_or_else(|| anyhow!("ADD: tensor 0x{:x} não encontrado", a1))?;
+        let m2 = self.memory.get_tensor_meta(a2).cloned()
+            .ok_or_else(|| anyhow!("ADD: tensor 0x{:x} não encontrado", a2))?;
+        if m1.is_sparse || m2.is_sparse {
+            return Err(anyhow!("ADD: esparso não suportado"));
+        }
+        if m1.shape != m2.shape {
+            return Err(anyhow!("ADD: shapes {:?} != {:?}", m1.shape, m2.shape));
+        }
+        let n: usize = m1.shape.iter().product();
+        let d1 = self.memory.read_f32_tensor(a1, n)?;
+        let d2 = self.memory.read_f32_tensor(a2, n)?;
+        let out_vec: Vec<f32> = d1.iter().zip(d2.iter()).map(|(a, b)| a + b).collect();
+        let out_addr = self.memory.alloc_tensor(&m1.shape, DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out_vec)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.add_execs += 1;
+        log_debug("add", &format!("ctx {} ADD r{} <- 0x{:x} + 0x{:x} => 0x{:x}", ctx_id, instr.rdest, a1, a2, out_addr));
+        Ok(())
+    }
+
+    /// SAMPLE rdest, rlogits [TEMP=x] — softmax + amostragem; guarda token em
+    /// rdest e em `last_sample` (igual ao sink SAMPLE do STREAM).
+    fn exec_sample(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let src_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            if instr.rsrc1 != 0xFF { ctx.reg(instr.rsrc1)? } else { 0 }
+        };
+        let logits: Vec<f32> = if let Some(meta) = self.memory.get_tensor_meta(src_addr).cloned() {
+            let n: usize = meta.shape.iter().product();
+            self.memory.read_f32_tensor(src_addr, n).unwrap_or_else(|_| vec![0.5; 4])
+        } else {
+            self.memory.read(src_addr, 64).ok()
+                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .unwrap_or(vec![0.5; 4])
+        };
+        // Temp vai no payload[0..4] (instr_sample); <=0 ou inválido => 1.0
+        let mut tb = [0u8; 4];
+        tb.copy_from_slice(&instr.payload[0..4]);
+        let temp = f32::from_le_bytes(tb);
+        let scaled: Vec<f32> = if temp > 0.0 && temp.is_finite() && (temp - 1.0).abs() > f32::EPSILON {
+            logits.iter().map(|v| v / temp).collect()
+        } else {
+            logits.clone()
+        };
+        let tok = self.sample_logits(&scaled);
+        self.last_sample = tok;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, tok as u128)?;
+            }
+        }
+        self.stats.sample_execs += 1;
+        log_debug("sample", &format!("ctx {} SAMPLE {} logits -> token {}", ctx_id, scaled.len(), tok));
+        Ok(())
+    }
+
+    /// COMPARE r1, r2|imm — `cmp_equal = (reg[r1] == reg[r2] ou imm)`.
+    fn exec_compare(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (v1, v2) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            let a = ctx.reg(instr.rsrc1)?;
+            let b = if instr.rsrc2 != 0xFF { ctx.reg(instr.rsrc2)? } else { instr.imm_u128() };
+            (a, b)
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.cmp_equal = v1 == v2;
+        }
+        log_debug("compare", &format!("ctx {} COMPARE {} == {} -> {}", ctx_id, v1, v2, v1 == v2));
+        Ok(())
+    }
+
+    /// Valida que um PC alvo cai dentro do programa.
+    fn check_jump_target(&self, target: u128) -> Result<()> {
+        if target < self.program_base {
+            return Err(anyhow!("JUMP para {:032x} antes da base {:032x}", target, self.program_base));
+        }
+        let offset = target - self.program_base;
+        if offset % 32 != 0 {
+            return Err(anyhow!("JUMP para {:032x} desalinhado", target));
+        }
+        let idx = (offset / 32) as usize;
+        if idx >= self.program.len() {
+            return Err(anyhow!("JUMP para {:032x} fora do programa (len {})", target, self.program.len()));
+        }
+        Ok(())
+    }
+
+    /// JUMP alvo — pc = alvo (chamador não avança).
+    fn exec_jump(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let target = instr.imm_u128();
+        self.check_jump_target(target)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.pc = target;
+        }
+        log_debug("jump", &format!("ctx {} JUMP -> {:032x}", ctx_id, target));
+        Ok(())
+    }
+
+    /// IF_EQUAL alvo — pula se `cmp_equal`; retorna se pulou.
+    fn exec_if_equal(&mut self, ctx_id: u64, instr: &Instruction) -> Result<bool> {
+        let take = self.scheduler.get(ctx_id).map(|c| c.cmp_equal).unwrap_or(false);
+        if take {
+            self.exec_jump(ctx_id, instr)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// IF_INTERRUPT [rcond,] alvo — pula se houver interrupção pendente:
+    /// com registrador, `reg != 0`; sem, `interrupt_flag` (consumida no pulo).
+    fn exec_if_interrupt(&mut self, ctx_id: u64, instr: &Instruction) -> Result<bool> {
+        self.stats.interrupt_checks += 1;
+        let take = if instr.rsrc1 != 0xFF {
+            self.scheduler.get(ctx_id).map(|c| c.reg(instr.rsrc1).unwrap_or(0) != 0).unwrap_or(false)
+        } else {
+            self.scheduler.get(ctx_id).map(|c| c.interrupt_flag).unwrap_or(false)
+        };
+        if take {
+            if instr.rsrc1 == 0xFF {
+                if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+                    ctx.interrupt_flag = false;
+                }
+            }
+            self.exec_jump(ctx_id, instr)?;
+            log_debug("if_interrupt", &format!("ctx {} IF_INTERRUPT tomado", ctx_id));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn exec_abort(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
@@ -1375,6 +1602,24 @@ impl Vm {
                 // PERIPHERAL_TOKEN: retorna last_sample como u32 LE
                 self.last_sample.to_le_bytes().to_vec()
             }
+            SENSE_USER_INPUT => {
+                // Entrada do usuário (não-bloqueante): consome 1 item da fila.
+                // Semântica de valor: rdest = 1/0 + interrupt_flag — casa com
+                // `IF_INTERRUPT rdest, ALVO` do loop thinking.
+                let item = self.user_input.pop_front();
+                let has = item.is_some();
+                if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+                    ctx.set_reg(instr.rdest, if has { 1 } else { 0 })?;
+                    ctx.interrupt_flag = has;
+                }
+                self.stats.senses += 1;
+                log_debug("sense", &format!("ctx {} SENSE USER_INPUT -> {} (fila {})", ctx_id, has as u8, self.user_input.len()));
+                if let Some(text) = item {
+                    let addr = self.memory.temporal_push(text.as_bytes())?;
+                    log_debug("sense", &format!("ctx {} USER_INPUT {} bytes em 0x{:032x}", ctx_id, text.len(), addr));
+                }
+                return Ok(());
+            }
             _ => {
                 // Lê do stdin se periférico desconhecido (para teste manual)
                 b"sense_default".to_vec()
@@ -1529,5 +1774,81 @@ mod tests {
         assert_eq!(stats.norm_execs, 2);
         assert_eq!(stats.attn_execs, 1);
         assert_eq!(stats.ffn_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_embed_add_sample_compare_jump() {
+        // Cadeia EMBED/ADD/SAMPLE + COMPARE/IF_EQUAL/JUMP com rótulos:
+        // prova assembler 2-pass, dispatch e pulos condicionais.
+        use crate::opcodes::assemble;
+        let src = r#"
+            TENSOR r0 2 2 f32
+            TENSOR r1 2 2 f32
+            ADD r2, r0, r1
+            SAMPLE r3, r2
+            EMBED r4, r7, r0
+            COMPARE r2, r2
+            IF_EQUAL DO_ADD
+            JUMP DONE
+        DO_ADD:
+            ADD r5, r0, r0
+            JUMP DONE
+        DONE:
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        assert_eq!(prog.len(), 11);
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.embed_execs, 1);
+        assert_eq!(stats.add_execs, 2);
+        assert_eq!(stats.sample_execs, 1);
+        // TENSOR 2x2 inicializa (i+1)*0.5 => [0.5,1,1.5,2]; ADD dobra
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let a2 = ctx.reg(2).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a2, 4).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        // IF_EQUAL tomado: JUMP DONE pulado, ADD r5 executou, JUMP DONE caiu no HALT
+        let a5 = ctx.reg(5).unwrap();
+        assert_ne!(a5, 0);
+        assert_eq!(vm.memory.read_f32_tensor(a5, 4).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        // EMBED r4, r7(=0), r0 -> linha 0 da tabela [0.5,1.0] em tensor [1,2]
+        let a4 = ctx.reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a4, 2).unwrap(), vec![0.5, 1.0]);
+        // SAMPLE guardou token em r3 e last_sample
+        let r3 = ctx.reg(3).unwrap();
+        assert_eq!(vm.last_sample as u128, r3);
+    }
+
+    #[tokio::test]
+    async fn test_sense_user_input_if_interrupt() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            SENSE r0, USER_INPUT
+            IF_INTERRUPT DONE
+            TENSOR r1 1 1 f32
+        DONE:
+            HALT
+        "#;
+        // Com input: r0=1, IF_INTERRUPT pula o TENSOR (r1 fica 0)
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        vm.push_input("hello".to_string());
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 1);
+        assert_eq!(ctx.reg(1).unwrap(), 0);
+        assert_eq!(stats.senses, 1);
+        assert_eq!(stats.interrupt_checks, 1);
+        // Sem input: r0=0, cai no TENSOR (r1 vira endereço válido)
+        let prog2 = assemble(src).unwrap();
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        vm2.load_program(prog2);
+        let stats2 = vm2.run().unwrap();
+        let ctx2 = vm2.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx2.reg(0).unwrap(), 0);
+        assert_ne!(ctx2.reg(1).unwrap(), 0);
+        assert_eq!(stats2.tensor_allocs, 1);
     }
 }

@@ -278,6 +278,9 @@ async fn run_file(path: PathBuf, max_steps: u64, trace: bool, model: Option<Path
     println!("ATTN execs      : {}", stats.attn_execs);
     println!("NORM execs      : {}", stats.norm_execs);
     println!("FFN execs       : {}", stats.ffn_execs);
+    println!("EMBED execs     : {}", stats.embed_execs);
+    println!("ADD execs       : {}", stats.add_execs);
+    println!("SAMPLE execs    : {}", stats.sample_execs);
     println!("STREAMs         : {}", stats.streams);
     println!("FORKs           : {}", stats.forks);
     println!("ABORTs          : {}", stats.aborts);
