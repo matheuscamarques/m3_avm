@@ -50,15 +50,12 @@ impl AsmEmitter {
         out.push("; ======================================================".to_string());
         out.push(String::new());
 
-        // Prólogo: aloca temporários com shapes compatíveis mas pequenos para FFN (evita colisão GGUF)
-        // Hidden [1, hidden] é seguro (não colide com norma [hidden]); W1/W2 usam inter=64 dummy
-        // para passar validação [1,hidden]*[hidden,64]*[64,hidden] sem mapear para pesos reais de 11M.
-        // Isso prova completude da ISA; com modelo real, RealInference leria pesos via mmap, não via TENSOR aqui.
+        // Prólogo: hidden [1, hidden] + W1/W2 dummy 64 para FFN stub (Fase 2 fará gate/up/down reais)
         let ff_inter = 64usize.min(self.config.intermediate);
-        out.push("; --- prólogo: aloca temporários (stub) ---".to_string());
+        out.push("; --- prólogo: hidden + FFN stub ---".to_string());
         out.push(format!("TENSOR r0 1 {} f32   ; hidden cur [1, hidden]", self.config.hidden));
-        out.push(format!("TENSOR r9 {} {} f32  ; W1 dummy [hidden, {}] para FFN (stub, evita GGUF map)", self.config.hidden, ff_inter, ff_inter));
-        out.push(format!("TENSOR r10 {} {} f32 ; W2 dummy [{}, hidden] para FFN", ff_inter, self.config.hidden, ff_inter));
+        out.push(format!("TENSOR r9 {} {} f32  ; W1 dummy [hidden, {}] stub", self.config.hidden, ff_inter, ff_inter));
+        out.push(format!("TENSOR r10 {} {} f32 ; W2 dummy [{}, hidden] stub", ff_inter, self.config.hidden, ff_inter));
         out.push("SENSE r15, USER_INPUT".to_string());
         out.push("IF_INTERRUPT HANDLE_ABORT".to_string());
         out.push(String::new());
@@ -95,8 +92,7 @@ impl AsmEmitter {
             out.push(format!("    ADD r0, r0, r5       ; R0 += attn_out layer {}", layer));
             // NORM2
             out.push(format!("    NORM r1, r0, r0, r0   ; norm2 layer {}", layer));
-            // FFN gate/up/down — shapes [hidden, inter] e [inter, hidden]; usa inter=64 stub para não colidir se quiser stub, mas aqui emitimos inter real para mapear quando possível
-            // Para Fase 1 mantemos stub 64 para FFN (evita 11M alloc repetido); Fase 2 emitirá inter real
+            // FFN stub: usa W1/W2 dummy 64 (Fase 2 fará gate/up/down reais com SILU+MUL)
             out.push(format!("    FFN r8, r1, r9, r10  ; FFN layer {} (R1->[hidden,64]->[hidden]) stub", layer));
             out.push("    SENSE r15, USER_INPUT".to_string());
             out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
@@ -126,8 +122,8 @@ impl AsmEmitter {
     }
 
     pub fn estimate_instr_count(&self) -> usize {
-        // prólogo 5 + MAIN_LOOP header 5 + n_layers*18 (NORM+3×(TENSOR+MATVEC)+ATTN+TENSOR+MATVEC+ADD+NORM+FFN) + epílogo 7
-        5 + 5 + self.config.n_layers * 18 + 7
+        // prólogo 3 + MAIN_LOOP 5 + n_layers*24 (NORM+4×TENSOR+4×MATVEC+ATTN+SILU+MUL+ADD) + epílogo 7
+        3 + 5 + self.config.n_layers * 24 + 7
     }
 
     /// Escreve arquivo `.m3asm` no path informado.

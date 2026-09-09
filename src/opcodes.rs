@@ -43,6 +43,8 @@ pub const OP_IF_EQUAL: u8 = 0x0D;
 pub const OP_JUMP: u8 = 0x0E;
 pub const OP_IF_INTERRUPT: u8 = 0x0F;
 pub const OP_MATVEC: u8 = 0x10;
+pub const OP_MUL: u8 = 0x11;
+pub const OP_SILU: u8 = 0x12;
 pub const OP_HALT: u8 = 0x00; // não oficial, usado para encerrar programa
 pub const OP_NOP: u8 = 0xFF;
 
@@ -218,6 +220,8 @@ impl Instruction {
             OP_JUMP => "JUMP",
             OP_IF_INTERRUPT => "IF_INTERRUPT",
             OP_MATVEC => "MATVEC",
+            OP_MUL => "MUL",
+            OP_SILU => "SILU",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -374,6 +378,14 @@ pub fn instr_if_interrupt(rcond: u8, target_pc: u128) -> Instruction {
 
 pub fn instr_matvec(rdest: u8, r_x: u8, r_w: u8) -> Instruction {
     Instruction::new(OP_MATVEC, 0, rdest, r_x, r_w, 0xFF)
+}
+
+pub fn instr_mul(rdest: u8, rsrc1: u8, rsrc2: u8) -> Instruction {
+    Instruction::new(OP_MUL, 0, rdest, rsrc1, rsrc2, 0xFF)
+}
+
+pub fn instr_silu(rdest: u8, rsrc: u8) -> Instruction {
+    Instruction::new(OP_SILU, 0, rdest, rsrc, 0xFF, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +799,23 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             let rx = parse_reg(parts[2])?;
             let rw = parse_reg(parts[3])?;
             Ok(instr_matvec(rdest, rx, rw))
+        }
+        "MUL" => {
+            if parts.len() < 4 {
+                return Err(anyhow!("MUL precisa de rdest, r1, r2 — ex: MUL r6, r6, r7"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let r1 = parse_reg(parts[2])?;
+            let r2 = parse_reg(parts[3])?;
+            Ok(instr_mul(rdest, r1, r2))
+        }
+        "SILU" => {
+            if parts.len() < 3 {
+                return Err(anyhow!("SILU precisa de rdest, rsrc — ex: SILU r6, r6"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rsrc = parse_reg(parts[2])?;
+            Ok(instr_silu(rdest, rsrc))
         }
         "HALT" => Ok(instr_halt()),
         "NOP" => Ok(instr_nop()),

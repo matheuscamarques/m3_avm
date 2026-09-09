@@ -671,6 +671,14 @@ impl Vm {
                 self.exec_matvec(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_MUL => {
+                self.exec_mul(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SILU => {
+                self.exec_silu(ctx_id, instr)?;
+                Ok(true)
+            }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
         }
     }
@@ -1699,6 +1707,52 @@ impl Vm {
         }
         self.stats.matvec_execs += 1;
         log_debug("matvec", &format!("ctx {} MATVEC r{} <- matvec(x 0x{:x} {:?} * W 0x{:x} {:?}) => 0x{:x} {:?}", ctx_id, instr.rdest, x_addr, meta_x.shape, w_addr, meta_w.shape, out_addr, out_shape));
+        Ok(())
+    }
+
+    fn exec_mul(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (a1, a2) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let m1 = self.memory.get_tensor_meta(a1).cloned().ok_or_else(|| anyhow!("MUL: tensor 0x{:x} não encontrado", a1))?;
+        let m2 = self.memory.get_tensor_meta(a2).cloned().ok_or_else(|| anyhow!("MUL: tensor 0x{:x} não encontrado", a2))?;
+        if m1.shape != m2.shape {
+            return Err(anyhow!("MUL: shapes {:?} != {:?}", m1.shape, m2.shape));
+        }
+        let n: usize = m1.shape.iter().product();
+        let d1 = self.memory.read_f32_tensor(a1, n)?;
+        let d2 = self.memory.read_f32_tensor(a2, n)?;
+        let out_vec: Vec<f32> = d1.iter().zip(d2.iter()).map(|(a, b)| a * b).collect();
+        let out_addr = self.memory.alloc_tensor(&m1.shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out_vec)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.add_execs += 1;
+        Ok(())
+    }
+
+    fn exec_silu(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        eprintln!("[silu enter] rdest {} rsrc1 {} rsrc2 {} rsrc3 {}", instr.rdest, instr.rsrc1, instr.rsrc2, instr.rsrc3);
+        let src = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            let v = ctx.reg(instr.rsrc1);
+            eprintln!("[silu] reg {} -> {:?}", instr.rsrc1, v);
+            v?
+        };
+        let meta = self.memory.get_tensor_meta(src).cloned().ok_or_else(|| anyhow!("SILU: tensor 0x{:x} não encontrado", src))?;
+        let n: usize = meta.shape.iter().product();
+        let data = self.memory.read_f32_tensor(src, n)?;
+        let out_vec: Vec<f32> = data.iter().map(|&v| {
+            let sig = 1.0 / (1.0 + (-v).exp());
+            v * sig
+        }).collect();
+        let out_addr = self.memory.alloc_tensor(&meta.shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out_vec)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
         Ok(())
     }
 

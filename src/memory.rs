@@ -395,46 +395,47 @@ impl MemoryManager {
     pub fn try_gguf_tensor(&mut self, shape: &[usize], dtype: DType) -> Option<u128> {
         let gg = self.gguf.as_ref()?;
         let elems: usize = shape.iter().product();
-        // Para dummy 2x8 (16 elems) não mapear para Q4_K (que exige múltiplo de 256), evita falso positivo
         let is_small = elems < 256;
-        for t in &gg.tensors {
-            if t.n_elements != elems { continue; }
-            // Filtra por dtype: se GGUF é quantizado e request é F32, permite (dequant)
-            // Mas se GGUF é F32 e request é F32, ok. Se GGUF é Q4_K e request é Q4_K, ok.
-            // Para small shapes, só aceita F32 para evitar Q4_K com 16 elems (não múltiplo 256)
-            if is_small && t.dtype != 0 { continue; }
-            let gg_dtype = DType::from_u32(t.dtype);
-            // Se request é quantizado, só mapeia se gg dtype igual; se request é F32, mapeia tanto F32 quanto Q4_K
-            if dtype.is_quantized() && gg_dtype != dtype { continue; }
-            // Checa shape exato ou invertida
-            let mut shape_match = t.shape.len()==shape.len() && t.shape.iter().zip(shape).all(|(a,b)| *a as usize==*b);
-            if !shape_match {
-                let rev: Vec<usize> = t.shape.iter().rev().map(|&x| x as usize).collect();
-                shape_match = rev == shape;
-            }
-            if shape_match {
-                let file_offset = gg.data_offset + t.offset;
-                let addr = make_persistent_addr(file_offset as u128);
-                // Evita mapear mesmo tensor duas vezes para shapes iguais (Q/K/V/O todos 2048x2048)
-                // — cada TENSOR com mesma shape deve pegar o próximo tensor livre com mesma shape
-                if self.tensor_meta.contains_key(&addr) {
+        // Helper closure para tentar match com flag rev
+        let mut try_match = |allow_rev: bool| -> Option<u128> {
+            for t in &gg.tensors {
+                if t.n_elements != elems { continue; }
+                if is_small && t.dtype != 0 { continue; }
+                let gg_dtype = DType::from_u32(t.dtype);
+                if dtype.is_quantized() && gg_dtype != dtype { continue; }
+                let mut shape_match = t.shape.len()==shape.len() && t.shape.iter().zip(shape).all(|(a,b)| *a as usize==*b);
+                if !shape_match && allow_rev {
+                    let rev: Vec<usize> = t.shape.iter().rev().map(|&x| x as usize).collect();
+                    shape_match = rev == shape;
+                } else if !shape_match {
                     continue;
                 }
-                // byte_len depende do dtype real do GGUF
-                let byte_len = match gg_dtype {
-                    DType::F32 => elems*4,
-                    DType::F16 => elems*2,
-                    DType::Q4_K | DType::Q5_K | DType::Q6_K => (elems/256)*144,
-                    DType::Q4_0 => (elems/32)*18,
-                    _ => elems*4,
-                };
-                let meta = TensorMeta { addr, shape: shape.to_vec(), dtype: gg_dtype, byte_len, is_sparse: false, density: 1.0 };
-                self.tensor_meta.insert(addr, meta);
-                eprintln!("[gguf] TENSOR {:?} {} mapeado para GGUF '{}' shape {:?} dtype {} @ PERSISTENTE 0x{:x} ({} bytes)", shape, if gg_dtype.is_quantized() {"Q4_K"} else {"f32"}, t.name, t.shape, t.dtype, addr, byte_len);
-                return Some(addr);
+                if shape_match {
+                    let file_offset = gg.data_offset + t.offset;
+                    let addr = make_persistent_addr(file_offset as u128);
+                    if self.tensor_meta.contains_key(&addr) {
+                        continue;
+                    }
+                    let byte_len = match gg_dtype {
+                        DType::F32 => elems*4,
+                        DType::F16 => elems*2,
+                        DType::Q4_K | DType::Q5_K => (elems/256)*144,
+                        DType::Q6_K => (elems/256)*210,
+                        DType::Q4_0 => (elems/32)*18,
+                        DType::Q8_0 => (elems/32)*34,
+                        _ => elems*4,
+                    };
+                    let meta = TensorMeta { addr, shape: shape.to_vec(), dtype: gg_dtype, byte_len, is_sparse: false, density: 1.0 };
+                    self.tensor_meta.insert(addr, meta);
+                    eprintln!("[gguf] TENSOR {:?} {} mapeado para GGUF '{}' shape {:?} dtype {} @ PERSISTENTE 0x{:x} ({} bytes)", shape, if gg_dtype.is_quantized() {"Q4_K"} else {"f32"}, t.name, t.shape, t.dtype, addr, byte_len);
+                    return Some(addr);
+                }
             }
-        }
-        None
+            None
+        };
+        // Primeiro tenta exato, depois rev — evita [2048,5632] pegar [5632,2048] Q6_K antes do Q4_K exato
+        if let Some(addr) = try_match(false) { return Some(addr); }
+        try_match(true)
     }
 
     /// Variante que registra metadados de tensor (shape + dtype).
