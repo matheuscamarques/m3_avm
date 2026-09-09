@@ -20,6 +20,7 @@
 //!   0x08 FFN     — Feed-Forward com SwiGLU
 
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use thiserror::Error;
 
 pub const INSTR_SIZE: usize = 32;
@@ -33,6 +34,14 @@ pub const OP_ABORT: u8 = 0x05;
 pub const OP_SENSE: u8 = 0x06;
 pub const OP_NORM: u8 = 0x07;
 pub const OP_FFN: u8 = 0x08;
+// Novos opcodes para LLM Thinking & Controle de Fluxo
+pub const OP_EMBED: u8 = 0x09;
+pub const OP_ADD: u8 = 0x0A;
+pub const OP_SAMPLE: u8 = 0x0B;
+pub const OP_COMPARE: u8 = 0x0C;
+pub const OP_IF_EQUAL: u8 = 0x0D;
+pub const OP_JUMP: u8 = 0x0E;
+pub const OP_IF_INTERRUPT: u8 = 0x0F;
 pub const OP_HALT: u8 = 0x00; // não oficial, usado para encerrar programa
 pub const OP_NOP: u8 = 0xFF;
 
@@ -54,9 +63,13 @@ pub const ATTN_FLAG_NOTIFY_EACH_HEAD: u8 = 0b01;
 pub const SENSE_AUDIO: u8 = 0;
 pub const SENSE_VAD: u8 = 1;
 pub const SENSE_TOKEN: u8 = 3; // PERIPHERAL_TOKEN lido via SENSE Rtoken, TOKEN
+pub const SENSE_USER_INPUT: u8 = 5; // PERIPHERAL_USER_INPUT lido via SENSE Rd, USER_INPUT
 // STREAM sinks periféricos (valor do registrador Rsink ou imediato Rsink==periph id)
 pub const STREAM_PERIPHERAL_SAMPLE: u128 = 2; // sink 2 = amostra logits -> token
 pub const STREAM_PERIPHERAL_OUTPUT_DECODED: u128 = 4; // sink 4 = decodifica token e imprime
+pub const STREAM_PERIPHERAL_INPUT: u128 = 1; // sink 1 = entrada do usuário / prompt
+pub const STREAM_PERIPHERAL_OUTPUT: u128 = 0; // sink 0 = stdout
+pub const EOS_TOKEN_DEFAULT: u128 = 2;
 
 #[derive(Debug, Error)]
 pub enum DecodeError {
@@ -196,6 +209,13 @@ impl Instruction {
             OP_SENSE => "SENSE",
             OP_NORM => "NORM",
             OP_FFN => "FFN",
+            OP_EMBED => "EMBED",
+            OP_ADD => "ADD",
+            OP_SAMPLE => "SAMPLE",
+            OP_COMPARE => "COMPARE",
+            OP_IF_EQUAL => "IF_EQUAL",
+            OP_JUMP => "JUMP",
+            OP_IF_INTERRUPT => "IF_INTERRUPT",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -312,6 +332,44 @@ pub fn instr_nop() -> Instruction {
     Instruction::new(OP_NOP, 0, 0xFF, 0xFF, 0xFF, 0xFF)
 }
 
+pub fn instr_embed(rdest: u8, rtoken: u8, rtable: u8) -> Instruction {
+    Instruction::new(OP_EMBED, 0, rdest, rtoken, rtable, 0xFF)
+}
+
+pub fn instr_add(rdest: u8, rsrc1: u8, rsrc2: u8) -> Instruction {
+    Instruction::new(OP_ADD, 0, rdest, rsrc1, rsrc2, 0xFF)
+}
+
+pub fn instr_sample(rdest: u8, rlogits: u8, temp: f32) -> Instruction {
+    let mut instr = Instruction::new(OP_SAMPLE, 0, rdest, rlogits, 0xFF, 0xFF);
+    instr.payload[0..4].copy_from_slice(&temp.to_le_bytes());
+    instr
+}
+
+pub fn instr_compare(rsrc1: u8, rsrc2: u8, imm: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_COMPARE, 0, 0xFF, rsrc1, rsrc2, 0xFF);
+    instr.set_imm_u128(imm);
+    instr
+}
+
+pub fn instr_if_equal(target_pc: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_IF_EQUAL, 0, 0xFF, 0xFF, 0xFF, 0xFF);
+    instr.set_imm_u128(target_pc);
+    instr
+}
+
+pub fn instr_jump(target_pc: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_JUMP, 0, 0xFF, 0xFF, 0xFF, 0xFF);
+    instr.set_imm_u128(target_pc);
+    instr
+}
+
+pub fn instr_if_interrupt(rcond: u8, target_pc: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_IF_INTERRUPT, 0, 0xFF, rcond, 0xFF, 0xFF);
+    instr.set_imm_u128(target_pc);
+    instr
+}
+
 // ---------------------------------------------------------------------------
 // Assembler textual simples (.m3asm)
 // ---------------------------------------------------------------------------
@@ -335,13 +393,39 @@ pub fn instr_nop() -> Instruction {
 /// NOP
 /// ```
 pub fn assemble(text: &str) -> Result<Vec<Instruction>> {
-    let mut out = Vec::new();
+    assemble_with_base(text, 0x1000)
+}
+
+pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruction>> {
+    let mut labels: HashMap<String, u128> = HashMap::new();
+    let mut instr_lines: Vec<(usize, String)> = Vec::new();
+
+    // Passo 1: Varredura de rótulos e mapeamento de instruções
     for (lineno, raw) in text.lines().enumerate() {
-        let line = strip_comment(raw).trim();
+        let mut line = strip_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
-        let instr = parse_line(line).map_err(|e| anyhow!("linha {}: {} — '{}'", lineno + 1, e, raw))?;
+
+        // Verifica se há rótulo no início da linha (ex: "MAIN_LOOP:" ou "MAIN_LOOP: SENSE ...")
+        if let Some(colon_idx) = line.find(':') {
+            let label_cand = line[..colon_idx].trim();
+            if !label_cand.is_empty() && !label_cand.contains(' ') {
+                let target_pc = program_base + (instr_lines.len() as u128) * (INSTR_SIZE as u128);
+                labels.insert(label_cand.to_uppercase(), target_pc);
+                line = line[colon_idx + 1..].trim();
+            }
+        }
+
+        if !line.is_empty() {
+            instr_lines.push((lineno + 1, line.to_string()));
+        }
+    }
+
+    // Passo 2: Montagem com resolução de rótulos
+    let mut out = Vec::with_capacity(instr_lines.len());
+    for (lineno, line) in instr_lines {
+        let instr = parse_line(&line, &labels).map_err(|e| anyhow!("linha {}: {} — '{}'", lineno, e, line))?;
         out.push(instr);
     }
     Ok(out)
@@ -372,7 +456,7 @@ fn parse_reg(tok: &str) -> Result<u8> {
     Ok(n)
 }
 
-fn parse_line(line: &str) -> Result<Instruction> {
+fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction> {
     // Normaliza vírgulas -> espaços
     let normalized = line.replace(',', " ");
     let parts: Vec<&str> = normalized.split_whitespace().collect();
@@ -448,7 +532,6 @@ fn parse_line(line: &str) -> Result<Instruction> {
             let mut cols = 2u64;
             let mut dtype = 0u8;
             if parts.len() > 4 {
-                // token 4 pode ser "2x2"
                 if parts[4].contains('x') {
                     let mut s = parts[4].split('x');
                     rows = s.next().unwrap().parse().unwrap_or(2);
@@ -458,7 +541,6 @@ fn parse_line(line: &str) -> Result<Instruction> {
             if parts.len() > 5 {
                 dtype = parse_dtype(parts[5]).unwrap_or(0);
             }
-            // Detecta SPARSE nos tokens restantes
             let remaining = if parts.len() > 6 { &parts[6..] } else if parts.len() > 5 && parts[5].to_ascii_uppercase() == "SPARSE" { &parts[5..] } else { &[] as &[&str] };
             let (is_sparse, dens) = detect_sparse(remaining);
             let mut instr = instr_tensor(rdest, rsrc1, rsrc2, rows, cols, dtype);
@@ -473,7 +555,6 @@ fn parse_line(line: &str) -> Result<Instruction> {
             let rq = parse_reg(parts[2])?;
             let rk = parse_reg(parts[3])?;
             let rv = parse_reg(parts[4])?;
-            // Flag opcional NOTIFY_EACH_HEAD
             let notify = if parts.len() > 5 {
                 parts[5..].iter().any(|p| {
                     let up = p.to_ascii_uppercase();
@@ -491,10 +572,12 @@ fn parse_line(line: &str) -> Result<Instruction> {
                 return Err(anyhow!("STREAM precisa de r_src, r_sink"));
             }
             let rsrc = parse_reg(parts[1])?;
-            // Suporta periféricos simbólicos: SAMPLE (2), DECODED (4) além de registradores
+            // Suporta periféricos simbólicos: INPUT (1), SAMPLE (2), DECODED (4), OUTPUT (0)
             let rsink = match parts[2].to_ascii_uppercase().as_str() {
+                "INPUT" | "PERIPHERAL_INPUT" | "1" => 1,
                 "SAMPLE" | "PERIPHERAL_SAMPLE" | "2" => 2,
                 "DECODED" | "OUTPUT_DECODED" | "PERIPHERAL_OUTPUT_DECODED" | "4" => 4,
+                "OUTPUT" | "PERIPHERAL_OUTPUT" | "0" => 0,
                 _ => parse_reg(parts[2])?,
             };
             let blocking = if parts.len() > 3 {
@@ -506,24 +589,43 @@ fn parse_line(line: &str) -> Result<Instruction> {
         }
         "FORK" => {
             if parts.len() < 3 {
-                return Err(anyhow!("FORK precisa de rdest, prioridade (RED/BLUE/GREEN)"));
+                return Err(anyhow!("FORK precisa de rdest, prioridade (RED/BLUE/GREEN) ou rótulo"));
             }
             let rdest = parse_reg(parts[1])?;
-            let prio = match parts[2].to_ascii_uppercase().as_str() {
-                "RED" => FORK_FLAG_RED,
-                "BLUE" => FORK_FLAG_BLUE,
-                "GREEN" => FORK_FLAG_GREEN,
-                "0" => FORK_FLAG_GREEN,
-                "1" => FORK_FLAG_BLUE,
-                "2" => FORK_FLAG_RED,
-                _ => FORK_FLAG_GREEN,
-            };
-            // Flag opcional NOTIFY (quarto token): "FORK r0, RED, NOTIFY"
-            let notify = if parts.len() > 3 {
-                parts[3].to_ascii_uppercase() == "NOTIFY" || parts[3].to_ascii_uppercase() == "NOTIFY_SCHEDULER"
-            } else { false };
-            let flags = if notify { prio | FORK_FLAG_NOTIFY } else { prio };
-            Ok(instr_fork(rdest, flags))
+            let second = parts[2].to_ascii_uppercase();
+
+            // Se segundo argumento é um rótulo conhecido (ex: FORK R12, MAIN_LOOP, GREEN)
+            if let Some(&target_pc) = labels.get(&second) {
+                let prio = if parts.len() > 3 {
+                    match parts[3].to_ascii_uppercase().as_str() {
+                        "RED" | "2" => FORK_FLAG_RED,
+                        "BLUE" | "1" => FORK_FLAG_BLUE,
+                        _ => FORK_FLAG_GREEN,
+                    }
+                } else {
+                    FORK_FLAG_GREEN
+                };
+                let notify = parts.iter().skip(3).any(|p| {
+                    let up = p.to_ascii_uppercase();
+                    up == "NOTIFY" || up == "NOTIFY_SCHEDULER"
+                });
+                let flags = if notify { prio | FORK_FLAG_NOTIFY } else { prio };
+                let mut instr = instr_fork(rdest, flags);
+                instr.set_imm_u128(target_pc);
+                Ok(instr)
+            } else {
+                // Sintaxe clássica: FORK Rd, PRIORITY [, NOTIFY]
+                let prio = match second.as_str() {
+                    "RED" | "2" => FORK_FLAG_RED,
+                    "BLUE" | "1" => FORK_FLAG_BLUE,
+                    _ => FORK_FLAG_GREEN,
+                };
+                let notify = if parts.len() > 3 {
+                    parts[3].to_ascii_uppercase() == "NOTIFY" || parts[3].to_ascii_uppercase() == "NOTIFY_SCHEDULER"
+                } else { false };
+                let flags = if notify { prio | FORK_FLAG_NOTIFY } else { prio };
+                Ok(instr_fork(rdest, flags))
+            }
         }
         "ABORT" => {
             if parts.len() < 3 {
@@ -535,18 +637,20 @@ fn parse_line(line: &str) -> Result<Instruction> {
         }
         "SENSE" => {
             if parts.len() < 3 {
-                return Err(anyhow!("SENSE precisa de rdest, periférico (AUDIO/VAD/TOKEN/0/1/3)"));
+                return Err(anyhow!("SENSE precisa de rdest, periférico (AUDIO/VAD/TOKEN/USER_INPUT/0/1/3/5)"));
             }
             let rdest = parse_reg(parts[1])?;
             let periph = match parts[2].to_ascii_uppercase().as_str() {
                 "AUDIO" | "0" => SENSE_AUDIO,
                 "VAD" | "1" => SENSE_VAD,
                 "TOKEN" | "3" => SENSE_TOKEN,
+                "USER_INPUT" | "PERIPHERAL_USER_INPUT" | "5" => SENSE_USER_INPUT,
                 _ => {
-                    // Tenta parse numérico direto (2->SAMPLE usa STREAM, 3->TOKEN)
                     if let Ok(n) = parts[2].parse::<u8>() {
-                        if n == 3 { SENSE_TOKEN } else { SENSE_AUDIO }
-                    } else { SENSE_AUDIO }
+                        n
+                    } else {
+                        SENSE_AUDIO
+                    }
                 }
             };
             Ok(instr_sense(rdest, periph))
@@ -568,25 +672,105 @@ fn parse_line(line: &str) -> Result<Instruction> {
             let rdest = parse_reg(parts[1])?;
             let rsrc = parse_reg(parts[2])?;
             let rw1 = parse_reg(parts[3])?;
-            // Detecta forma com bias: 6 registradores (rdest + 5 src)
             if parts.len() >= 7 {
-                // FFN r3, r0, r1, r4, r2, r5  => rw1=r1, rb1=r4, rw2=r2, rb2=r5
                 let rb1 = parse_reg(parts[4])?;
                 let rw2 = parse_reg(parts[5])?;
                 let rb2 = parse_reg(parts[6])?;
                 Ok(instr_ffn_with_bias(rdest, rsrc, rw1, rb1, rw2, rb2))
             } else if parts.len() == 6 {
-                // 5 regs: assume último é rw2 sem rb2
                 let rw2 = parse_reg(parts[4])?;
                 let maybe_rb = parse_reg(parts[5])?;
-                // Heurística: se 5 regs, trata como rw2=parts[4], rb1=0xFF, rb2=maybe
-                // Para compatibilidade, tenta mapear: FFN r3,r0,r1,r2,rX => rX como bias2
                 let mut instr = instr_ffn(rdest, rsrc, rw1, rw2);
                 instr.payload[1] = maybe_rb;
                 Ok(instr)
             } else {
                 let rw2 = parse_reg(parts[4])?;
                 Ok(instr_ffn(rdest, rsrc, rw1, rw2))
+            }
+        }
+        "EMBED" => {
+            if parts.len() < 4 {
+                return Err(anyhow!("EMBED precisa de rdest, r_token, r_table — ex: EMBED r10, r11, r1"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rtoken = parse_reg(parts[2])?;
+            let rtable = parse_reg(parts[3])?;
+            Ok(instr_embed(rdest, rtoken, rtable))
+        }
+        "ADD" => {
+            if parts.len() < 4 {
+                return Err(anyhow!("ADD precisa de rdest, r_src1, r_src2 — ex: ADD r10, r10, r14"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rsrc1 = parse_reg(parts[2])?;
+            let rsrc2 = parse_reg(parts[3])?;
+            Ok(instr_add(rdest, rsrc1, rsrc2))
+        }
+        "SAMPLE" => {
+            if parts.len() < 3 {
+                return Err(anyhow!("SAMPLE precisa de rdest, r_logits — ex: SAMPLE r11, r15"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let rlogits = parse_reg(parts[2])?;
+            let mut temp = 1.0f32;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if up.starts_with("TEMP=") {
+                    if let Ok(v) = up["TEMP=".len()..].parse::<f32>() { temp = v; }
+                } else if let Ok(v) = p.parse::<f32>() {
+                    temp = v;
+                }
+            }
+            Ok(instr_sample(rdest, rlogits, temp))
+        }
+        "COMPARE" => {
+            if parts.len() < 3 {
+                return Err(anyhow!("COMPARE precisa de r_src1, r_src2/imediato — ex: COMPARE r11, EOS_TOKEN"));
+            }
+            let rsrc1 = parse_reg(parts[1])?;
+            let second = parts[2].to_ascii_uppercase();
+            if second == "EOS_TOKEN" {
+                Ok(instr_compare(rsrc1, 0xFF, EOS_TOKEN_DEFAULT))
+            } else if let Ok(r2) = parse_reg(parts[2]) {
+                Ok(instr_compare(rsrc1, r2, 0))
+            } else if let Ok(n) = parts[2].parse::<u128>() {
+                Ok(instr_compare(rsrc1, 0xFF, n))
+            } else {
+                Err(anyhow!("COMPARE segundo operando inválido '{}'", parts[2]))
+            }
+        }
+        "IF_EQUAL" => {
+            if parts.len() < 2 {
+                return Err(anyhow!("IF_EQUAL precisa de rótulo alvo — ex: IF_EQUAL PROGRAM_END"));
+            }
+            let label = parts[1].to_ascii_uppercase();
+            let target_pc = *labels.get(&label)
+                .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para IF_EQUAL", label))?;
+            Ok(instr_if_equal(target_pc))
+        }
+        "JUMP" | "JMP" => {
+            if parts.len() < 2 {
+                return Err(anyhow!("JUMP precisa de rótulo alvo — ex: JUMP MAIN_LOOP"));
+            }
+            let label = parts[1].to_ascii_uppercase();
+            let target_pc = *labels.get(&label)
+                .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para JUMP", label))?;
+            Ok(instr_jump(target_pc))
+        }
+        "IF_INTERRUPT" => {
+            if parts.len() == 2 {
+                let label = parts[1].to_ascii_uppercase();
+                let target_pc = *labels.get(&label)
+                    .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para IF_INTERRUPT", label))?;
+                Ok(instr_if_interrupt(0xFF, target_pc))
+            } else if parts.len() >= 3 {
+                let rcond = parse_reg(parts[1])?;
+                let label = parts[2].to_ascii_uppercase();
+                let target_pc = *labels.get(&label)
+                    .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para IF_INTERRUPT", label))?;
+                Ok(instr_if_interrupt(rcond, target_pc))
+            } else {
+                Err(anyhow!("IF_INTERRUPT precisa de rótulo ou rcond, rótulo"))
             }
         }
         "HALT" => Ok(instr_halt()),
@@ -680,5 +864,68 @@ mod tests {
         let bytes = instr.encode();
         let dec = Instruction::decode(&bytes).unwrap();
         assert_eq!(dec.ffn_bias_regs(), (4, 5));
+    }
+
+    #[test]
+    fn test_new_opcodes_encode_decode() {
+        let instr_emb = instr_embed(10, 11, 1);
+        assert_eq!(instr_emb.opcode, OP_EMBED);
+        assert_eq!(instr_emb.rdest, 10);
+        assert_eq!(instr_emb.rsrc1, 11);
+        assert_eq!(instr_emb.rsrc2, 1);
+
+        let instr_a = instr_add(10, 10, 14);
+        assert_eq!(instr_a.opcode, OP_ADD);
+        assert_eq!(instr_a.rdest, 10);
+        assert_eq!(instr_a.rsrc1, 10);
+        assert_eq!(instr_a.rsrc2, 14);
+
+        let instr_s = instr_sample(11, 15, 0.7);
+        assert_eq!(instr_s.opcode, OP_SAMPLE);
+        assert_eq!(instr_s.rdest, 11);
+        assert_eq!(instr_s.rsrc1, 15);
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&instr_s.payload[0..4]);
+        assert_eq!(f32::from_le_bytes(b), 0.7);
+    }
+
+    #[test]
+    fn test_labels_and_control_flow_assemble() {
+        let src = r#"
+            MAIN_LOOP:
+                SENSE r5, USER_INPUT
+                IF_INTERRUPT r5, HANDLE_ABORT
+                EMBED r10, r11, r1
+                ADD r10, r10, r14
+                SAMPLE r11, r15
+                COMPARE r11, EOS_TOKEN
+                IF_EQUAL PROGRAM_END
+                JUMP MAIN_LOOP
+
+            HANDLE_ABORT:
+                ABORT r12, r0
+                HALT
+
+            PROGRAM_END:
+                HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        assert_eq!(prog[0].opcode, OP_SENSE);
+        assert_eq!(prog[1].opcode, OP_IF_INTERRUPT);
+        assert_eq!(prog[2].opcode, OP_EMBED);
+        assert_eq!(prog[3].opcode, OP_ADD);
+        assert_eq!(prog[4].opcode, OP_SAMPLE);
+        assert_eq!(prog[5].opcode, OP_COMPARE);
+        assert_eq!(prog[6].opcode, OP_IF_EQUAL);
+        assert_eq!(prog[7].opcode, OP_JUMP);
+
+        // JUMP MAIN_LOOP aponta para a primeira instrução (PC = 0x1000)
+        assert_eq!(prog[7].imm_u128(), 0x1000);
+
+        // HANDLE_ABORT está no índice 8 (PC = 0x1000 + 8 * 32 = 0x1100)
+        assert_eq!(prog[1].imm_u128(), 0x1000 + 8 * 32);
+
+        // PROGRAM_END está no índice 10 (PC = 0x1000 + 10 * 32 = 0x1140)
+        assert_eq!(prog[6].imm_u128(), 0x1000 + 10 * 32);
     }
 }

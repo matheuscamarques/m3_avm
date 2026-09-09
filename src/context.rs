@@ -90,6 +90,10 @@ pub struct Context {
     pub state: ContextState,
     /// Timestamp de criação (para TEMPORAL indexing / debug)
     pub created_at_ns: u64,
+    /// Flag de igualdade para controle de fluxo (COMPARE / IF_EQUAL)
+    pub cmp_equal: bool,
+    /// Flag de interrupção específica do contexto
+    pub interrupt_flag: bool,
 }
 
 impl Context {
@@ -102,6 +106,8 @@ impl Context {
             priority,
             state: ContextState::Ready,
             created_at_ns: crate::utils::now_ns(),
+            cmp_equal: false,
+            interrupt_flag: false,
         }
     }
 
