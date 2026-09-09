@@ -717,23 +717,27 @@ impl Vm {
             self.memory.alloc_sparse_tensor(&shape, final_dtype, dens)?
         } else {
             let addr = self.memory.alloc_tensor(&shape, final_dtype)?;
-            match final_dtype {
-                DType::F32 => {
-                    let init_data: Vec<f32> = (0..elems).map(|i| (i as f32 + 1.0) * 0.5).collect();
-                    self.memory.write_f32_tensor(addr, &init_data)?;
-                }
-                DType::F16 => {
-                    // F16: escreve como bytes (2 por elem) — mock com f32 truncado
-                    let init_bytes: Vec<u8> = (0..elems*2).map(|i| (i % 256) as u8).collect();
-                    self.memory.write(addr, &init_bytes)?;
-                }
-                DType::U8 | DType::I8 => {
-                    let init_bytes: Vec<u8> = (0..elems).map(|i| (i % 256) as u8).collect();
-                    self.memory.write(addr, &init_bytes)?;
-                }
-                _ => {
-                    if final_dtype.is_quantized() {
-                        // Quantizado: não inicializa, virá do GGUF se shape bater
+            // Se foi mapeado para PERSISTENTE (GGUF zero-copy), não inicializa — dados já estão no mmap
+            let is_persist = crate::memory::region_of(addr) == crate::memory::Region::Persistent;
+            if !is_persist {
+                match final_dtype {
+                    DType::F32 => {
+                        let init_data: Vec<f32> = (0..elems).map(|i| (i as f32 + 1.0) * 0.5).collect();
+                        self.memory.write_f32_tensor(addr, &init_data)?;
+                    }
+                    DType::F16 => {
+                        // F16: escreve como bytes (2 por elem) — mock com f32 truncado
+                        let init_bytes: Vec<u8> = (0..elems*2).map(|i| (i % 256) as u8).collect();
+                        self.memory.write(addr, &init_bytes)?;
+                    }
+                    DType::U8 | DType::I8 => {
+                        let init_bytes: Vec<u8> = (0..elems).map(|i| (i % 256) as u8).collect();
+                        self.memory.write(addr, &init_bytes)?;
+                    }
+                    _ => {
+                        if final_dtype.is_quantized() {
+                            // Quantizado: não inicializa, virá do GGUF se shape bater
+                        }
                     }
                 }
             }

@@ -29,6 +29,7 @@ pub mod tui;
 pub mod utils;
 pub mod vm;
 pub mod memory_wgpu;
+pub mod asm_emitter;
 
 use opcodes::{assemble, Instruction, INSTR_SIZE, OP_HALT, OP_NOP};
 use vm::{Vm, VmConfig};
@@ -66,6 +67,9 @@ enum Commands {
         /// Modo real inference: usa pesos f32/Q4_K do GGUF para gerar texto real (lento, CPU)
         #[arg(long)]
         real: bool,
+        /// Gera assembly M³ desenrolado a partir do modelo GGUF e escreve em <FILE> (não executa)
+        #[arg(long, value_name = "FILE")]
+        emit_asm: Option<PathBuf>,
     },
     /// Monta .m3asm -> .m3bin
     Assemble {
@@ -92,7 +96,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { file, max_steps, trace, model, interactive, persistent_mib, real } => run_file(file, max_steps, trace, model, interactive, persistent_mib, real).await?,
+        Commands::Run { file, max_steps, trace, model, interactive, persistent_mib, real, emit_asm } => run_file(file, max_steps, trace, model, interactive, persistent_mib, real, emit_asm).await?,
         Commands::Assemble { input, output } => assemble_file(input, output)?,
         Commands::Disassemble { file } => disassemble_file(file)?,
         Commands::Bench { nops } => bench(nops).await?,
@@ -101,7 +105,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_file(path: PathBuf, max_steps: u64, trace: bool, model: Option<PathBuf>, interactive: bool, persistent_mib: usize, real: bool) -> Result<()> {
+async fn run_file(path: PathBuf, max_steps: u64, trace: bool, model: Option<PathBuf>, interactive: bool, persistent_mib: usize, real: bool, emit_asm: Option<PathBuf>) -> Result<()> {
+    // --emit-asm: caminho separado — gera assembly desenrolado e sai, sem tocar VM/interpreter
+    if let Some(emit_path) = emit_asm {
+        let model_path = model.as_ref().ok_or_else(|| anyhow!("--emit-asm precisa de --model <GGUF>"))?;
+        let model_str = model_path.to_str().ok_or_else(|| anyhow!("model path inválido"))?;
+        let inf = crate::inference::RealInference::new(model_str)?;
+        let emitter = crate::asm_emitter::AsmEmitter::new(&inf.config);
+        let text = emitter.emit_to_string();
+        if let Some(parent) = emit_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(&emit_path, &text)?;
+        println!(";; --emit-asm: {} instruções estimadas -> {} ({} bytes)", emitter.estimate_instr_count(), emit_path.display(), text.len());
+        println!(";; Modelo: {} arch={} hidden={} layers={} vocab={}", model_path.display(), inf.config.arch, inf.config.hidden, inf.config.n_layers, inf.config.vocab);
+        println!(";; Execute: cargo run -- run {} --model {} {}", emit_path.display(), model_path.display(), if interactive { "--interactive" } else { "" });
+        // valida que assembly monta
+        let prog = assemble(&text)?;
+        println!(";; Validado: {} instruções montáveis", prog.len());
+        return Ok(());
+    }
     if !path.exists() {
         return Err(anyhow!("arquivo não encontrado: {}", path.display()));
     }

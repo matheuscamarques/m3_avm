@@ -19,6 +19,7 @@ pub mod matvec_quant;
 pub mod tui;
 pub mod utils;
 pub mod vm;
+pub mod asm_emitter;
 
 // Módulo de QA — testes de física abstrata (Nível 1-4)
 #[cfg(test)]
