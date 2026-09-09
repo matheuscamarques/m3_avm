@@ -12,9 +12,10 @@ The M³-AVM is a software emulator in Rust (`src/lib.rs:1`, `src/vm.rs:1`) explo
 
 1. A fixed 15-opcode ISA: `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
 2. A scheduler with strict priority `Red > Blue > Green` (`src/context.rs:15`, `src/context.rs:167`) and an optional event-driven reactor (`src/reactor.rs:1`, `src/bus.rs:20`) using `tokio::sync::watch`/`broadcast`.
-3. Dense tensors via `ndarray` and sparse CSR via `nalgebra-sparse 0.10` + `sprs 0.11` (`Cargo.toml:22`, `src/sparse.rs:1`).
+3. Dense tensors via `ndarray` + `faer` SIMD and sparse CSR via `nalgebra-sparse 0.10` + `sprs 0.11` (`Cargo.toml:22`, `src/sparse.rs:1`), plus quantized dequant `Q4_0/Q4_K/Q6_K/Q8_0` `src/quant.rs:1` and fused `matvec_q4k` `AVX2` `src/matvec_quant.rs:1`.
+4. Real inference from GGUF (`src/inference.rs:1`, `src/gguf.rs:1`) with `mmap` zero-copy in `PERSISTENTE 0x20` (`src/memory.rs:15`), `KV_CACHE 0x30` per-layer (`src/memory.rs:27`) and `AsmEmitter` (`src/asm_emitter.rs:1`) that lowers a model to `.m3asm` desenrolado.
 
-**Caveats (verified):** This runs on x86/ARM hosts. It does not bypass the Von Neumann bottleneck and does not run on optical hardware. It is a functional reference, not a production inference engine.
+**Caveats (verified):** This runs on x86/ARM hosts. It does not bypass the Von Neumann bottleneck and does not run on optical hardware. It is a functional reference, not a production inference engine. Vega 8 `wgpu` (`src/memory_wgpu.rs:1`) only accelerates `ATTN <=64x64`; the hot path is still `matvec` on CPU.
 
 ## 1. Problem Space
 
@@ -25,16 +26,17 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 ### Address Space (u128 virtual) `src/memory.rs:21`
 - `GLOBAL (0x00…)` — `global_heap: HashMap<u128, Arc<Vec<u8>>>` + `sparse_heap: HashMap<u128, SparseTensor>` `src/memory.rs:122` (dense aligned to 64B `src/memory.rs:221`, sparse CSR).
 - `TEMPORAL (0x10…)` — circular buffer 1 GiB logical / 64 MiB physical in dev (`src/memory.rs:27`, `src/memory.rs:31`).
-- `PERSISTENTE (0x20…)` — `memmap2::MmapMut` `src/memory.rs:15`, survives restarts (`src/memory.rs:157`). File `m3_persistent.dat`.
+- `PERSISTENTE (0x20…)` — `memmap2::MmapMut` `src/memory.rs:15`, survives restarts (`src/memory.rs:157`). File `m3_persistent.dat`. GGUF weights are `mmap`ed read-only (`model_mmap: Arc<Mmap>`) with `madvise WillNeed` and exposed via `get_tensor_f32_slice` zero-copy (`src/memory.rs:506`).
+- `KV_CACHE (0x30…)` — 22+ layers, `seq_len*hidden` per layer, 1 GiB logical / 64 MiB physical (`src/memory.rs:43`, `src/memory.rs:380`) with `snapshot`/`restore` for rollback.
 
 | Tensor | Internal | Memory cost (actual) |
 | :--- | :--- | :--- |
 | Dense | `Vec<u8>` + `TensorMeta` `src/memory.rs:103` | `rows*cols*4` |
 | Sparse | `CsrMatrix<f32>` `src/sparse.rs:30` | `(nnz*4)+(rows+1)*4+nnz*4` |
+| Quant | `Q4_K 144B/256` `src/quant.rs:38` | `(n/256)*144` |
 
 ### Context `src/context.rs:84`
 - 16 regs `u128`, `pc: u128`, `root_version: u64`, `priority: Priority`, `state: ContextState`, plus `cmp_equal: bool` (COMPARE/IF_EQUAL) and `interrupt_flag: bool` (SENSE USER_INPUT / IF_INTERRUPT).
-- No `tensor_type` or `chunk_size` field in code — chunking is done inside `attn_sparse` per row (`src/sparse.rs:183`).
 
 ### NOP Buses `src/bus.rs:32`
 - `interrupt_tx: watch::Sender<Option<InterruptSignal>>` — `SENSE`/`ABORT` → `ATTN` heads.
@@ -42,79 +44,90 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 - `sched_tx: broadcast::Sender<SchedSignal>` — `FORK` → scheduler (`recv().await` in `src/reactor.rs:45`).
 - Emulated latency is `watch`/`broadcast` (≈µs in tests `src/bus.rs:130`), not <10ns silicon.
 
+### Real Inference `src/inference.rs:1`
+- `ModelConfig::from_gguf` parses `hidden/intermediate/n_layers/n_heads/n_kv_heads/vocab/arch` from GGUF KV (Qwen2/Llama/Mistral).
+- `RealInference` holds `weight_cache: FxHashMap<String, Arc<Vec<f32>>>` (`src/inference.rs:180`) and `LayerNames` pre-resolved indices (`src/inference.rs:155`) — avoids `format!`+`HashMap` per `matvec` (154 lookups/token).
+- `matvec_weight_pre` (`src/inference.rs:370`) tries `read_model_raw` zero-copy + `matvec_quant::matvec_q4k` `AVX2` fused (`src/matvec_quant.rs:249`) before falling back to `faer` (`src/matvec.rs:37`). `embedding_row` row-slice avoids materializing `934MB`.
+- `forward_one` loop `src/inference.rs:527` does `RMSNorm → Q/K/V matvec → RoPE → KV append → per-head softmax → O proj → residual → FFN gate/up/down` for `22-28` layers, with `M3_PROFILE=1` breakdown.
+- `AsmEmitter` (`src/asm_emitter.rs:1`) lowers the same `ModelConfig` to desenrolado `.m3asm` (`TENSOR r0 1 hidden` + `NORM/ATTN/FFN/ADD` per layer + `SENSE/IF_INTERRUPT`).
+
+### Vega 8 (optional) `src/memory_wgpu.rs:1`
+- `wgpu 0.19` `RADV RAVEN 8 CUs @1200MHz 1.1 TFLOPS` via `Vulkan`. `WgpuMemoryManager` mirrors `MemoryManager` with `STORAGE` buffers + `cpu_fallback` shadow. `attn_wgpu` `src/memory_wgpu.rs:185` does `QKT/softmax/SM*V` in 3 dispatches, `<=64x64`. For LLM `2048` the hot path stays on CPU — GPU gain `<5%` today, `~1.5x` est. with resident `GEMV.wgsl`.
+
 ## 3. ISA — As Implemented
 
 | Opcode | Hex | Syntax (assembler `src/opcodes.rs:332`) | Behavior in emulator |
 | :--- | :--- | :--- | :--- |
-| `0x01` | **TENSOR** | `TENSOR Rd 32 32 f32` or `TENSOR Rd 32 32 f32 SPARSE DENSITY=0.05` | Dense: `alloc_tensor` `src/memory.rs:238`; Sparse: `alloc_sparse_tensor` `src/memory.rs:258` with `SparseTensor::random` `src/sparse.rs:54` (not `CsrMatrix::zero`). Payload `[17]=is_sparse` `src/opcodes.rs:168`. |
-| `0x02` | **ATTN** | `ATTN Rd, Q, K, V` or `ATTN Rd, Q, K, V NOTIFY_EACH_HEAD` | Sparse-aware dispatcher `src/vm.rs:418`: if any sparse → `sparse::attn_sparse` `src/sparse.rs:146` (`Q*K^T` scaled, softmax per row, `*V`, notifies `AttentionEvent::HeadCompleted` per row `src/sparse.rs:183`); else dense `ndarray` `src/vm.rs:454`. Flag `ATTN_FLAG_NOTIFY_EACH_HEAD=0b01` `src/opcodes.rs:42`. |
-| `0x03` | **STREAM** | `STREAM Rsrc, Rsink, [BLOCKING/DROP]` | `tokio::sync::mpsc` bounded 16 stub `src/vm.rs:82`; blocking uses `try_send` + warn, reactor uses `StreamSignal` `src/reactor.rs:273`. |
-| `0x04` | **FORK** | `FORK Rd, RED` or `FORK Rd, RED, NOTIFY` or `FORK Rd, LABEL, GREEN` | CoW via `Arc::clone` `src/memory.rs:475` and `sparse_snapshots` `src/memory.rs:149`; `FORK_FLAG_NOTIFY=0b100` `src/opcodes.rs:44` publishes `SchedSignal` `src/reactor.rs:313`. Label form (2-pass assembler) starts the child at the label PC. |
-| `0x05` | **ABORT** | `ABORT Rs_ctx, Rs_ts` | Removes context `src/vm.rs:601`, restores snapshot `src/memory.rs:489` (`watch` publish `InterruptSignal` in reactor `src/reactor.rs:318`). |
-| `0x06` | **SENSE** | `SENSE Rd, AUDIO/VAD/TOKEN/USER_INPUT` | Generates white noise `rand::thread_rng` `src/vm.rs:621` or `0/1`, pushes to `TEMPORAL` `src/memory.rs:430`. `USER_INPUT` (non-blocking) pops the host queue (`Vm::push_input`): writes `1/0` + sets `interrupt_flag` — pairs with `IF_INTERRUPT`. |
-| `0x07` | **NORM** | `NORM Rd, Rsrc, Rgamma, Rbeta` | RMSNorm over last axis (`x/sqrt(mean(x²)+eps)*gamma+beta`). |
-| `0x08` | **FFN** | `FFN Rd, Rsrc, Rw1, Rw2[, Rb1, Rb2]` | SwiGLU feed-forward (`silu(x·W1+b1)*up`, `·W2+b2`). |
-| `0x09` | **EMBED** | `EMBED Rd, Rtoken, Rtable` | Embedding lookup: row `token_id % rows` of dense 2D table → new `[1, hidden]` tensor. |
-| `0x0A` | **ADD** | `ADD Rd, R1, R2` | Elementwise `f32` add, shapes must match. |
-| `0x0B` | **SAMPLE** | `SAMPLE Rd, Rlogits [TEMP=x]` | Softmax + weighted sampling (temp from payload, default 1.0); writes token id to `Rd` and `last_sample`. |
-| `0x0C` | **COMPARE** | `COMPARE R1, R2` or `COMPARE R1, imm` or `COMPARE R1, EOS_TOKEN` | Sets `cmp_equal = (v1 == v2)`. |
-| `0x0D` | **IF_EQUAL** | `IF_EQUAL LABEL` | Jumps to label PC if `cmp_equal`, else falls through. |
-| `0x0E` | **JUMP** | `JUMP LABEL` | Unconditional jump (target validated against program bounds). |
-| `0x0F` | **IF_INTERRUPT** | `IF_INTERRUPT LABEL` or `IF_INTERRUPT Rcond, LABEL` | With reg: jumps if `reg != 0`. Without: jumps if `interrupt_flag` (consumed on jump). |
+| `0x01` | **TENSOR** | `TENSOR Rd 32 32 f32` or `TENSOR Rd 32 32 f32 SPARSE DENSITY=0.05` | Dense: `alloc_tensor` `src/memory.rs:238`; Sparse: `alloc_sparse_tensor` `src/memory.rs:258` with `SparseTensor::random` `src/sparse.rs:54`. GGUF-shaped `F32 2048x5632` is auto-mapped to `PERSISTENTE` `Q4_K` via `try_gguf_tensor` (`src/memory.rs:380`), `vm.rs:718` skips init for `PERSISTENTE`. Payload `[17]=is_sparse` `src/opcodes.rs:168`. |
+| `0x02` | **ATTN** | `ATTN Rd, Q, K, V` or `ATTN Rd, Q, K, V NOTIFY_EACH_HEAD` | Sparse-aware dispatcher `src/vm.rs:418`: if any sparse → `sparse::attn_sparse` `src/sparse.rs:146`; else dense `ndarray` `src/vm.rs:906` or `attn_wgpu` if `<=64` and `feature=wgpu` `src/vm.rs:875`. Flag `0b01` `src/opcodes.rs:42`. |
+| `0x03` | **STREAM** | `STREAM Rsrc, Rsink, [BLOCKING/DROP]` or `STREAM Rsrc, SAMPLE/DECODED` | `tokio::sync::mpsc` bounded 16 stub `src/vm.rs:82`; `SAMPLE` (`2`) does `softmax+sampling` → `last_sample`, `DECODED` (`4`) decodes via `M3Tokenizer`. |
+| `0x04` | **FORK** | `FORK Rd, RED` or `FORK Rd, RED, NOTIFY` or `FORK Rd, LABEL, GREEN` | CoW via `Arc::clone` `src/memory.rs:475` and `sparse_snapshots` `src/memory.rs:149`; `NOTIFY=0b100` `src/opcodes.rs:44` publishes `SchedSignal`. Label form starts child at label PC (2-pass). |
+| `0x05` | **ABORT** | `ABORT Rs_ctx, Rs_ts` | Removes context `src/vm.rs:1350`, restores snapshot `src/memory.rs:489`. |
+| `0x06` | **SENSE** | `SENSE Rd, AUDIO/VAD/TOKEN/USER_INPUT` | White noise `rand` `src/vm.rs:621` or `0/1`, pushes to `TEMPORAL`. `USER_INPUT` pops host queue `Vm::push_input`: writes `1/0` + `interrupt_flag` `src/vm.rs:1605` — pairs with `IF_INTERRUPT`. |
+| `0x07` | **NORM** | `NORM Rd, Rsrc, Rgamma, Rbeta` | RMSNorm `x/sqrt(mean(x²)+eps)*gamma+beta` `src/vm.rs:1380`. |
+| `0x08` | **FFN** | `FFN Rd, Rsrc, Rw1, Rw2[, Rb1, Rb2]` | SwiGLU `silu(x·W1+b1)*up ·W2+b2` `src/vm.rs:1476`. |
+| `0x09` | **EMBED** | `EMBED Rd, Rtoken, Rtable` | Row `token_id % rows` of `[vocab, hidden]` → `[1, hidden]` `src/vm.rs:1172`. |
+| `0x0A` | **ADD** | `ADD Rd, R1, R2` | Elementwise `f32` add `src/vm.rs:1250`. |
+| `0x0B` | **SAMPLE** | `SAMPLE Rd, Rlogits [TEMP=x]` | Softmax + weighted sampling `src/vm.rs:1270`; writes `Rd` and `last_sample`. |
+| `0x0C` | **COMPARE** | `COMPARE R1, R2` or `COMPARE R1, imm/EOS_TOKEN` | Sets `cmp_equal` `src/vm.rs:1300`. |
+| `0x0D` | **IF_EQUAL** | `IF_EQUAL LABEL` | Jumps if `cmp_equal` `src/vm.rs:1330`. |
+| `0x0E` | **JUMP** | `JUMP LABEL` | Unconditional `src/vm.rs:1315`, target validated. |
+| `0x0F` | **IF_INTERRUPT** | `IF_INTERRUPT LABEL` or `IF_INTERRUPT Rcond, LABEL` | With reg `reg!=0`, without `interrupt_flag` (consumed) `src/vm.rs:1335`. |
 
 All instructions are 32 bytes `src/opcodes.rs:82`.
 
 ## 4. Implementation Status — Verified Gaps
 
-- Sparse is CSR via `nalgebra-sparse`; no native `f16/i8` — cast to `f32` internally.
-- No sparse FlashAttention; `attn_sparse` densifies for softmax `src/sparse.rs:190` (`to_dense` `src/sparse.rs:73`), losing memory savings for large heads.
+- Sparse is CSR; no `f16/i8` native — cast to `f32`.
+- No sparse FlashAttention; `attn_sparse` densifies for softmax `src/sparse.rs:190` (`to_dense` `src/sparse.rs:73`).
 - No BSR backend.
-- No `block_size` param for `ATTN` — granularity is per row, not configurable block.
-- `ndarray` dense path only `f32`.
 - `watch`/`broadcast` are Tokio channels, not hardware crossbar.
+- `wgpu` only for `ATTN <=64`; `GEMV` hot path is CPU `faer`/`matvec_quant` — unified `DDR4 19GB/s` limits Vega 8 to `~1.5x` est.
 
-Tests that pass on this host: `cargo test --lib` 124 tests (ISA, sparse, bus, reactor, inference, TUI, VM control-flow).
+Tests that pass on this host: `cargo test --lib` 124 tests (ISA, sparse, bus, reactor, inference, asm_emitter, TUI, VM).
 
 ## 5. Benchmarking — Measured (not claimed)
-
-All measurements on this host are for small matrices; large 2048x2048 numbers in the draft were hypothetical and are not included.
 
 | Scenario (measured) | Matrix | Operation | Time (debug) | Note |
 | :--- | :--- | :--- | :--- | :--- |
 | `ATTN` dense | 32x32 | `attn_sparse` 1.0 density | ~5 ms iter `cargo bench sparse_nop` | |
-| `ATTN` sparse | 32x32 5% | `attn_sparse` + `NOTIFY_EACH_HEAD` | ~5 ms + overhead <3x per head `src/qa.rs:860` | overhead measured with `watch` |
-| Program `sparse_nop.m3asm` | 6 tensors 32x32 | 2x ATTN + 2x STREAM | 45 ms debug `cargo run --bin m3_avm -- run examples/sparse_nop.m3asm` | dense 4x4 part ~similar |
+| `ATTN` sparse | 32x32 5% | `attn_sparse` + `NOTIFY_EACH_HEAD` | ~5 ms + overhead <3x `src/qa.rs:860` | |
+| Program `sparse_nop.m3asm` | 6 tensors 32x32 | 2x ATTN + 2x STREAM | 45 ms debug `cargo run --bin m3_avm -- run examples/sparse_nop.m3asm` | |
 | Scheduler IPS | NOP loop | 100k `NOP` | 240k IPS debug, 2.1M IPS release (`cargo run --release -- bench --nops 1000000`) | target 1M met in release |
 | FORK CoW | 100x1MiB | `snapshot` | <1 ms `src/qa.rs:270` | `Arc` clone |
-| ABORT | 1 sparse ATTN 32x32 under load | `ABORT` | 25 ms measured `src/qa.rs:664` (not 50µs; 50µs is hypothetical HW) | watch publish <1ms `src/bus.rs:130` |
-| Memory saving | 64x64 5% | CSR vs dense | sparse ~10x smaller `src/qa.rs:900` (`nnz*4+...` < `rows*cols*4`) | verified |
+| ABORT | 1 sparse ATTN 32x32 under load | `ABORT` | 25 ms measured `src/qa.rs:664` (hypothetical 50µs is HW) | publish <1ms `src/bus.rs:130` |
+| Memory saving | 64x64 5% | CSR vs dense | sparse ~10x smaller `src/qa.rs:900` | |
+| DeepSeek 1.5B `Q4_K` | 1536 hidden 28 layers | `forward_one` `M3_PROFILE=1` `matvec_q4k AVX2` | ~1.2s/token `0.8 tok/s` `3500U` (layersTOTAL) | `wgpu` today `0%` gain |
+| TinyLlama 1.1B `Q4_K` | 2048 hidden 22 layers | same | ~0.33s/token `3 tok/s` | `RUSTFLAGS="-C target-cpu=znver1"` `+10%` |
 
 ## 6. Research Gaps
 
 1. No autograd for sparse Jacobians.
 2. No BSR / FlashAttention-3 sparse.
-3. `std::time::Instant` used for timestamps `src/utils.rs:9`, not synchronized across epochs.
+3. `std::time::Instant` used for timestamps `src/utils.rs:9`, not synchronized.
 4. No rate-limiting; `SENSE` flood could thrash reactor.
+5. No resident `GEMV.wgsl` for `Q4_K` — needed for Vega 8 `1.5x`.
 
 ## 7. Comparison — Honest
 
 | Aspect | CUDA/PyTorch | M³-AVM (this emulator) |
 | :--- | :--- | :--- |
-| Preemption | Kernel ~500 ms (reported) | Block-level via `watch` — measured ~25 ms for 32x32 sparse ATTN under load; publish <1ms |
+| Preemption | Kernel ~500 ms | Block-level via `watch` — `~25 ms` for 32x32; publish `<1ms` |
 | Sparse | cuSPARSE opaque | First-class CSR `src/sparse.rs`, not accelerated |
 | I/O | ALSA/syscalls | `TEMPORAL` `mmap` + `rand` stub |
-| Rollback | Disk checkpoint | CoW snapshot `src/memory.rs:475` — clones `Arc`+`HashMap` in µs for small heaps |
+| Rollback | Disk checkpoint | CoW snapshot `src/memory.rs:475` — `Arc`+`HashMap` µs for small heaps |
 | Scheduler | FIFO | strict `Red>Blue>Green` `src/context.rs:194` |
+| Throughput | cuBLAS 300+ tok/s | `faer` `3 tok/s` TinyLlama `3500U` — functional, `BW-bound` |
 
 This is a testbed, not a replacement.
 
 ## 8. Integration with JusrisOS
 
-Current state: *Proposed, not integrated.* The emulator is standalone (`src/main.rs`). Integration via `persistent_term` dispatcher and `Rustler` NIF was reverted to focus on VM (`docs/PLANO_NOP.md`). A future adapter would be `lib/jusris_os_core/adapters/llm_m3.ex` via `Port` or `mmap`, but no NIF exists in this repo today (`native/` is Tauri shell, not Rustler).
+Current state: *Proposed, not integrated.* The emulator is standalone (`src/main.rs`). Integration via `persistent_term` was reverted (`docs/PLANO_NOP.md`). A future adapter would be `lib/jusris_os_core/adapters/llm_m3.ex` via `Port` or `mmap`, but no NIF exists in this repo today.
 
 ## 8.1 Model Selection — Measured on Ryzen 3500U
 
-Empirical: `ggml-tiny-q8_0.bin` 42MB (RTF 0.56 for 5s `mic.wav`, `encode 1847ms`) is 44% faster than `q5_1` 31MB (RTF 1.00, `encode 3043ms`) and stable in silence (5s silêncio 2441ms vs 6612ms, 10s 2334ms vs 24007ms). Both fit in `PERSISTENTE` 64MiB `src/memory.rs:32`; `FP32` 75MB does not. Default is now `MODEL_DEFAULT="ggml-tiny-q8_0.bin"` `src/stt.rs:20`.
+`ggml-tiny-q8_0.bin` 42MB (RTF 0.56 for 5s `mic.wav`, `encode 1847ms`) is 44% faster than `q5_1` 31MB (RTF 1.00) and stable in silence. Both fit in `PERSISTENTE` 64MiB `src/memory.rs:32`; `FP32` 75MB does not. Default `MODEL_DEFAULT="ggml-tiny-q8_0.bin"` `src/stt.rs:20`. For LLM, `TinyLlama 1.1B Q4_K 638MB` `DeepSeek 1.5B Q4_K 1.1GB` need `persistent_mib 64-2048` and `mmap` lazy.
 
 ## 9. Getting Started — Commands That Actually Work
 
@@ -126,14 +139,27 @@ cargo build
 cargo run --bin m3_avm -- run examples/minimal.m3asm        # dense 2x2
 cargo run --bin m3_avm -- run examples/sparse_nop.m3asm     # sparse 32x32 5% + NOTIFY_EACH_HEAD
 cargo run --bin m3_avm -- run examples/nop_demo.m3asm
-cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm  # EMBED/ADD/SAMPLE + labels/jumps (both modes)
+cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm  # EMBED/ADD/SAMPLE + jumps
+
+# Assembly roundtrip
 cargo run --bin m3_avm -- assemble examples/minimal.m3asm -o /tmp/minimal.m3bin
 cargo run --bin m3_avm -- disassemble /tmp/minimal.m3bin
+
+# Real inference (GGUF mmap + KV_CACHE 0x30, interactive thèse)
+cargo run --bin m3_avm -- run programs/thinking_sample.m3asm --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --real --interactive
+M3_PROFILE=1 cargo run --bin m3_avm --release -- run --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --real --max-steps 3  # ~1.2s/token
+cargo run --bin m3_avm -- run --model models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf --emit-asm /tmp/gen.m3asm examples/minimal.m3asm
+cargo run --bin m3_avm -- run /tmp/gen.m3asm --max-steps 50  # 238 instr desenroladas, SENSE/IF_INTERRUPT per layer
+
+# Vega 8 (optional, unified)
+cargo run --bin m3_avm --features wgpu -- run --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --real --interactive  # [wgpu] RADV RAVEN
+M3_PROFILE=1 cargo run --bin m3_avm --features wgpu --release -- run --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --real --max-steps 3
+
+# Tests & benches
 cargo test --lib                               # 124 tests
 cargo test --lib sparse_nop -- --nocapture
-cargo test --lib bus -- --nocapture
-cargo test --lib reactor -- --nocapture
-cargo bench --bench physics_bench -- --quick    # includes sparse_nop group
+cargo test --lib asm_emitter -- --nocapture
+cargo bench --bench physics_bench -- --quick
 ```
 
 What does *not* exist: `cargo run --bin m3_tui` (no TUI), `cargo test test_sparse_attention` (actual names are `sparse::*` and `qa::sparse_nop::*`).
@@ -146,7 +172,7 @@ ATTN r3 r0 r1 r2 NOTIFY_EACH_HEAD
 STREAM r3 r15 BLOCKING
 ```
 
-Thinking loop with the new opcodes (`programs/control_flow_demo.m3asm:1`, runs to `HALT` in both `run` and `--interactive` modes):
+Thinking loop (`programs/thinking_sample.m3asm:1`, `HALT` in both `run` and `--interactive`):
 ```asm
     TENSOR r0 2 2 f32
     ADD r2, r0, r1
@@ -163,12 +189,39 @@ DONE:
     HALT
 ```
 
+Emitted program (`--emit-asm` `src/asm_emitter.rs:1`):
+```asm
+; arch=llama hidden=2048 layers=22
+TENSOR r0 1 2048 f32
+TENSOR r9 2048 64 f32
+MAIN_LOOP:
+    SENSE r11, TOKEN
+    FORK r12, GREEN, NOTIFY
+    NORM r1, r0, r0, r0
+    ATTN r5, r1, r1, r1
+    ADD r0, r0, r5
+    FFN r8, r1, r9, r10
+    ADD r0, r0, r8
+    SAMPLE r11, r0
+    STREAM r11, 4 BLOCKING
+    COMPARE r11, 2
+    IF_EQUAL PROGRAM_END
+    JUMP MAIN_LOOP
+HANDLE_ABORT:
+    JUMP MAIN_LOOP
+PROGRAM_END:
+    HALT
+```
+
 ## 10. Immediate Roadmap
 
-- BSR backend for block-sparse attention.
-- Keep softmax dense densification or implement sparse softmax.
-- Validate 1024+ dimensions (currently tested up to 64 for speed).
-- Re-introduce JusrisOS adapter when `TARGET` is defined.
+- [x] `EMBED/ADD/SAMPLE` + `COMPARE/JUMP/IF_*` + 2-pass labels.
+- [x] Real inference `Q4_K` `AVX2` + `KV_CACHE 0x30` + `AsmEmitter --emit-asm`.
+- [x] `FxHash` + `LayerNames` pre-resolve (P0, ~20% `matvec`).
+- [ ] Resident `GEMV.wgsl` `Q4_K` for Vega 8 (est. `1.5x`, `BW-bound`).
+- [ ] BSR backend for block-sparse attention.
+- [ ] Validate 1024+ dims (tested up to 64 for sparse, 2048 for dense).
+- [ ] Re-introduce JusrisOS adapter when `TARGET` defined.
 
 ## License
 
