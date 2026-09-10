@@ -1,4 +1,4 @@
-# M³-AVM: A Sparse Event-Driven Tensor Virtual Machine with Deterministic Rollback for Interactive AI (draft for arXiv cs.DC)
+#  (draft for arXiv cs.DC)
 
 **Author:** Matheus de Camargo Marques — ORCID https://orcid.org/0009-0003-4518-2258 — matheuscamarques@gmail.com — Independent Researcher
 **Code:** https://github.com/matheuscamarques/m3_avm — License: AGPL-3.0-or-later — **Status:** research prototype, not production.
