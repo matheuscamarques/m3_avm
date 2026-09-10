@@ -1,9 +1,14 @@
 # M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation
 
-> **Author: Matheus de Camargo Marques** — Máquina Abstrata de Matheus de Camargo Marques · https://github.com/matheuscamarques/m3_avm · If you use this work, please cite it (see [CITATION.cff](CITATION.cff) / [How to cite](#license--citation)).
+> **Author: Matheus de Camargo Marques** — Independent Researcher · Máquina Abstrata de Matheus de Camargo Marques \
+> ORCID: [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258) · Email: <matheuscamarques@gmail.com> · GitHub: [@matheuscamarques](https://github.com/matheuscamarques) \
+> If you use this work, please cite it (see [CITATION.cff](CITATION.cff) / [How to cite](#license--citation)).
 
+[![ORCID](https://img.shields.io/badge/ORCID-0009--0003--4518--2258-A6CE39?style=flat&logo=orcid&logoColor=white)](https://orcid.org/0009-0003-4518-2258)
+[![Author](https://img.shields.io/badge/Author-matheuscamarques-181717?style=flat&logo=github&logoColor=white)](https://github.com/matheuscamarques)
+[![Email](https://img.shields.io/badge/Email-matheuscamarques%40gmail.com-D14836?style=flat&logo=gmail&logoColor=white)](mailto:matheuscamarques@gmail.com)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![ISA](https://img.shields.io/badge/ISA-22%20Opcodes-blueviolet)](docs/ISA_OPCODES_0x13_0x19.md)
+[![ISA](https://img.shields.io/badge/ISA-28%20Opcodes-blueviolet)](docs/ESPEC.md)
 [![Sparse](https://img.shields.io/badge/Support-Sparse%20%26%20Dense-brightgreen)]()
 [![License](https://img.shields.io/badge/License-AGPL_v3.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow)]()
@@ -12,7 +17,7 @@
 
 The M³-AVM is a software emulator in Rust (`src/lib.rs:1`, `src/vm.rs:1`) exploring primitives for interactive AI: preemption and sparse memory. It implements:
 
-1. A fixed 22-opcode ISA: `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) + `MATVEC, MUL, SILU` (GEMV blocks) + `SSM_SCAN, SSM_RESET` (Mamba) + `CODEC_ENC, CODEC_DEC, AUDIO_ALIGN` (Mimi full-duplex) + `CTX_SWITCH, ROPE` (hybrid control) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`, spec `docs/ISA_OPCODES_0x13_0x19.md`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
+1. A fixed 28-opcode ISA (`0x01–0x19` + `GATHER 0x1F, DISTANCE 0x23, RANK1_UPDATE 0x24`): `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) + `MATVEC, MUL, SILU` (GEMV blocks) + `SSM_SCAN, SSM_RESET` (Mamba) + `CODEC_ENC, CODEC_DEC, AUDIO_ALIGN` (Mimi full-duplex) + `CTX_SWITCH, ROPE` (hybrid control) + `GATHER, DISTANCE, RANK1_UPDATE` (indexing, retrieval, matrix memory — RFC-0004) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`, spec `docs/ESPEC.md`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
 2. A scheduler with strict priority `Red > Blue > Green` (`src/context.rs:15`, `src/context.rs:167`) and an optional event-driven reactor (`src/reactor.rs:1`, `src/bus.rs:20`) using `tokio::sync::watch`/`broadcast`.
 3. Dense tensors via `ndarray` + `faer` SIMD and sparse CSR via `nalgebra-sparse 0.10` + `sprs 0.11` (`Cargo.toml:22`, `src/sparse.rs:1`), plus quantized dequant `Q4_0/Q4_K/Q6_K/Q8_0` `src/quant.rs:1` and fused `matvec_q4k` `AVX2` `src/matvec_quant.rs:1`.
 4. Real inference from GGUF (`src/inference.rs:1`, `src/gguf.rs:1`) with `mmap` zero-copy in `PERSISTENTE 0x20` (`src/memory.rs:15`), `KV_CACHE 0x30` per-layer (`src/memory.rs:27`) and `AsmEmitter` (`src/asm_emitter.rs:1`) that lowers a model to `.m3asm` desenrolado.
@@ -25,7 +30,7 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 
 ## 2. Architecture — Implemented
 
-> Full target vision (diagram + heterogeneous engines + distributed roadmap): see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> Full target vision (diagram + heterogeneous engines + distributed roadmap): see [docs/ESPEC.md](docs/ESPEC.md).
 
 ### Address Space (u128 virtual) `src/memory.rs:21`
 - `GLOBAL (0x00…)` — `global_heap: HashMap<u128, Arc<Vec<u8>>>` + `sparse_heap: HashMap<u128, SparseTensor>` `src/memory.rs:122` (dense aligned to 64B `src/memory.rs:221`, sparse CSR).
@@ -78,7 +83,7 @@ Sparsity (MoE routing, pruning, long-context KV cache) is common, but current st
 | `0x0E` | **JUMP** | `JUMP LABEL` | Unconditional `src/vm.rs:1315`, target validated. |
 | `0x0F` | **IF_INTERRUPT** | `IF_INTERRUPT LABEL` or `IF_INTERRUPT Rcond, LABEL` | With reg `reg!=0`, without `interrupt_flag` (consumed) `src/vm.rs:1335`. |
 | `0x10-0x12` | **MATVEC/MUL/SILU** | `MATVEC Rd, Rx, Rw` / `MUL Rd, R1, R2` / `SILU Rd, Rsrc` | GEMV `x·W` (`faer`), elementwise mul, SiLU `x·sigmoid(x)` — building blocks for SwiGLU/heads. |
-| `0x13` | **SSM_SCAN** | `SSM_SCAN rY, rX, rH, rP [D_INNER=n D_STATE=n LAYER=n]` | Selective scan `h*=exp(dt·A)+x·B·dt; y=h·C+D·x` (`src/ssm.rs`); `rH=_` uses `Vm::ssm_states[layer]`; full spec `docs/ISA_OPCODES_0x13_0x19.md`. |
+| `0x13` | **SSM_SCAN** | `SSM_SCAN rY, rX, rH, rP [D_INNER=n D_STATE=n LAYER=n]` | Selective scan `h*=exp(dt·A)+x·B·dt; y=h·C+D·x` (`src/ssm.rs`); `rH=_` uses `Vm::ssm_states[layer]`; full spec `docs/ESPEC.md`. |
 | `0x14` | **SSM_RESET** | `SSM_RESET rH [D_INNER=n D_STATE=n LAYER=n]` | Zeroes `h_t` (tensor or `ssm_states[layer]`); pairs with `ABORT` (auto pop of `FORK` snapshot) for Mamba rollback. |
 | `0x15` | **CODEC_ENC** | `CODEC_ENC rD, rS [TENSOR]` | PCM `1920xf32` (tensor or `TEMPORAL`) → Mimi codes 32B / `[1,16]` (`src/mimi.rs`). |
 | `0x16` | **CODEC_DEC** | `CODEC_DEC rD, rS [TENSOR]` | Inverse: codes → PCM frame. |
@@ -97,7 +102,7 @@ All instructions are 32 bytes `src/opcodes.rs:82`.
 - `watch`/`broadcast` are Tokio channels, not hardware crossbar.
 - `wgpu` only for `ATTN <=64`; `GEMV` hot path is CPU `faer`/`matvec_quant` — unified `DDR4 19GB/s` limits Vega 8 to `~1.5x` est.
 
-Tests that pass on this host: `cargo test --lib` 124 tests (ISA, sparse, bus, reactor, inference, asm_emitter, TUI, VM).
+Tests that pass on this host: `cargo test --lib` 170 tests (ISA, sparse, bus, reactor, inference, asm_emitter, TUI, VM).
 
 ## 5. Benchmarking — Measured (not claimed)
 
@@ -169,13 +174,13 @@ cargo run --bin m3_avm --features wgpu -- run --model models/tinyllama-1.1b-chat
 M3_PROFILE=1 cargo run --bin m3_avm --features wgpu --release -- run --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --real --max-steps 3
 
 # Tests & benches
-cargo test --lib                               # 124 tests
+cargo test --lib                               # 170 tests
 cargo test --lib sparse_nop -- --nocapture
 cargo test --lib asm_emitter -- --nocapture
 cargo bench --bench physics_bench -- --quick
 ```
 
-What does *not* exist: `cargo run --bin m3_tui` (no TUI), `cargo test test_sparse_attention` (actual names are `sparse::*` and `qa::sparse_nop::*`).
+What does *not* exist: a `m3_tui` binary (the TUI is a REPL module `src/tui.rs` used by `--real --interactive`, not a separate binary), `cargo test test_sparse_attention` (actual names are `sparse::*` and `qa::sparse_nop::*`).
 
 Example verified: `examples/sparse_nop.m3asm:1`
 ```asm
@@ -231,10 +236,13 @@ PROGRAM_END:
 - [x] `EMBED/ADD/SAMPLE` + `COMPARE/JUMP/IF_*` + 2-pass labels.
 - [x] Real inference `Q4_K` `AVX2` + `KV_CACHE 0x30` + `AsmEmitter --emit-asm`.
 - [x] `FxHash` + `LayerNames` pre-resolve (P0, ~20% `matvec`).
+- [x] `MATVEC/MUL/SILU` + Mamba/SSM (`SSM_SCAN/RESET`) + audio codec (`CODEC_ENC/DEC`, `AUDIO_ALIGN`, `CTX_SWITCH`, `ROPE`) — see `docs/ESPEC.md`.
 - [ ] Resident `GEMV.wgsl` `Q4_K` for Vega 8 (est. `1.5x`, `BW-bound`).
 - [ ] BSR backend for block-sparse attention.
 - [ ] Validate 1024+ dims (tested up to 64 for sparse, 2048 for dense).
 - [ ] Re-introduce JusrisOS adapter when `TARGET` defined.
+- [ ] `AVM-Cluster`: distributed actors (`REMOTE_SPAWN/SIGNAL/SEND_TENSOR/BARRIER` `0x1A..0x1D`) — plan in `docs/ESPEC.md`.
+- [ ] Universal ISA: `CONV/GATHER/SPIKE_STEP/DENOISE_STEP` (`0x1E..0x21`) + `FOREST/DISTANCE/RANK1_UPDATE/ODE_STEP` (`0x22..0x25`), incl. Titans/DeltaNet/trees/kNN/SVD coverage — map + aliases + canonical table in `docs/ESPEC.md`.
 
 ## License — Citation
 
@@ -249,9 +257,12 @@ Network use of a modified version (e.g. hosted inference) requires offering the 
   author  = {Marques, Matheus de Camargo},
   title   = {M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation},
   year    = {2026},
+  version = {0.1.0},
   url     = {https://github.com/matheuscamarques/m3_avm},
   license = {AGPL-3.0-or-later}
 }
 ```
+
+> DOI Zenodo em breve: `10.5281/zenodo.XXXXXXX` (substituir após publicar; ver `docs/zenodo/README_ZENODO.md`). ORCID: [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).
 
 Or use the machine-readable [CITATION.cff](CITATION.cff) (GitHub "Cite this repository"). Contributions welcome, especially sparse-dense matmul optimizations — by contributing you agree your code is licensed under the same AGPL-3.0-or-later.
