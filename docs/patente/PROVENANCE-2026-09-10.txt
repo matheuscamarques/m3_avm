@@ -1,0 +1,63 @@
+0548f46 docs(math): modelos matematicos do MVP + provas (SSM, rollback, quant, tempo-real)
+b2342ed docs(arch): add M3-AVM target architecture diagram + implemented-vs-vision status
+49c0c1e chore(public): AGPL-3.0 + CITATION.cff + autoria Matheus de Camargo Marques
+2c707c1 feat(asm): torn assembly emit-asm executável com pesos reais Q4_K
+e966c6c feat(asm+vm): Fase 1 MATVEC real para Q/K/V via GGUF mmap
+75be3e2 estudo(gpu): bench CPUxGPU Vega 8 + fix build --features wgpu
+75617d1 docs(readme): sync com estado atual — real inference Q4_K/AVX2, AsmEmitter, Vega 8 wgpu
+a4444a0 feat(isa): stepping compartilhado, docs 15 opcodes e demo control-flow
+63925e9 feat(emit-asm): --emit-asm gera assembly M3 desenrolado a partir de GGUF
+de6b2c9 perf(inference): P0+P1 — nomes pré-resolvidos, arena, fxhash, serial gating
+---
+ M AUTHORS
+ M CITATION.cff
+ M Cargo.toml
+ M README.md
+ D docs/ARCHITECTURE.md
+ D docs/MATH_MVP.md
+ D docs/MOSHI_MAP.md
+ D docs/PLANO_MOSHI_NATIVO.md
+ M programs/control_flow_demo.m3asm
+ M src/asm_emitter.rs
+ M src/context.rs
+ M src/inference.rs
+ M src/lib.rs
+ M src/main.rs
+ M src/memory.rs
+ M src/moshi.rs
+ M src/opcodes.rs
+ M src/qa.rs
+ M src/reactor.rs
+ M src/rollback.rs
+ M src/ssm.rs
+ M src/vm.rs
+ D tese.md
+?? .zenodo.json
+?? benches/hybrid_ops_bench.rs
+?? docs/ESPEC-V2.md
+?? docs/ESPEC.md
+?? docs/RFC-0002-DUALMODE.md
+?? docs/RFC-0003-RETENTION.md
+?? docs/RFC-0004-GATHER-DISTANCE-RANK1.md
+?? docs/RFC-0005-DETERMINISM.md
+?? docs/RFC-0006-TELEMETRY-SCHED.md
+?? docs/RFC-0007-LOADI-MOV-CMP.md
+?? docs/RFC-0008-STRICT-ASM.md
+?? docs/RFC-0009-SAMPLE-RNG.md
+?? docs/RFC-0010-KV-TRUNCATE.md
+?? docs/RFC-0011-ROLLBACK-ROBUST.md
+?? docs/RFC-0012-FOREST.md
+?? docs/RFC-0013-DENOISE.md
+?? docs/arq/
+--- cargo test --lib ---
+
+
+failures:
+    moshi::tests::test_gguf_qkv_split_shapes
+
+test result: FAILED. 228 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.59s
+
+error: test failed, to rerun pass `--lib`
+
+--- autoria ---
+Matheus de Camargo Marques <matheuscamarques@gmail.com> ORCID https://orcid.org/0009-0003-4518-2258
