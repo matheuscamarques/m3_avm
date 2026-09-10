@@ -14,6 +14,7 @@
 [![Sparse](https://img.shields.io/badge/Support-Sparse%20%26%20Dense-brightgreen)]()
 [![License](https://img.shields.io/badge/License-AGPL_v3.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow)]()
+[![DOI](https://zenodo.org/badge/10.5281/zenodo.22694886.svg)](https://doi.org/10.5281/zenodo.22694886)
 
 ## Abstract — What This Emulator Actually Is
 
@@ -260,6 +261,6 @@ Network use of a modified version (e.g. hosted inference) requires offering the 
 }
 ```
 
-> DOI Zenodo em breve: `10.5281/zenodo.XXXXXXX` (substituir após publicar; ver `docs/zenodo/README_ZENODO.md`). ORCID: [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).
+> DOI: 10.5281/zenodo.22694886
 
 Or use the machine-readable [CITATION.cff](CITATION.cff) (GitHub "Cite this repository"). Contributions welcome, especially sparse-dense matmul optimizations — by contributing you agree your code is licensed under the same AGPL-3.0-or-later.
