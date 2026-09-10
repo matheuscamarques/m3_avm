@@ -63,7 +63,7 @@
 
 ## 3. Ordem e não-objetivos
 Ordem: `F0 -> F1 -> F2 -> F3 -> F4 -> F5`. Não pular `F2` — sem Mimi não há speech-to-speech.
-Não fazer agora: `BSR/FlashAttention sparse (README.md:82)`, `TUI nova (src/tui.rs)`, `JusrisOS adapter (README.md:126)`.
+Não fazer agora: `BSR/FlashAttention sparse (README.md:82)`, `TUI nova (src/tui.rs)`.
 
 ## 4. Comandos úteis
 ```bash

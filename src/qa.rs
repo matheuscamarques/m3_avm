@@ -522,7 +522,7 @@ mod level1_isa {
 }
 
 // =============================================================================
-// NÍVEL 2 — Testes de Integração (fluxos JusrisOS)
+// NÍVEL 2 — Testes de Integração (fluxos externos)
 // =============================================================================
 
 mod level2_integration {
@@ -920,7 +920,7 @@ mod diagnostic_physics {
     #[test]
     fn test_adapter_switch_zero_downtime() {
         // Hexagonal: trocar adapter de API para M³ em runtime sem reiniciar
-        // Simula JusrisOS Dispatcher.set em Rust
+        // Simula dispatcher externo (.set) em Rust
         trait LlmAdapter { fn generate(&self, prompt: &str) -> String; }
         struct Cloud; impl LlmAdapter for Cloud { fn generate(&self, p: &str)->String{ format!("cloud:{}",p)} }
         struct M3; impl LlmAdapter for M3 { fn generate(&self, p: &str)->String{ format!("m3:{}",p)} }

@@ -124,7 +124,7 @@ Heartbeat carrega `free_pct + queue_lengths (R,B,G)` para `REMOTE_SPAWN` escolhe
 ## 6. Ordem e não-objetivos
 
 Ordem: `F0 → F1 → F2 → F3 → F4 → F5`. Não pular F2 — sem `SIGNAL` fora-de-banda não há tese.
-Não fazer agora: QUIC (`quinn`)/RDMA real, gossip/SWIM completo, TLS mútuo, `BSR/FlashAttention sparse`, `GEMV.wgsl Q4_K`, adapter JusrisOS.
+Não fazer agora: QUIC (`quinn`)/RDMA real, gossip/SWIM completo, TLS mútuo, `BSR/FlashAttention sparse`, `GEMV.wgsl Q4_K`.
 
 ## 7. Comandos úteis
 
