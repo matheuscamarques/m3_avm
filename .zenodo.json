@@ -1,0 +1,34 @@
+{
+  "title": "M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation",
+  "version": "v0.1.0",
+  "description": "M³-AVM (Máquina Abstrata de Matheus de Camargo Marques) is a deterministic virtual machine prototype in Rust for sparse event-driven tensor computation. This deposit freezes ISA v1.4 (32-byte instructions: control/thinking loop 0x00-0x0F, GEMV 0x10-0x12, Mamba/SSM and audio codec 0x13-0x19, GATHER 0x1F / DISTANCE 0x23 / RANK1_UPDATE 0x24, KV_TRUNCATE 0x38, RNG/hash 0x60-0x66, telemetry/scheduler 0x6A-0x77, LOADI/MOV 0x78-0x79, NOP 0xFF), strict-priority scheduler (Red > Blue > Green) with absolute deadlines, CoW snapshot/rollback (FORK/ABORT) with monotonic version counter, CSR sparse tensors, Q4_K fused AVX2 matvec, GGUF mmap inference with per-layer KV cache, and Lean 4 proofs (SSM, rollback, windowed error). Cluster (0x1A-0x1D), universal-AI remainder (CONV/SPIKE/DENOISE/FOREST/ODE/RAG/DEPFORMER), 64-byte forms and device-aware EDF scheduling are frozen/reserved future work, explicitly rejected at runtime — see docs/ESPEC.md (normative) and docs/ESPEC-V2.md (draft).",
+  "creators": [
+    {
+      "name": "Marques, Matheus de Camargo",
+      "orcid": "0009-0003-4518-2258",
+      "affiliation": "Independent Researcher"
+    }
+  ],
+  "keywords": [
+    "virtual machine",
+    "instruction set architecture",
+    "AI inference",
+    "sparse computation",
+    "heterogeneous computing",
+    "deterministic rollback",
+    "KV cache",
+    "Mamba SSM",
+    "full-duplex audio"
+  ],
+  "license": "AGPL-3.0-or-later",
+  "upload_type": "software",
+  "access_right": "open",
+  "language": "eng",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/matheuscamarques/m3_avm",
+      "relation": "isSupplementTo",
+      "resource_type": "software"
+    }
+  ]
+}
