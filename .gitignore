@@ -20,3 +20,7 @@ criterion/
 *.orig
 *.rej
 /tmp/
+
+# Lean 4 (lake) — toolchain e artefatos de build (GBs; manifest + fontes bastam)
+formal/.lake/
+formal/build/
