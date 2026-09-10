@@ -1,4 +1,4 @@
-# M3-AVM Specification v2.0 (Draft, Reconciled)
+# M³-AVM Specification v2.0 (Draft, Reconciled)
 
 ```text
 Status:   DRAFT — non-normative proposal. NOT IMPLEMENTED.

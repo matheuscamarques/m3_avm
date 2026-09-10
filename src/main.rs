@@ -43,7 +43,7 @@ use bus::{Bus, InterruptSignal};
 use std::sync::mpsc as std_mpsc;
 
 #[derive(Parser)]
-#[command(name = "m3_avm", version, about = "M³-AVM — Máquina Abstrata de Matheus de Camargo Marques", long_about = None)]
+#[command(name = "m3_avm", version, about = "M³-AVM — Multimodal Multi-Model Abstract Virtual Machine", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

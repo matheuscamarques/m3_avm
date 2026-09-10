@@ -1,4 +1,4 @@
-# M3-AVM Specification
+# M³-AVM Specification
 
 ```text
 Status:   Informational Draft (research prototype, not a standard)
@@ -11,7 +11,7 @@ Replaces: all documents under docs/arq/ (archived, non-normative)
 
 ## Abstract
 
-This document is the single normative specification of the M3-AVM
+This document is the single normative specification of the M³-AVM
 (Abstract Machine of Matheus de Camargo Marques), a software virtual
 machine in Rust exploring preemptible, sparse, event-driven tensor
 computation for interactive AI. It defines the instruction encoding,
@@ -51,7 +51,7 @@ A. Appendix: Mnemonic Quick Reference
 
 ### 1.1 Scope
 
-M3-AVM is a fixed-width instruction-set emulator with first-class
+M³-AVM is a fixed-width instruction-set emulator with first-class
 sparse tensors, quantized GEMV, a strict-priority scheduler, and
 microsecond-scale abort/rollback of inference state. It runs
 Transformer text models from GGUF files today; Mamba recurrence,

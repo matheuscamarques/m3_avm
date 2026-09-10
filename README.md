@@ -1,6 +1,8 @@
-# M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation
+# M³-AVM — Multimodal Multi-Model Abstract Virtual Machine
 
-> **Author: Matheus de Camargo Marques** — Independent Researcher · Máquina Abstrata de Matheus de Camargo Marques \
+*Research prototype for sparse event-driven tensor computation.*
+
+> **Author: Matheus de Camargo Marques** — Independent Researcher \
 > ORCID: [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258) · Email: <matheuscamarques@gmail.com> · GitHub: [@matheuscamarques](https://github.com/matheuscamarques) \
 > If you use this work, please cite it (see [CITATION.cff](CITATION.cff) / [How to cite](#license--citation)).
 
@@ -255,7 +257,7 @@ Network use of a modified version (e.g. hosted inference) requires offering the 
 ```bibtex
 @software{m3_avm_2026,
   author  = {Marques, Matheus de Camargo},
-  title   = {M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation},
+  title   = {M³-AVM: Multimodal Multi-Model Abstract Virtual Machine},
   year    = {2026},
   version = {0.1.0},
   url     = {https://github.com/matheuscamarques/m3_avm},

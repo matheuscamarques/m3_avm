@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "M³-AVM: Research Prototype for Sparse Event-Driven Tensor Computation"
+title: "M³-AVM: Multimodal Multi-Model Abstract Virtual Machine"
 message: "If you use this software, please cite it as below."
 type: software
 authors:
@@ -10,7 +10,7 @@ authors:
     affiliation: "Independent Researcher"
 repository-code: "https://github.com/matheuscamarques/m3_avm"
 url: "https://github.com/matheuscamarques/m3_avm"
-abstract: "M³-AVM (Máquina Abstrata de Matheus de Camargo Marques) is a deterministic virtual machine prototype in Rust for sparse event-driven tensor computation: ISA v1.4 with 32-byte instructions (control/thinking loop 0x00-0x0F, GEMV 0x10-0x12, Mamba/SSM and audio codec 0x13-0x19, GATHER 0x1F / DISTANCE 0x23 / RANK1_UPDATE 0x24, KV_TRUNCATE 0x38, RNG/hash 0x60-0x66, telemetry/scheduler 0x6A-0x77, LOADI/MOV 0x78-0x79, NOP 0xFF), strict-priority scheduler (Red > Blue > Green) with absolute deadlines, CoW snapshot/rollback (FORK/ABORT) with monotonic version counter, CSR sparse tensors, Q4_K fused AVX2 matvec, GGUF mmap inference with per-layer KV cache, and Lean 4 proofs (SSM, rollback, windowed error). Cluster and universal-AI remainder are frozen/reserved future work (see docs/ESPEC.md normative, docs/ESPEC-V2.md draft)."
+abstract: "M³-AVM (Multimodal Multi-Model Abstract Virtual Machine) is a deterministic virtual machine prototype in Rust for sparse event-driven tensor computation: ISA v1.4 with 32-byte instructions (control/thinking loop 0x00-0x0F, GEMV 0x10-0x12, Mamba/SSM and audio codec 0x13-0x19, GATHER 0x1F / DISTANCE 0x23 / RANK1_UPDATE 0x24, KV_TRUNCATE 0x38, RNG/hash 0x60-0x66, telemetry/scheduler 0x6A-0x77, LOADI/MOV 0x78-0x79, NOP 0xFF), strict-priority scheduler (Red > Blue > Green) with absolute deadlines, CoW snapshot/rollback (FORK/ABORT) with monotonic version counter, CSR sparse tensors, Q4_K fused AVX2 matvec, GGUF mmap inference with per-layer KV cache, and Lean 4 proofs (SSM, rollback, windowed error). Cluster and universal-AI remainder are frozen/reserved future work (see docs/ESPEC.md normative, docs/ESPEC-V2.md draft)."
 keywords:
   - virtual-machine
   - tensor
