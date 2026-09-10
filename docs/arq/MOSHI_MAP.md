@@ -48,3 +48,6 @@ Gerado a partir de `src/moshi.rs` (`describe_map`). Fonte de verdade em runtime 
 - `is_moshi_arch()`: contém `moshi|mimi|personaplex|moshiko|moshika` (case-insensitive).
 - `count_moshi_tensors()`: nº de `blk.{l}.attn/ffn` encontrados; `0` em LLM texto puro com outros nomes? Não — LLM texto também usa `blk.*`, então checar `arch` primeiro, contagem depois.
 - Moshi original (8 codebooks) vs PersonaPlex (16): checar `moshi.audio.codebooks / mimi.codebooks`.
+
+---
+*Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

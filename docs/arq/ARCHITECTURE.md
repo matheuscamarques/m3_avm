@@ -109,6 +109,8 @@
              └─────────────────────┘                           └─────────────────────┘
 ```
 
+> Note: the fourth network opcode `OP_BARRIER` (`0x1D`, deterministic barrier/RELEASE across nodes) rides the same cluster bus; full spec in `docs/PLANO_AVM_CLUSTER.md` §2.
+
 ## Technical highlights
 
 1. **ISA topology (32-byte fixed):** deterministic fetch and prefetch at the top of
@@ -130,16 +132,21 @@
 | 32-byte fetch/dispatcher, `TENSOR/ATTN/STREAM/FORK/ABORT/SENSE` (`0x01–0x06`) | ✅ Implemented | `src/opcodes.rs`, `src/vm.rs` |
 | `NORM/FFN/EMBED/ADD/SAMPLE` + control flow (`0x07–0x0F`) | ✅ Implemented | `src/vm.rs`, `programs/control_flow_demo.m3asm` |
 | `MATVEC/MUL/SILU`, GGUF `mmap` inference, `KV_CACHE` + snapshot/rollback | ✅ Implemented | `src/inference.rs`, `src/matvec_quant.rs`, `src/memory.rs` |
-| `SSM_SCAN/SSM_RESET/CODEC_ENC/CODEC_DEC/AUDIO_ALIGN/CTX_SWITCH/ROPE` (`0x13–0x19`) | 🧪 Experimental | `src/ssm.rs`, `src/mimi.rs`, `src/moshi.rs`, `src/inference_gpu.rs` — opcode constants + modules exist, VM wiring in progress |
+| `SSM_SCAN/SSM_RESET/CODEC_ENC/CODEC_DEC/AUDIO_ALIGN/CTX_SWITCH/ROPE` (`0x13–0x19`) | ✅ Implemented | `src/opcodes.rs`, `src/vm.rs` (`exec_ssm_scan/reset`, `exec_codec_enc/dec`, `exec_audio_align/ctx_switch/rope`) + `src/ssm.rs`, `src/mimi.rs`, `src/moshi.rs`; spec `docs/ISA_OPCODES_0x13_0x19.md`; demos `programs/mamba_scan_demo.m3asm`, `programs/codec_loop.m3asm`, `programs/moshi_loop_v2.m3asm` |
 | Barge-in via `SENSE` + `IF_INTERRUPT`, `ABORT` rollback | ✅ Implemented (local) | `src/vm.rs`, `src/rollback.rs`, `src/bus.rs` |
-| `REMOTE_SPAWN/SIGNAL/SEND_TENSOR` (`0x1A–0x1C`), network dispatcher, cluster bus (QUIC/TCP/RDMA) | 🔭 Roadmap (not implemented) | Reserved opcode range; no network transport in this repo |
+| `REMOTE_SPAWN/SIGNAL/SEND_TENSOR/BARRIER` (`0x1A–0x1D`), network dispatcher, cluster bus (QUIC/TCP/RDMA) | 🔭 Roadmap (not implemented) | Reserved opcode range; no network transport in this repo; spec in `docs/PLANO_AVM_CLUSTER.md` |
 | Latency figures in diagram (`~217µs`, sub-ms distributed) | 🎯 Target | Local measured baselines in `README.md` §5; distributed figures are design goals, not measurements |
 
 ## Planning / roadmap
 
 - [x] Core ISA + scheduler + sparse/quant backends + real GGUF inference (done — see `README.md`).
-- [ ] Finish VM wiring for `0x13–0x19` (SSM/codec/audio-align/ctx-switch/ROPE) with tests + benches.
+- [x] VM wiring for `0x13–0x19` (SSM/codec/audio-align/ctx-switch/ROPE) with tests (166 lib green) — benches still open.
+- [ ] Benches (`criterion`) for `0x13–0x19` + end-to-end smoke with a real Mamba GGUF.
 - [ ] `GEMV.wgsl` resident kernels for the GPU path (`src/inference_gpu.rs`).
-- [ ] Specify `0x1A–0x1C` wire format (envelope, addressing, auth) before any network code.
+- [ ] Specify `0x1A–0x1D` wire format (envelope, addressing, auth) before any network code.
+- [ ] Universal-AI opcodes `0x1E–0x25` (`CONV/GATHER/SPIKE_STEP/DENOISE_STEP` + `FOREST/DISTANCE/RANK1_UPDATE/ODE_STEP`) — plan in `docs/PLANO_ISA_UNIVERSAL.md`.
 - [ ] Reference cluster transport (Tokio/QUIC first, RDMA later) + distributed preemption demo.
 - [ ] Publish ISA spec as `docs/ISA.md` + whitepaper so the architecture above is citable.
+
+---
+*Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

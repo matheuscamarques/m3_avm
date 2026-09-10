@@ -189,5 +189,13 @@ FlashAttention esparsa).
 
 | Afirmação | Status |
 | :--- | :--- |
-| Teoremas 1–7 acima | Provados a partir do código citado; verif
-...[truncated 911 chars]
+| Teoremas 1–2 (SSM: contração, erro Euler `O(dt²)`, custo `Θ(I·S)`) | Provados a partir do código citado; machine-checked em `formal/Formal/SSM.lean` (`ssm_contraction`, `euler_local_error`, `ssm_forget`, `scanCost_eq`). |
+| Teorema 3 (cruzamento quadrático → linear) | Prova estilo paper acima; custo assintótico, não bound de constante. |
+| Teorema 4 (rollback exato) | Vale **somente** sob imutabilidade pós-snapshot (I-Persist) + contador monotônico (I-Mono). O código atual viola ambos: mutação in-place quebraria a hipótese (ii) e `restore` faz `version := v` (`src/memory.rs:1027`), permitindo clobber — contraexemplo machine-checked `formal/Formal/Rollback.lean:clobber_demo`. Fix provado: `restoreFix` + `fresh_of_inv`. Sem o fix, o teorema é falso sob reuso. |
+| Latência `L_abort` (§4), tempo-real áudio (Teo. 6) | Modelos com forma estrutural provada (sem termo em N); valores absolutos (`25ms` debug, `~217µs` meta) são medição (`README.md §5`), não teorema. |
+| Teorema 5 (quant Q4_K) | Bound estilo paper acima; qualidade (perplexidade) exige bench empírico, não coberto. |
+| Proposição 7 (CSR) | Economia para projeções/FFN; atenção densifica no softmax (`src/sparse.rs:190`) — sem FlashAttention esparsa não há ganho na atenção. Condição de ganho com poda top-k em `docs/MODELO_SIGMA.md` T4. |
+| Composição híbrida Mamba+Transformer, cluster, migração | **Não** provados neste doc; especificados como T2/T3/T5 em `docs/MODELO_SIGMA.md` com esqueletos Lean (`WindowedError`, `TopK`, `ClusterWAL`). Chao `docs/chat.md` §1 itens 1–5 procedem como lacunas até os invariantes I-Persist/I-Mono/I-WAL/I-Deadline serem implementados. |
+
+---
+*Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

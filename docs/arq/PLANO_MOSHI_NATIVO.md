@@ -71,3 +71,6 @@ cargo test --lib moshi mimi matvec_quant -- --nocapture
 M3_PROFILE=1 cargo run --bin m3_avm --release -- run programs/moshi_loop.m3asm --model models/personaplex-7b-v1-q4_k.gguf --real --max-steps 3
 RUSTFLAGS="-C target-cpu=znver1" cargo run --release -- run --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --real --max-steps 3
 ```
+
+---
+*Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

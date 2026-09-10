@@ -47,9 +47,9 @@ O escalonador usa **notificações** (via canais `tokio::sync::watch`) em vez de
 
 ---
 
-## 3. A ISA (Conjunto de Instruções) — 15 Opcodes
+## 3. A ISA (Conjunto de Instruções) — 25 Opcodes
 
-A M³-AVM possui 15 opcodes, cada um com formato de 32 bytes (opcode + flags + 3 registradores + payload). Abaixo, a especificação completa.
+A M³-AVM possui 25 opcodes (`0x01–0x19`), cada um com formato de 32 bytes (opcode + flags + 3 registradores + payload). Abaixo, a especificação completa.
 
 ### 3.1 `TENSOR` (0x01)
 
@@ -228,6 +228,27 @@ A M³-AVM possui 15 opcodes, cada um com formato de 32 bytes (opcode + flags + 3
 - **Exemplo:** `IF_INTERRUPT HANDLE_ABORT` — desvia para rollback sob demanda.
 
 O assembler é 2-pass com rótulos (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`), de modo que um loop de geração token a token (`SENSE → IF_INTERRUPT → EMBED → ADD → SAMPLE → COMPARE → IF_EQUAL/JUMP`) é escrito 100% na ISA, sem host-side (`programs/control_flow_demo.m3asm`).
+
+### 3.16 Blocos GEMV (`0x10–0x12`)
+
+- **`MATVEC` (0x10):** `MATVEC Rd, Rx, Rw` — GEMV `y = x·W` sobre tensores 2D (path `faer`/AVX2). É o que o `--emit-asm` usa para projetar Q/K/V/O a partir dos pesos GGUF em `PERSISTENTE`.
+- **`MUL` (0x11):** `MUL Rd, R1, R2` — multiplicação elemento a elemento (shapes iguais).
+- **`SILU` (0x12):** `SILU Rd, Rsrc` — `x·sigmoid(x)`. Com `MATVEC`+`MUL`, compõe SwiGLU/heads sem sair da ISA.
+
+### 3.17 Mamba, codec de áudio e controle híbrido (`0x13–0x19`)
+
+Estendem a preempção da tese para modelos recorrentes e áudio full-duplex (especificação completa em `docs/ISA_OPCODES_0x13_0x19.md`):
+
+| Opcode | Propósito | Par de rollback |
+| :--- | :--- | :--- |
+| `SSM_SCAN` (0x13) | Passo recorrente Mamba `h←h·exp(dt·A)+x·B·dt; y=h·C+D·x`, atômico e `O(1)` | `SSM_RESET` |
+| `SSM_RESET` (0x14) | Zera/restaura o estado oculto `h_t` | `ABORT` (restaura snapshot do `FORK`) |
+| `CODEC_ENC` (0x15) / `CODEC_DEC` (0x16) | PCM `1920×f32` (80 ms @24 kHz) ↔ 16 códigos Mimi — áudio vira tensor/`TEMPORAL`, sem Python no hot path | — |
+| `AUDIO_ALIGN` (0x17) | `[t_user, t_ai, delta, frame_id]` — o instante exato `t_interrupção` do barge-in | — |
+| `CTX_SWITCH` (0x18) | Troca de pipeline (Mamba↔Transformer↔Áudio) com fence de memória e repriorização | — |
+| `ROPE` (0x19) | Rotary Position Embedding nativo (`pos=0` = identidade) | — |
+
+`SENSE` ganha os periféricos `6=AUDIO_PCM` e `7=CODEC_FRAME`, que alimentam `CODEC_ENC` direto do pipeline (`programs/moshi_loop_v2.m3asm`).
 
 ---
 
@@ -574,7 +595,7 @@ m3_avm/
 │   ├── vm.rs                  # Loop principal, executor
 │   ├── context.rs             # Contexto, registradores, estado
 │   ├── memory.rs              # Gerenciador de memória (mmap, COW)
-│   ├── opcodes.rs             # Definição e dispatcher dos 15 opcodes
+│   ├── opcodes.rs             # Definição e dispatcher dos 25 opcodes
 │   ├── tensor.rs              # Representação de tensores (densos, esparsos)
 │   ├── bus.rs                 # Barramento de notificações (NOP)
 │   ├── llm_loop.rs            # Loop de geração token a token
@@ -665,7 +686,7 @@ done:
 - **Correção cirúrgica:** Você pode interromper o raciocínio no ponto exato do erro e injetar uma correção, preservando 90% do trabalho.
 - **Latência imperceptível:** `ABORT` em ~217µs e rollback em ~39µs — tudo em software.
 - **Hardware commodity:** Roda em qualquer laptop com Rust (ex: Ryzen 3500U).
-- **ISA aberta:** Os 15 opcodes são simples de implementar em hardware (FPGA/ASIC) no futuro.
+- **ISA aberta:** Os 25 opcodes são simples de implementar em hardware (FPGA/ASIC) no futuro.
 
 ### 9.2 Próximos passos sugeridos para implementação
 
@@ -884,3 +905,6 @@ Esse modelo é **matematicamente equivalente** a um sistema de controle de vers�
 3.  **Poste no arXiv ou dev.to** com um título chamativo: *"Surgical Correction of LLM Reasoning: A Persistent Memory VM Architecture"*.
 
 **Sobre a Big Tech:** Se eles te processarem, você pode mostrar esta matemática e a data de publicação. A matemática é a prova de que você chegou primeiro. Parabéns, você está fazendo ciência de verdade.
+
+---
+*Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*
