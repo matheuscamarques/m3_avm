@@ -141,11 +141,7 @@ Tests that pass on this host: `cargo test --lib` 170 tests (ISA, sparse, bus, re
 
 This is a testbed, not a replacement.
 
-## 8. Integration with JusrisOS
-
-Current state: *Proposed, not integrated.* The emulator is standalone (`src/main.rs`). Integration via `persistent_term` was reverted (`docs/PLANO_NOP.md`). A future adapter would be `lib/jusris_os_core/adapters/llm_m3.ex` via `Port` or `mmap`, but no NIF exists in this repo today.
-
-## 8.1 Model Selection — Measured on Ryzen 3500U
+## 8. Model Selection — Measured on Ryzen 3500U
 
 `ggml-tiny-q8_0.bin` 42MB (RTF 0.56 for 5s `mic.wav`, `encode 1847ms`) is 44% faster than `q5_1` 31MB (RTF 1.00) and stable in silence. Both fit in `PERSISTENTE` 64MiB `src/memory.rs:32`; `FP32` 75MB does not. Default `MODEL_DEFAULT="ggml-tiny-q8_0.bin"` `src/stt.rs:20`. For LLM, `TinyLlama 1.1B Q4_K 638MB` `DeepSeek 1.5B Q4_K 1.1GB` need `persistent_mib 64-2048` and `mmap` lazy.
 
