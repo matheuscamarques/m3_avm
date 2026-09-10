@@ -14,7 +14,7 @@ zip -r "$OUT" \
   README.md CITATION.cff LICENSE .zenodo.json AUTHORS PROVENANCE.txt \
   Cargo.toml Cargo.lock \
   src examples programs benches tests formal \
-  docs/ESPEC.md docs/ESPEC-V2.md docs/RFC-*.md docs/zenodo docs/patente \
+  docs/ESPEC.md docs/ESPEC-V2.md docs/RFC-*.md docs/zenodo docs/patente docs/paper \
   -x "formal/.lake/*" "target/*" "*.dat" "*.gguf" "whisper.cpp/*"
 rm ./PROVENANCE.txt
 echo "OK: $OUT"
