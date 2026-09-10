@@ -238,7 +238,6 @@ PROGRAM_END:
 - [ ] Resident `GEMV.wgsl` `Q4_K` for Vega 8 (est. `1.5x`, `BW-bound`).
 - [ ] BSR backend for block-sparse attention.
 - [ ] Validate 1024+ dims (tested up to 64 for sparse, 2048 for dense).
-- [ ] Re-introduce JusrisOS adapter when `TARGET` defined.
 - [ ] `AVM-Cluster`: distributed actors (`REMOTE_SPAWN/SIGNAL/SEND_TENSOR/BARRIER` `0x1A..0x1D`) — plan in `docs/ESPEC.md`.
 - [ ] Universal ISA: `CONV/GATHER/SPIKE_STEP/DENOISE_STEP` (`0x1E..0x21`) + `FOREST/DISTANCE/RANK1_UPDATE/ODE_STEP` (`0x22..0x25`), incl. Titans/DeltaNet/trees/kNN/SVD coverage — map + aliases + canonical table in `docs/ESPEC.md`.
 
