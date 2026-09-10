@@ -1,4 +1,4 @@
-; control_flow_demo.m3asm — Demonstra os opcodes novos (ISA 15) e controle de fluxo.
+; control_flow_demo.m3asm — Demonstra os opcodes de thinking loop e controle de fluxo (ISA base 0x01–0x0F).
 ; Roda fim-a-fim nos dois modos:
 ;   cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm
 ;   cargo run --bin m3_avm -- run programs/control_flow_demo.m3asm --interactive --max-steps 40

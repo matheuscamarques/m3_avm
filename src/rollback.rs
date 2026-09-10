@@ -101,6 +101,19 @@ pub fn compute_entropy(logits: &[f32]) -> f32 {
     entropy
 }
 
+/// Janela de checkpoints do host (RFC-0011): espelha a retenção k=16 da
+/// RFC-0003. Entradas além da janela podem já ter sido recicladas no
+/// servidor (restore falha limpo); a poda só limita a memória do host.
+pub const HOST_CHECKPOINT_WINDOW: usize = 16;
+
+/// Descarta os mais antigos além de `keep` (ordem de push preservada).
+pub fn prune_oldest<T>(v: &mut Vec<T>, keep: usize) {
+    if v.len() > keep {
+        let drop = v.len() - keep;
+        v.drain(..drop);
+    }
+}
+
 /// Função principal V1: tenta entropia (Alg 4), senão fallback (Alg 1)
 pub fn determine_target_token_index(
     entropy_tracker: &EntropyTracker,
@@ -187,5 +200,21 @@ mod tests {
     #[test]
     fn test_compute_entropy_empty() {
         assert_eq!(compute_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_prune_oldest_bounds_window() {
+        let mut v: Vec<u64> = (0..20).collect();
+        prune_oldest(&mut v, HOST_CHECKPOINT_WINDOW);
+        assert_eq!(v.len(), HOST_CHECKPOINT_WINDOW);
+        assert_eq!(v[0], 4, "mantém os mais recentes, na ordem");
+        assert_eq!(v[15], 19);
+        // Abaixo do teto: intocado.
+        let mut w = vec![1u64, 2, 3];
+        prune_oldest(&mut w, HOST_CHECKPOINT_WINDOW);
+        assert_eq!(w, vec![1, 2, 3]);
+        // keep=0 esvazia (uso não recomendado, mas definido).
+        prune_oldest(&mut w, 0);
+        assert!(w.is_empty());
     }
 }

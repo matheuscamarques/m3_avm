@@ -1,0 +1,26 @@
+; loadi_demo.m3asm — imediatos e predicados (RFC-0007)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/loadi_demo.m3asm --max-steps 30
+; Semântica (o gap chicken-and-egg fechado):
+;   LOADI r0, 80000000 (deadline como literal, sem tensor)
+;   LOADI r1, 77       (lock-id como literal)
+;   LOADI r2, 2        (RED como literal)
+;   MOV r3, r0         (cópia)
+;   SET_DEADLINE r0 / GET_DEADLINE r4 (roundtrip 80M)
+;   PRIORITY_SET r2 (RED) / PRIORITY_GET r5 (=2)
+;   LOCK r1 / UNLOCK r1 (id 77)
+;   COMPARE r3, r0 PRED=EQ (80M == 80M)
+;   HALT
+
+LOADI r0, 80000000
+LOADI r1, 77
+LOADI r2, 2
+MOV r3, r0
+SET_DEADLINE r0
+GET_DEADLINE r4
+PRIORITY_SET r2
+PRIORITY_GET r5
+LOCK r1
+UNLOCK r1
+COMPARE r3, r0 PRED=EQ
+HALT

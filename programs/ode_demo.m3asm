@@ -1,0 +1,19 @@
+; ode_demo.m3asm — oscilador amortecido 2-D (RFC-0014)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/ode_demo.m3asm --max-steps 30
+; Semântica (fumaça de fiação; numéricos nos goldens):
+;   r0 = x [2,2] (ramp; `TENSOR r0 2 f32` cai no fallback 2x2),
+;   r1 = u [2,2] (ramp; û cheio, sem pad).
+;   Campo default contrativo (W=-0.1I): 5 passos RK2 DT=0.01 encadeados
+;   (sem loops: contador ainda não existe; W4-futuro).
+;   STREAM rD -> saída. HALT.
+
+TENSOR r0 2 f32
+TENSOR r1 1 f32
+ODE_STEP r2, r0, r1 DT=0.01 METHOD=RK2
+ODE_STEP r2, r2, r1 DT=0.01 METHOD=RK2
+ODE_STEP r2, r2, r1 DT=0.01 METHOD=RK2
+ODE_STEP r2, r2, r1 DT=0.01 METHOD=RK2
+ODE_STEP r2, r2, r1 DT=0.01 METHOD=RK2
+STREAM r2, OUTPUT BLOCKING
+HALT

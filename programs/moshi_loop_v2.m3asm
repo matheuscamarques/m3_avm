@@ -1,0 +1,49 @@
+; moshi_loop_v2.m3asm — full-duplex Moshi/PersonaPlex com ISA 0x13..0x19
+; Evolução de programs/moshi_loop.m3asm (skeleton F1/F4) com codec + SSM + RoPE nativos.
+; Uso:
+;   cargo run --bin m3_avm -- run programs/moshi_loop_v2.m3asm --max-steps 60
+;   cargo run --bin m3_avm -- run programs/moshi_loop_v2.m3asm --interactive --max-steps 200
+; Futuro (pesos reais):
+;   cargo run --bin m3_avm -- run programs/moshi_loop_v2.m3asm --model models/personaplex-7b-v1-q4_k.gguf --real --interactive-audio
+;
+; Tensores demo 8-dim (reais: 4096 hidden, ff 11264, dep 1024 — ver docs/MOSHI_MAP.md).
+
+TENSOR r0 1 8 f32
+TENSOR r1 1 8 f32
+TENSOR r3 8 8 f32
+TENSOR r5 8 16 f32
+TENSOR r6 16 8 f32
+TENSOR r7 2 1 f32   ; h SSM demo [d_inner=2, d_state=1]
+
+MAIN_LOOP:
+    ; 12.5Hz frame Mimi (80ms): PCM real via SENSE + codec nativo
+    SENSE r10, AUDIO_PCM
+    CODEC_ENC r11, r10
+    SENSE r15, USER_INPUT
+    ; GREEN = inference pesada, RED = barge-in (tese §5, Red>Blue>Green)
+    FORK r12, GREEN, NOTIFY
+    CTX_SWITCH TRANSFORMER, GREEN
+    ; 1 layer temporal demo: NORM -> ROPE(Q/K) -> ATTN -> residual -> SSM -> FFN -> residual
+    NORM r1, r0, r0, r0
+    ROPE r1, r1 POS=0 HDIM=8 NHEADS=1
+    ATTN r4, r1, r1, r1, NOTIFY_EACH_HEAD
+    ADD r0, r0, r4
+    SSM_SCAN r9, r0, r7, r0 D_INNER=2 D_STATE=1 LAYER=0
+    FFN r8, r1, r5, r6
+    ADD r0, r0, r8
+    ; depformer + sample + codec out (r11 preserva codes do ENC; sample vai p/ r2)
+    SAMPLE r2, r0
+    STREAM r2, 4 BLOCKING
+    CODEC_DEC r13, r11
+    AUDIO_ALIGN r14, r10, r13
+    COMPARE r2, EOS_TOKEN
+    IF_EQUAL PROGRAM_END
+    ; barge-in: SENSE USER_INPUT seta interrupt_flag, IF_INTERRUPT desvia
+    IF_INTERRUPT HANDLE_ABORT
+    JUMP MAIN_LOOP
+HANDLE_ABORT:
+    ; rollback: KV via ABORT + SSM via RESET + volta ao loop
+    SSM_RESET r7 D_INNER=2 D_STATE=1
+    JUMP MAIN_LOOP
+PROGRAM_END:
+    HALT

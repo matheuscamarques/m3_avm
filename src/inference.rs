@@ -1550,7 +1550,8 @@ impl RealInference {
 /// RoPE estilo HF Llama/Qwen2 (split-half, `rotate_half` — mesma convenção que
 /// o modo NEOX do ggml): par (i, i+half) gira pelo ângulo da freq i.
 /// `v` tem `n_heads * head_dim` elementos; `freqs` tem `head_dim/2` (cos, sin).
-pub(crate) fn apply_rope(v: &mut [f32], n_heads: usize, head_dim: usize, freqs: &[(f32, f32)]) {
+/// `pub` para reuso pelo opcode nativo `OP_ROPE` (`vm.rs::exec_rope`).
+pub fn apply_rope(v: &mut [f32], n_heads: usize, head_dim: usize, freqs: &[(f32, f32)]) {
     if head_dim == 0 || head_dim % 2 != 0 || freqs.len() * 2 != head_dim {
         return;
     }

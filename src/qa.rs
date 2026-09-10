@@ -314,6 +314,169 @@ mod level1_isa {
         assert!(vm.memory.restore(v).is_ok());
     }
 
+    /// I-Mono (ESPEC §6.3/T1): espelho em Rust do `clobber_demo` de
+    /// `formal/Formal/Rollback.lean`. Snapshot-restore-snapshot NUNCA pode
+    /// reutilizar id nem soterrar snapshot antigo. FALHA no código anterior
+    /// a `restoreFix` (`self.version = version` em `memory.rs`).
+    #[test]
+    fn snapshot_restore_monotonic_no_clobber() {
+        let mut mem = MemoryManager::new_in_memory();
+        let addr = mem.alloc_global(64).unwrap();
+        mem.write(addr, &[111u8;64]).unwrap();
+        let v1 = mem.snapshot();
+        mem.write(addr, &[222u8;64]).unwrap();
+        let v2 = mem.snapshot();
+        assert!(v2 > v1, "ids de snapshot devem ser estritamente crescentes");
+        // Restore do antigo, depois novo snapshot: id deve ser fresco.
+        mem.restore(v1).unwrap();
+        assert_eq!(mem.read(addr,64).unwrap()[0], 111);
+        mem.write(addr, &[33u8;64]).unwrap();
+        let v3 = mem.snapshot();
+        assert!(v3 != v1 && v3 != v2, "novo snapshot após restore deve ter id fresco (I-Mono)");
+        assert!(v3 > v2, "contador de versão é monotônico mesmo após restore");
+        // O snapshot antigo soterrado no bug agora sobrevive: restore(v2) é exato.
+        mem.restore(v2).unwrap();
+        assert_eq!(mem.read(addr,64).unwrap()[0], 222, "restore(v2) deve recuperar 222, não 33 (clobber)");
+        mem.restore(v1).unwrap();
+        assert_eq!(mem.read(addr,64).unwrap()[0], 111);
+        // Versão inexistente continua erro (caminho de erro preservado).
+        assert!(mem.restore(v3 + 1000).is_err());
+    }
+
+    /// T1 (ESPEC §8): rollout de 100 passos, ABORT no 50, +50 passos =
+    /// bit-exato vs rollout sem abort.
+    #[test]
+    fn rollback_100_50_50_bit_exact() {
+        fn rollout(abort_at: Option<usize>) -> Vec<u8> {
+            let mut mem = MemoryManager::new_in_memory();
+            let addr = mem.alloc_global(64).unwrap();
+            let mut snaps = Vec::new();
+            for i in 0..100usize {
+                let mut blk = [0u8;64];
+                blk[0] = (i % 251) as u8;
+                blk[1] = ((i * 7) % 251) as u8;
+                mem.write(addr, &blk).unwrap();
+                snaps.push(mem.snapshot());
+                if Some(i) == abort_at {
+                    // ABORT no passo i: restaura o snapshot do passo i-5 e
+                    // reexecuta os mesmos 5 passos + o restante (total 100).
+                    let target = snaps[i - 5];
+                    mem.restore(target).unwrap();
+                    // Rejoga do passo i-4 ao 99 com os mesmos bytes.
+                    for j in (i - 4)..100usize {
+                        let mut b = [0u8;64];
+                        b[0] = (j % 251) as u8;
+                        b[1] = ((j * 7) % 251) as u8;
+                        mem.write(addr, &b).unwrap();
+                        let _ = mem.snapshot();
+                    }
+                    break;
+                }
+            }
+            mem.read(addr, 64).unwrap()
+        }
+        let straight = rollout(None);
+        let with_abort = rollout(Some(50));
+        assert_eq!(straight, with_abort, "ABORT no passo 50 + replay deve ser bit-exato (T1)");
+    }
+
+    /// RFC-0003: janela de retenção recicla os mais antigos nos 4 mapas;
+    /// restore de reciclado falha limpo, do retido é exato.
+    #[test]
+    fn snapshot_window_evicts_oldest() {
+        let mut mem = MemoryManager::new_in_memory();
+        mem.set_snapshot_window(4);
+        let addr = mem.alloc_global(64).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..6u8 {
+            mem.write(addr, &[10 + i; 64]).unwrap();
+            ids.push(mem.snapshot());
+        }
+        assert_eq!(mem.snapshot_count(), 4, "janela k=4 deve reter 4");
+        // Os dois mais antigos foram reciclados: erro limpo, sem parcial.
+        assert!(mem.restore(ids[0]).is_err());
+        assert!(mem.restore(ids[1]).is_err());
+        // Os retidos restauram exato.
+        mem.restore(ids[5]).unwrap();
+        assert_eq!(mem.read(addr, 64).unwrap()[0], 15);
+        mem.restore(ids[2]).unwrap();
+        assert_eq!(mem.read(addr, 64).unwrap()[0], 12);
+    }
+
+    /// RFC-0003: janela `0` = opt-out explícito, ilimitado.
+    #[test]
+    fn snapshot_window_zero_means_unbounded() {
+        let mut mem = MemoryManager::new_in_memory();
+        mem.set_snapshot_window(0);
+        let addr = mem.alloc_global(64).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..20u8 {
+            mem.write(addr, &[i; 64]).unwrap();
+            ids.push(mem.snapshot());
+        }
+        assert_eq!(mem.snapshot_count(), 20);
+        for (k, v) in ids.iter().enumerate() {
+            assert!(mem.restore(*v).is_ok(), "sem retenção, v{} deve existir", k);
+        }
+    }
+
+    /// RFC-0003: default de construtor é k=16 (ESPEC §6.3 item 3).
+    #[test]
+    fn snapshot_window_default_is_16() {
+        let mut mem = MemoryManager::new_in_memory();
+        let addr = mem.alloc_global(64).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..20u8 {
+            mem.write(addr, &[i; 64]).unwrap();
+            ids.push(mem.snapshot());
+        }
+        assert_eq!(mem.snapshot_count(), 16);
+        assert!(mem.restore(ids[3]).is_err(), "4 mais antigos reciclados");
+        assert!(mem.restore(ids[4]).is_ok(), "16 mais recentes retidos");
+        mem.restore(ids[19]).unwrap();
+        assert_eq!(mem.read(addr, 64).unwrap()[0], 19);
+    }
+
+    /// RFC-0016: mutação esparsa in-place após snapshot NÃO vaza para o
+    /// restore (prova que o clone do snapshot é profundo; falharia com
+    /// clone raso). Usa `set()` — o mesmo path de escrita do executor.
+    #[test]
+    fn snapshot_sparse_mutation_invisible() {
+        let mut mem = MemoryManager::new_in_memory();
+        let addr = mem.alloc_sparse_tensor(&[2, 2], DType::F32, 1.0).unwrap();
+        for (r, c, v) in [(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)] {
+            mem.get_sparse_mut(addr).unwrap().set(r, c, v, None).unwrap();
+        }
+        let v0 = mem.snapshot();
+        // Muta in-place APÓS o snapshot (o padrão perigoso).
+        mem.get_sparse_mut(addr).unwrap().set(0, 0, 99.0, None).unwrap();
+        mem.get_sparse_mut(addr).unwrap().set(1, 1, 99.0, None).unwrap();
+        assert_eq!(mem.get_sparse(addr).unwrap().to_dense(), vec![99.0, 2.0, 3.0, 99.0]);
+        mem.restore(v0).unwrap();
+        assert_eq!(
+            mem.get_sparse(addr).unwrap().to_dense(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            " restore deve ver o CSR de v0, não a mutação posterior"
+        );
+    }
+
+    /// RFC-0016: coerência meta/heap. Alloc pós-snapshot + restore =>
+    /// a meta do tensor novo SOME junto (antes: pendurada, `get` Ok +
+    /// leitura Err — divergência). Falha sem o quinto mapa.
+    #[test]
+    fn snapshot_meta_coherence() {
+        let mut mem = MemoryManager::new_in_memory();
+        let a = mem.alloc_tensor(&[2, 2], DType::F32).unwrap();
+        let v0 = mem.snapshot();
+        let b = mem.alloc_tensor(&[2, 2], DType::F32).unwrap();
+        assert!(mem.get_tensor_meta(b).is_some());
+        mem.restore(v0).unwrap();
+        assert!(mem.get_tensor_meta(a).is_some(), "A precede v0, sobrevive");
+        assert!(mem.get_tensor_meta(b).is_none(), "B nasceu após v0: meta reciclada com o heap");
+        // E a leitura de B falha limpo (sem pânico, sem lixo).
+        assert!(mem.read(b, 16).is_err() || mem.read_f32_tensor(b, 4).is_err());
+    }
+
     // ---- SENSE --------------------------------------------------------------
 
     #[tokio::test]

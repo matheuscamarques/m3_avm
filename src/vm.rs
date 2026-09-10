@@ -23,10 +23,14 @@ use crate::memory_wgpu::WgpuMemoryManager;
 use pollster;
 use crate::opcodes::{
     Instruction, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
-    OP_COMPARE, OP_CTX_SWITCH, OP_EMBED, OP_FFN, OP_FORK, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
-    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
+    OP_COMPARE, OP_CTX_SWITCH, OP_DISTANCE, OP_EMBED, OP_FFN, OP_FORK, OP_GATHER, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
+    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
     OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_AUDIO_PCM, SENSE_CODEC_FRAME, SENSE_TOKEN, SENSE_USER_INPUT,
-    SENSE_VAD, STREAM_FLAG_BLOCKING,
+    SENSE_VAD, STREAM_FLAG_BLOCKING, OP_RNG_SEED, OP_RNG_NEXT, OP_RNG_UNIFORM, OP_RNG_NORMAL,
+    OP_HASH, OP_CHECKSUM, OP_HMAC, OP_CYCLES_COUNT, OP_TRACE_EVENT, OP_SANITY_CHECK,
+    OP_PREEMPT_CHECK, OP_ASSERT, OP_DUMP, OP_YIELD, OP_SET_DEADLINE, OP_GET_DEADLINE,
+    OP_PRIORITY_SET, OP_PRIORITY_GET, OP_LOCK, OP_UNLOCK, OP_FENCE, OP_LOADI, OP_MOV, OP_KV_TRUNCATE,
+    OP_FOREST, OP_DENOISE_STEP, OP_ODE_STEP, OP_SPIKE_STEP,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -72,6 +76,37 @@ pub struct VmStats {
     pub audio_aligns: u64,
     pub ctx_switches: u64,
     pub ropes: u64,
+    pub gather_execs: u64,
+    pub distance_execs: u64,
+    pub rank1_execs: u64,
+    pub rng_seed_execs: u64,
+    pub rng_next_execs: u64,
+    pub rng_uniform_execs: u64,
+    pub rng_normal_execs: u64,
+    pub hash_execs: u64,
+    pub checksum_execs: u64,
+    pub hmac_execs: u64,
+    pub cycles_execs: u64,
+    pub trace_execs: u64,
+    pub sanity_execs: u64,
+    pub preempt_check_execs: u64,
+    pub assert_execs: u64,
+    pub dump_execs: u64,
+    pub yield_execs: u64,
+    pub set_deadline_execs: u64,
+    pub get_deadline_execs: u64,
+    pub priority_set_execs: u64,
+    pub priority_get_execs: u64,
+    pub lock_execs: u64,
+    pub unlock_execs: u64,
+    pub fence_execs: u64,
+    pub loadi_execs: u64,
+    pub mov_execs: u64,
+    pub kv_truncate_execs: u64,
+    pub forest_execs: u64,
+    pub denoise_execs: u64,
+    pub ode_execs: u64,
+    pub spike_execs: u64,
     pub start_ns: u64,
 }
 
@@ -285,6 +320,10 @@ impl MemBackend {
 }
 
 /// Máquina Virtual M³-AVM
+/// Teto do anel de trace (TRACE_EVENT 0x6B, RFC-0006): além disso, descarta o
+/// mais antigo. O limite existe para a primitiva nunca virar vetor de flood.
+pub const TRACE_CAP: usize = 1024;
+
 pub struct Vm {
     pub memory: MemBackend,
     pub scheduler: Scheduler,
@@ -306,8 +345,24 @@ pub struct Vm {
     /// Estado recorrente Mamba por camada (fase 2 híbrida; MVP usa tensores,
     /// Rh==0xFF endereça este vetor via payload layer_id).
     pub ssm_states: Vec<crate::ssm::MambaState>,
-    /// Pilha de snapshots SSM para ABORT/rollback (CoW manual).
-    ssm_snapshots: Vec<Vec<crate::ssm::MambaState>>,
+    /// Pilha de snapshots SSM para ABORT/rollback: (versão da memória no
+    /// FORK, estados). RFC-0011: pop versionado (ts!=0) ou LIFO legado (ts=0).
+    ssm_snapshots: Vec<(u64, Vec<crate::ssm::MambaState>)>,
+    /// Handle corrente da matriz H por camada (RANK1_UPDATE 0x24, RFC-0004).
+    /// H em si vive em tensores imutáveis (CoW por passo); aqui só o mapa
+    /// camada->addr, com push no FORK e pop no ABORT (espelha ssm_snapshots).
+    pub rank1_layers: HashMap<u8, u128>,
+    rank1_snapshots: Vec<(u64, HashMap<u8, u128>)>,
+    /// Handles SNN por camada (SPIKE_STEP 0x20, RFC-0015): layer ->
+    /// (addr V, addr refr). Tensores imutáveis (CoW); mapa com
+    /// push no FORK e pop versionado no ABORT (espelha rank1_layers).
+    pub snn_layers: HashMap<u8, (u128, u128)>,
+    snn_snapshots: Vec<(u64, HashMap<u8, (u128, u128)>)>,
+    /// Locks cross-context (LOCK 0x75 / UNLOCK 0x76, RFC-0006): id -> holder.
+    /// Try-lock não-bloqueante; sem filas de espera (EDF real é follow-up).
+    pub locks: HashMap<u32, u64>,
+    /// Anel de trace (TRACE_EVENT 0x6B): (event_id, data), teto TRACE_CAP.
+    pub trace: VecDeque<(u64, u128)>,
 }
 
 impl Vm {
@@ -353,6 +408,12 @@ impl Vm {
             user_input: VecDeque::new(),
             ssm_states: Vec::new(),
             ssm_snapshots: Vec::new(),
+            rank1_layers: HashMap::new(),
+            rank1_snapshots: Vec::new(),
+            snn_layers: HashMap::new(),
+            snn_snapshots: Vec::new(),
+            locks: HashMap::new(),
+            trace: VecDeque::new(),
         })
     }
 
@@ -375,6 +436,12 @@ impl Vm {
             user_input: VecDeque::new(),
             ssm_states: Vec::new(),
             ssm_snapshots: Vec::new(),
+            rank1_layers: HashMap::new(),
+            rank1_snapshots: Vec::new(),
+            snn_layers: HashMap::new(),
+            snn_snapshots: Vec::new(),
+            locks: HashMap::new(),
+            trace: VecDeque::new(),
         }
     }
 
@@ -394,6 +461,12 @@ impl Vm {
             user_input: VecDeque::new(),
             ssm_states: Vec::new(),
             ssm_snapshots: Vec::new(),
+            rank1_layers: HashMap::new(),
+            rank1_snapshots: Vec::new(),
+            snn_layers: HashMap::new(),
+            snn_snapshots: Vec::new(),
+            locks: HashMap::new(),
+            trace: VecDeque::new(),
         })
     }
 
@@ -408,6 +481,9 @@ impl Vm {
 
     /// Host-side SAMPLE: softmax + random weighted sampling (temperatura 1.0)
     /// Se logits são constantes (dummy), adiciona jitter para variar tokens e provar pipeline
+    /// LEGADO (thread_rng): preservado p/ compat externa; dentro da Vm todo
+    /// sampling passa por `sample_logits_ctx` (RFC-0009). Será removido.
+    #[deprecated(note = "use sample_logits_ctx (seeded, RFC-0009) ou determinism::sample_logits_host")]
     pub fn sample_logits(&self, logits: &[f32]) -> u32 {
         if logits.is_empty() { return 0; }
         // Adiciona jitter aleatório para dummy logits constantes (ex: 0.7) não ficarem sempre token 0
@@ -435,6 +511,17 @@ impl Vm {
             if p > best_p { best_p = p; best_idx = i; }
         }
         best_idx as u32
+    }
+
+    /// Amostragem seeded pelo contexto (RFC-0009): mesma seed + mesmos
+    /// logits => mesmo token. Avança `rng_state` do contexto.
+    pub fn sample_logits_ctx(&mut self, ctx_id: u64, logits: &[f32]) -> Result<u32> {
+        let mut st = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.rng_state;
+        let tok = crate::determinism::sample_logits_seeded(&mut st, logits);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.rng_state = st;
+        }
+        Ok(tok)
     }
 
     /// Carrega programa a partir de Vec<Instruction>
@@ -729,6 +816,130 @@ impl Vm {
             }
             OP_ROPE => {
                 self.exec_rope(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_GATHER => {
+                self.exec_gather(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_DISTANCE => {
+                self.exec_distance(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RANK1_UPDATE => {
+                self.exec_rank1_update(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RNG_SEED => {
+                self.exec_rng_seed(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RNG_NEXT => {
+                self.exec_rng_next(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RNG_UNIFORM => {
+                self.exec_rng_uniform(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RNG_NORMAL => {
+                self.exec_rng_normal(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_HASH => {
+                self.exec_hash(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CHECKSUM => {
+                self.exec_checksum(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_HMAC => {
+                self.exec_hmac(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CYCLES_COUNT => {
+                self.exec_cycles_count(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_TRACE_EVENT => {
+                self.exec_trace_event(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SANITY_CHECK => {
+                self.exec_sanity_check(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_PREEMPT_CHECK => {
+                self.exec_preempt_check(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ASSERT => {
+                self.exec_assert(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_DUMP => {
+                self.exec_dump(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_YIELD => {
+                self.exec_yield(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SET_DEADLINE => {
+                self.exec_set_deadline(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_GET_DEADLINE => {
+                self.exec_get_deadline(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_PRIORITY_SET => {
+                self.exec_priority_set(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_PRIORITY_GET => {
+                self.exec_priority_get(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_LOCK => {
+                self.exec_lock(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_UNLOCK => {
+                self.exec_unlock(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_FENCE => {
+                self.exec_fence(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_LOADI => {
+                self.exec_loadi(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_MOV => {
+                self.exec_mov(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_KV_TRUNCATE => {
+                self.exec_kv_truncate(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_DENOISE_STEP => {
+                self.exec_denoise_step(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ODE_STEP => {
+                self.exec_ode_step(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SPIKE_STEP => {
+                self.exec_spike_step(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_FOREST => {
+                self.exec_forest(ctx_id, instr)?;
                 Ok(true)
             }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
@@ -1078,7 +1289,7 @@ impl Vm {
             } else {
                 self.memory.read(src_addr, 64).ok().map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()).unwrap_or(vec![0.5;4])
             };
-            let tok = self.sample_logits(&logits);
+            let tok = self.sample_logits_ctx(ctx_id, &logits)?;
             self.last_sample = tok;
             log_info("sample", &format!("ctx {} SAMPLE logits {} -> token {} ({} logits)", ctx_id, src_addr, tok, logits.len()));
             self.stats.streams += 1;
@@ -1122,7 +1333,7 @@ impl Vm {
                 // Tenta ler 64 bytes como f32
                 self.memory.read(src_addr, 64).ok().map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()).unwrap_or(vec![0.5;4])
             };
-            let tok = self.sample_logits(&logits);
+            let tok = self.sample_logits_ctx(ctx_id, &logits)?;
             self.last_sample = tok;
             log_info("sample", &format!("ctx {} SAMPLE logits {} -> token {} ({} logits)", ctx_id, src_addr, tok, logits.len()));
             self.stats.streams += 1;
@@ -1241,12 +1452,19 @@ impl Vm {
         // Copia registradores do pai para filho
         if let Some(child) = self.scheduler.get_mut(new_id) {
             child.regs = parent.regs;
+            child.rng_state = parent.rng_state; // RFC-0005: herda stream RNG
             child.root_version = snap_version;
         }
         // Retorna ID do filho em rdest do pai
         if let Some(parent_mut) = self.scheduler.get_mut(ctx_id) {
             parent_mut.set_reg(instr.rdest, new_id as u128)?;
         }
+        // Snapshot SSM para rollback, carimbado com a versão (RFC-0011).
+        self.ssm_snapshots.push((snap_version, self.ssm_states.clone()));
+        // Snapshot dos handles RANK1 (mapa barato; tensores H são imutáveis).
+        self.rank1_snapshots.push((snap_version, self.rank1_layers.clone()));
+        // Snapshot dos handles SNN (idem; V/refr imutáveis por passo).
+        self.snn_snapshots.push((snap_version, self.snn_layers.clone()));
         self.stats.forks += 1;
         log_info("fork", &format!("ctx {} FORK -> child {} prio {} (snap v{})", ctx_id, new_id, child_prio, snap_version));
         Ok(())
@@ -1333,6 +1551,32 @@ impl Vm {
                 .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
                 .unwrap_or(vec![0.5; 4])
         };
+        // TOPK mode (RFC-0004 §4): payload[4..6]=k>0 escreve tensor de
+        // índices [1,k] (top-k logits, desempate por menor índice) e NÃO
+        // toca em last_sample. payload zero = amostragem legada.
+        let topk = instr.sample_topk();
+        if topk > 0 {
+            let k = (topk as usize).min(logits.len());
+            if k == 0 {
+                return Err(anyhow!("SAMPLE: TOPK com logits vazios"));
+            }
+            let mut order: Vec<usize> = (0..logits.len()).collect();
+            order.sort_by(|&a, &b| {
+                logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+            });
+            order.truncate(k);
+            let out: Vec<f32> = order.iter().map(|&i| i as f32).collect();
+            let out_addr = self.memory.alloc_tensor(&[1, k], crate::memory::DType::F32)?;
+            self.memory.write_f32_tensor(out_addr, &out)?;
+            if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+                if instr.rdest != 0xFF {
+                    ctx.set_reg(instr.rdest, out_addr)?;
+                }
+            }
+            self.stats.sample_execs += 1;
+            log_debug("sample", &format!("ctx {} SAMPLE TOPK={} -> 0x{:x}", ctx_id, k, out_addr));
+            return Ok(());
+        }
         // Temp vai no payload[0..4] (instr_sample); <=0 ou inválido => 1.0
         let mut tb = [0u8; 4];
         tb.copy_from_slice(&instr.payload[0..4]);
@@ -1342,7 +1586,7 @@ impl Vm {
         } else {
             logits.clone()
         };
-        let tok = self.sample_logits(&scaled);
+        let tok = self.sample_logits_ctx(ctx_id, &scaled)?;
         self.last_sample = tok;
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
             if instr.rdest != 0xFF {
@@ -1362,10 +1606,22 @@ impl Vm {
             let b = if instr.rsrc2 != 0xFF { ctx.reg(instr.rsrc2)? } else { instr.imm_u128() };
             (a, b)
         };
+        // Predicado (RFC-0007, payload[16]; 0 = EQ legado). u128 sem sinal:
+        // regs carregam endereços/ids/contadores, não floats.
+        use crate::opcodes::{CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE};
+        let result = match instr.compare_pred() {
+            CMP_EQ => v1 == v2,
+            CMP_NE => v1 != v2,
+            CMP_LT => v1 < v2,
+            CMP_LE => v1 <= v2,
+            CMP_GT => v1 > v2,
+            CMP_GE => v1 >= v2,
+            p => return Err(anyhow!("COMPARE: PRED {} inválido (0-5)", p)),
+        };
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
-            ctx.cmp_equal = v1 == v2;
+            ctx.cmp_equal = result;
         }
-        log_debug("compare", &format!("ctx {} COMPARE {} == {} -> {}", ctx_id, v1, v2, v1 == v2));
+        log_debug("compare", &format!("ctx {} COMPARE {} pred={} {} -> {}", ctx_id, v1, instr.compare_pred(), v2, result));
         Ok(())
     }
 
@@ -1456,6 +1712,52 @@ impl Vm {
                 Ok(_) => log_info("abort", &format!("ABORT restaurou memória para v{}", ts_version)),
                 Err(e) => log_warn("abort", &format!("falha ao restaurar v{}: {}", ts_version, e)),
             }
+        }
+        // Rollback SSM versionado (RFC-0011): com ts != 0, descarta entradas
+        // mais novas que o alvo e aplica a entrada exata, se houver; com
+        // ts == 0, pop único legado. Pilha vazia = no-op (nunca panic).
+        if ts_version != 0 {
+            while self.ssm_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.ssm_snapshots.pop();
+            }
+            if self.ssm_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.ssm_snapshots.pop() {
+                    self.ssm_states = snap;
+                    log_info("abort", &format!("ctx {} ABORT restaurou {} estados SSM (v{})", ctx_id, self.ssm_states.len(), ts_version));
+                }
+            } else {
+                log_info("abort", &format!("ctx {} ABORT sem snapshot SSM em v{} (mantido)", ctx_id, ts_version));
+            }
+        } else if let Some((_, snap)) = self.ssm_snapshots.pop() {
+            self.ssm_states = snap;
+            log_info("abort", &format!("ctx {} ABORT restaurou {} estados SSM", ctx_id, self.ssm_states.len()));
+        }
+        // Rollback RANK1: mesma disciplina sobre os handles (tensores H
+        // antigos seguem válidos por CoW).
+        if ts_version != 0 {
+            while self.rank1_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.rank1_snapshots.pop();
+            }
+            if self.rank1_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.rank1_snapshots.pop() {
+                    self.rank1_layers = snap;
+                }
+            }
+        } else if let Some((_, snap)) = self.rank1_snapshots.pop() {
+            self.rank1_layers = snap;
+        }
+        // Rollback SNN: idem (handles V/refr).
+        if ts_version != 0 {
+            while self.snn_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.snn_snapshots.pop();
+            }
+            if self.snn_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.snn_snapshots.pop() {
+                    self.snn_layers = snap;
+                }
+            }
+        } else if let Some((_, snap)) = self.snn_snapshots.pop() {
+            self.snn_layers = snap;
         }
 
         self.stats.aborts += 1;
@@ -1670,13 +1972,20 @@ impl Vm {
     fn exec_sense(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
         let peripheral = instr.rsrc1;
         let data: Vec<u8> = match peripheral {
-            SENSE_AUDIO => {
+            SENSE_AUDIO | SENSE_AUDIO_PCM => {
                 // F2 Mimi: frame determinístico 24kHz/80ms (1920 samples senoide
                 // 440Hz) em vez de white-noise rand. Mesmo bytes por chamada,
                 // codificável via `crate::mimi::encode_frame` (16cb@12.5Hz).
+                // SENSE_AUDIO_PCM (6) é alias explícito p/ CODEC_ENC.
                 let frame = crate::mimi::synth_frame_440hz();
                 debug_assert_eq!(frame.len(), crate::mimi::MIMI_SAMPLES_PER_FRAME);
                 crate::mimi::pcm_to_bytes(&frame)
+            }
+            SENSE_CODEC_FRAME => {
+                // Frame já codificado Mimi: 32B LE (16xu16) do synth 440Hz.
+                let frame = crate::mimi::synth_frame_440hz();
+                let codes = crate::mimi::encode_frame(&frame);
+                crate::mimi::codes_to_bytes(&codes).to_vec()
             }
             SENSE_VAD => {
                 // VAD stub: 1 byte 0/1 aleatório + timestamp
@@ -1791,12 +2100,9 @@ impl Vm {
     }
 
     fn exec_silu(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
-        eprintln!("[silu enter] rdest {} rsrc1 {} rsrc2 {} rsrc3 {}", instr.rdest, instr.rsrc1, instr.rsrc2, instr.rsrc3);
         let src = {
             let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
-            let v = ctx.reg(instr.rsrc1);
-            eprintln!("[silu] reg {} -> {:?}", instr.rsrc1, v);
-            v?
+            ctx.reg(instr.rsrc1)?
         };
         let meta = self.memory.get_tensor_meta(src).cloned().ok_or_else(|| anyhow!("SILU: tensor 0x{:x} não encontrado", src))?;
         let n: usize = meta.shape.iter().product();
@@ -1810,6 +2116,1518 @@ impl Vm {
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
             ctx.set_reg(instr.rdest, out_addr)?;
         }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Novos opcodes 0x13..0x19 (Mamba / Codec / Align / CtxSwitch / RoPE)
+    // -----------------------------------------------------------------------
+
+    /// Garante `ssm_states[layer]` compatível com (di, ds); preserva d_conv.
+    fn ensure_ssm_state(&mut self, layer: usize, d_inner: usize, d_state: usize) {
+        if self.ssm_states.len() <= layer {
+            self.ssm_states.resize_with(layer + 1, || crate::ssm::MambaState::new(d_inner, d_state, 4));
+        }
+        let st = &mut self.ssm_states[layer];
+        if !st.is_compatible(d_inner, d_state, st.d_conv) {
+            let dc = st.d_conv;
+            *st = crate::ssm::MambaState::new(d_inner, d_state, dc);
+        }
+    }
+
+    /// Lê pack de params do SSM: dt[di]+A[di*ds]+B[ds]+C[ds]+D[di].
+    /// Retorna `None` se pack ausente/incompatível (caller usa defaults).
+    fn read_ssm_pack(&self, pack_addr: u128, d_inner: usize, d_state: usize) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let meta = self.memory.get_tensor_meta(pack_addr)?;
+        let n: usize = meta.shape.iter().product();
+        let expect = d_inner + d_inner * d_state + d_state + d_state + d_inner;
+        if n != expect {
+            return None;
+        }
+        let v = self.memory.read_f32_tensor(pack_addr, n).ok()?;
+        let mut off = 0;
+        let dt = v[off..off + d_inner].to_vec(); off += d_inner;
+        let a = v[off..off + d_inner * d_state].to_vec(); off += d_inner * d_state;
+        let b = v[off..off + d_state].to_vec(); off += d_state;
+        let c = v[off..off + d_state].to_vec(); off += d_state;
+        let d = v[off..off + d_inner].to_vec();
+        Some((dt, a, b, c, d))
+    }
+
+    fn default_ssm_pack(&self, d_inner: usize, d_state: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        // Defaults determinísticos p/ demo sem pack: dt=1, A=-1, B=1, C=1, D=0.
+        // Coincidem com o golden `ssm.rs::test_scan_decay_and_leak`.
+        (vec![1.0; d_inner], vec![-1.0; d_inner * d_state], vec![1.0; d_state], vec![1.0; d_state], vec![0.0; d_inner])
+    }
+
+    fn exec_ssm_scan(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        // Flags CONV/GATE são reservadas: falhar explícito em vez de ignorar
+        // silenciosamente (evita programa que parece fazer conv/gate sem fazer).
+        if instr.flags & crate::opcodes::SSM_SCAN_FLAG_CONV != 0 {
+            return Err(anyhow!("SSM_SCAN CONV ainda não implementado (use scan puro + MATVEC p/ conv depthwise)"));
+        }
+        if instr.flags & crate::opcodes::SSM_SCAN_FLAG_GATE != 0 {
+            return Err(anyhow!("SSM_SCAN GATE ainda não implementado (use SILU+MUL explícitos p/ gating)"));
+        }
+        let (d_inner, d_state, layer_id) = instr.ssm_dims();
+        if d_inner == 0 || d_state == 0 || d_inner > 16384 || d_state > 1024 {
+            return Err(anyhow!("SSM_SCAN dims inválidas di={} ds={}", d_inner, d_state));
+        }
+        let (x_addr, h_addr, p_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2).unwrap_or(0), ctx.reg(instr.rsrc3).unwrap_or(0))
+        };
+        // x: tensor [1,di] (ou produto==di); trunca/pad para di.
+        let x_meta = self.memory.get_tensor_meta(x_addr).cloned()
+            .ok_or_else(|| anyhow!("SSM_SCAN: x tensor 0x{:x} não encontrado", x_addr))?;
+        let nx: usize = x_meta.shape.iter().product();
+        let mut x = self.memory.read_f32_tensor(x_addr, nx)?;
+        x.resize(d_inner, 0.0);
+        x.truncate(d_inner);
+        // params: pack tensor ou defaults.
+        let (dt, a, b, c, d) = if p_addr != 0 && self.memory.get_tensor_meta(p_addr).is_some() {
+            self.read_ssm_pack(p_addr, d_inner, d_state).unwrap_or_else(|| self.default_ssm_pack(d_inner, d_state))
+        } else {
+            self.default_ssm_pack(d_inner, d_state)
+        };
+        let y = if instr.rsrc2 == 0xFF {
+            // Path híbrido: estado na Vm (fase 2), indexado por layer_id.
+            let layer = layer_id as usize;
+            self.ensure_ssm_state(layer, d_inner, d_state);
+            let st = &mut self.ssm_states[layer];
+            debug_assert_eq!(st.ssm.len(), d_inner * d_state);
+            crate::ssm::selective_scan_update(&mut st.ssm, &x, &dt, &a, &b, &c, &d, d_inner, d_state)
+        } else {
+            // Path tensor puro (MVP): h é tensor [di,ds] atualizado in-place.
+            let h_meta = self.memory.get_tensor_meta(h_addr).cloned()
+                .ok_or_else(|| anyhow!("SSM_SCAN: h tensor 0x{:x} não encontrado", h_addr))?;
+            let nh: usize = h_meta.shape.iter().product();
+            if nh != d_inner * d_state {
+                return Err(anyhow!("SSM_SCAN: h shape {:?} != [{} x {}]", h_meta.shape, d_inner, d_state));
+            }
+            let mut h = self.memory.read_f32_tensor(h_addr, nh)?;
+            let y = crate::ssm::selective_scan_update(&mut h, &x, &dt, &a, &b, &c, &d, d_inner, d_state);
+            self.memory.write_f32_tensor(h_addr, &h)?;
+            y
+        };
+        let out_addr = self.memory.alloc_tensor(&[1, d_inner], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &y)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.ssm_scans += 1;
+        log_debug("ssm", &format!("ctx {} SSM_SCAN di={} ds={} layer={} -> 0x{:x}", ctx_id, d_inner, d_state, layer_id, out_addr));
+        Ok(())
+    }
+
+    fn exec_ssm_reset(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (d_inner, d_state, layer_id) = instr.ssm_dims();
+        if instr.rsrc1 == 0xFF {
+            let layer = layer_id as usize;
+            self.ensure_ssm_state(layer, d_inner.max(1), d_state.max(1));
+            self.ssm_states[layer].reset();
+        } else {
+            let h_addr = {
+                let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+                ctx.reg(instr.rsrc1)?
+            };
+            if let Some(meta) = self.memory.get_tensor_meta(h_addr).cloned() {
+                let n: usize = meta.shape.iter().product();
+                self.memory.write_f32_tensor(h_addr, &vec![0.0; n])?;
+            } else {
+                let layer = layer_id as usize;
+                self.ensure_ssm_state(layer, d_inner.max(1), d_state.max(1));
+                self.ssm_states[layer].reset();
+            }
+        }
+        self.stats.ssm_resets += 1;
+        log_debug("ssm", &format!("ctx {} SSM_RESET layer={}", ctx_id, layer_id));
+        Ok(())
+    }
+
+    /// Lê PCM 1920xf32 de um addr (tensor f32 ou bytes TEMPORAL LE).
+    fn read_pcm_frame(&self, addr: u128) -> Result<Vec<f32>> {
+        use crate::mimi::MIMI_SAMPLES_PER_FRAME;
+        if let Some(meta) = self.memory.get_tensor_meta(addr).cloned() {
+            let n: usize = meta.shape.iter().product();
+            let mut v = self.memory.read_f32_tensor(addr, n)?;
+            v.resize(MIMI_SAMPLES_PER_FRAME, 0.0);
+            v.truncate(MIMI_SAMPLES_PER_FRAME);
+            return Ok(v);
+        }
+        // Fallback bytes (SENSE AUDIO_PCM em TEMPORAL).
+        let raw = self.memory.read(addr, MIMI_SAMPLES_PER_FRAME * 4)?;
+        let mut v = crate::mimi::pcm_from_bytes(&raw);
+        v.resize(MIMI_SAMPLES_PER_FRAME, 0.0);
+        v.truncate(MIMI_SAMPLES_PER_FRAME);
+        Ok(v)
+    }
+
+    /// Lê 16 códigos de um addr (tensor [1,16] f32 ou 32B LE).
+    fn read_codes(&self, addr: u128) -> Result<crate::mimi::MimiCodes> {
+        use crate::mimi::{MIMI_CODEBOOK_SIZE, MIMI_N_CODEBOOKS};
+        if let Some(meta) = self.memory.get_tensor_meta(addr).cloned() {
+            let n: usize = meta.shape.iter().product();
+            let v = self.memory.read_f32_tensor(addr, n)?;
+            let mut codes = [0u16; MIMI_N_CODEBOOKS];
+            for (i, c) in codes.iter_mut().enumerate() {
+                let f = v.get(i).copied().unwrap_or(0.0).round() as i32;
+                *c = f.clamp(0, (MIMI_CODEBOOK_SIZE - 1) as i32) as u16;
+            }
+            return Ok(codes);
+        }
+        let raw = self.memory.read(addr, MIMI_N_CODEBOOKS * 2)?;
+        crate::mimi::codes_from_bytes(&raw).ok_or_else(|| anyhow!("CODEC: codes inválidos em 0x{:x}", addr))
+    }
+
+    fn exec_codec_enc(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::CODEC_FLAG_AS_TENSOR;
+        let pcm_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let pcm = self.read_pcm_frame(pcm_addr)?;
+        let codes = crate::mimi::encode_frame(&pcm);
+        let as_tensor = instr.flags & CODEC_FLAG_AS_TENSOR != 0;
+        let out_addr = if as_tensor {
+            let a = self.memory.alloc_tensor(&[1, codes.len()], crate::memory::DType::F32)?;
+            let f: Vec<f32> = codes.iter().map(|&c| c as f32).collect();
+            self.memory.write_f32_tensor(a, &f)?;
+            a
+        } else {
+            let b = crate::mimi::codes_to_bytes(&codes);
+            self.memory.temporal_push(&b)?
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.codec_encs += 1;
+        log_debug("codec", &format!("ctx {} CODEC_ENC 0x{:x} -> 0x{:x}", ctx_id, pcm_addr, out_addr));
+        Ok(())
+    }
+
+    fn exec_codec_dec(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::CODEC_FLAG_AS_TENSOR;
+        let codes_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let codes = self.read_codes(codes_addr)?;
+        let frame = crate::mimi::decode_frame(&codes);
+        let as_tensor = instr.flags & CODEC_FLAG_AS_TENSOR != 0;
+        let out_addr = if as_tensor {
+            let a = self.memory.alloc_tensor(&[1, frame.len()], crate::memory::DType::F32)?;
+            self.memory.write_f32_tensor(a, &frame)?;
+            a
+        } else {
+            let b = crate::mimi::pcm_to_bytes(&frame);
+            self.memory.temporal_push(&b)?
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.codec_decs += 1;
+        log_debug("codec", &format!("ctx {} CODEC_DEC 0x{:x} -> 0x{:x}", ctx_id, codes_addr, out_addr));
+        Ok(())
+    }
+
+    /// Lê timestamp u64 de um registrador: tensor `[n]` (primeiro `f32`),
+    /// bytes `TEMPORAL` (8B LE), ou o valor imediato do registrador.
+    /// Bytes só são lidos quando a região é `TEMPORAL` — nunca de `GLOBAL`,
+    /// para não interpretar peso/tensor como timestamp.
+    fn read_ts(&self, addr_or_imm: u128) -> u64 {
+        if let Some(meta) = self.memory.get_tensor_meta(addr_or_imm).cloned() {
+            let n: usize = meta.shape.iter().product();
+            if let Ok(v) = self.memory.read_f32_tensor(addr_or_imm, n) {
+                if let Some(&f) = v.first() {
+                    return f as u64;
+                }
+            }
+            return 0;
+        }
+        if crate::memory::region_of(addr_or_imm) == crate::memory::Region::Temporal {
+            if let Ok(raw) = self.memory.read(addr_or_imm, 8) {
+                if raw.len() >= 8 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&raw[..8]);
+                    return u64::from_le_bytes(b);
+                }
+            }
+            return 0;
+        }
+        // Imediato: valor do registrador é o próprio timestamp.
+        addr_or_imm as u64
+    }
+
+    fn exec_audio_align(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (u_addr, ai_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let t_user = self.read_ts(u_addr);
+        let t_ai = self.read_ts(ai_addr);
+        let delta = t_ai.wrapping_sub(t_user);
+        // frame_id = delta_ms / 80ms (Mimi frame). Usa u64 ns.
+        let delta_ms = (t_ai.saturating_sub(t_user)) as f64 / 1_000_000.0;
+        let frame_id = (delta_ms / 80.0).floor() as u64;
+        let out = vec![t_user as f32, t_ai as f32, delta as f32, frame_id as f32];
+        let out_addr = self.memory.alloc_tensor(&[1, 4], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.audio_aligns += 1;
+        log_debug("audio", &format!("ctx {} AUDIO_ALIGN tu={} tai={} d={} f={}", ctx_id, t_user, t_ai, delta, frame_id));
+        Ok(())
+    }
+
+    fn exec_ctx_switch(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        // Pipe canônico via payload+MAGIC (ver instr_ctx_switch); rsrc1 é legado.
+        let pipe = crate::opcodes::ctx_switch_pipe(instr);
+        if pipe > 2 {
+            return Err(anyhow!("CTX_SWITCH pipe inválido {} (use MAMBA/TRANSFORMER/AUDIO)", pipe));
+        }
+        let prio = Priority::from_flags(instr.flags);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.pipeline = pipe;
+            // Só re-enfileira se prioridade mudou (evita duplicar fila no path comum).
+            if ctx.priority != prio {
+                ctx.priority = prio;
+            }
+        }
+        // Fence: checkpoint de memória p/ rollback + reavalia preempção.
+        let v = self.memory.snapshot();
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.root_version = v;
+        }
+        self.scheduler.maybe_preempt();
+        self.stats.ctx_switches += 1;
+        log_debug("ctx", &format!("ctx {} CTX_SWITCH pipe={} prio={} fence=v{}", ctx_id, pipe, prio, v));
+        Ok(())
+    }
+
+    fn exec_rope(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (pos, head_dim, n_heads, theta) = instr.rope_params();
+        if head_dim % 2 != 0 || head_dim == 0 {
+            return Err(anyhow!("ROPE head_dim inválido {}", head_dim));
+        }
+        let src_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let meta = self.memory.get_tensor_meta(src_addr).cloned()
+            .ok_or_else(|| anyhow!("ROPE: tensor 0x{:x} não encontrado", src_addr))?;
+        let n: usize = meta.shape.iter().product();
+        if n % (n_heads * head_dim) != 0 && n != n_heads * head_dim {
+            return Err(anyhow!("ROPE shape {:?} incompatível com n_heads={} head_dim={}", meta.shape, n_heads, head_dim));
+        }
+        let mut v = self.memory.read_f32_tensor(src_addr, n)?;
+        // freqs por posição (mesma fórmula de moshi.rs/inference.rs).
+        let half = head_dim / 2;
+        let freqs: Vec<(f32, f32)> = (0..half.max(1))
+            .map(|i| {
+                let f = pos as f32 * theta.powf(-2.0 * i as f32 / head_dim.max(1) as f32);
+                (f.cos(), f.sin())
+            })
+            .collect();
+        // Aplica por bloco [n_heads*head_dim] (suporta batch M>1).
+        let block = n_heads * head_dim;
+        for chunk in v.chunks_mut(block) {
+            crate::inference::apply_rope(chunk, n_heads, head_dim, &freqs);
+        }
+        let out_addr = self.memory.alloc_tensor(&meta.shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &v)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.ropes += 1;
+        log_debug("rope", &format!("ctx {} ROPE pos={} hd={} nh={} -> 0x{:x}", ctx_id, pos, head_dim, n_heads, out_addr));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0004: GATHER (0x1F) / DISTANCE (0x23) / RANK1_UPDATE (0x24)
+    // -----------------------------------------------------------------------
+
+    /// GATHER rD, rTable, rIdx [, rAcc] — indexação indireta N-D row-major.
+    /// Índices em f32 (interop com DISTANCE/SAMPLE-TOPK): devem ser integrais
+    /// e não-negativos; o limite é dim(axis) da tabela (GATHER) ou do
+    /// acumulador (scatter) — fora disso, erro determinístico (nunca wrap).
+    /// Denso apenas; tabela esparsa retorna erro explícito.
+    fn exec_gather(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{
+            GATHER_MODE_GATHER, GATHER_MODE_SCATTER_ADD, GATHER_MODE_SCATTER_MAX,
+        };
+        let (t_addr, i_addr, acc_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?, ctx.reg(instr.rsrc3).unwrap_or(0xFF))
+        };
+        let (axis, mode, _hint) = instr.gather_params();
+        let tmeta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("GATHER: tabela 0x{:x} não encontrada", t_addr))?;
+        if tmeta.is_sparse {
+            return Err(anyhow!("GATHER: tabela esparsa não suportada (RFC-0004: denso)"));
+        }
+        let rank = tmeta.shape.len();
+        if rank == 0 || (axis as usize) >= rank {
+            return Err(anyhow!("GATHER: axis {} inválido para rank {}", axis, rank));
+        }
+        let ax = axis as usize;
+        let imeta = self.memory.get_tensor_meta(i_addr).cloned()
+            .ok_or_else(|| anyhow!("GATHER: índices 0x{:x} não encontrados", i_addr))?;
+        if imeta.is_sparse {
+            return Err(anyhow!("GATHER: índices esparsos não suportados"));
+        }
+        let n_idx: usize = imeta.shape.iter().product();
+        let idata = self.memory.read_f32_tensor(i_addr, n_idx)?;
+        let dim: usize = tmeta.shape[ax];
+        let mut idx = Vec::with_capacity(n_idx);
+        for (j, &f) in idata.iter().enumerate() {
+            // Integralidade e não-negatividade sempre; o limite superior
+            // depende do modo (tabela no GATHER, acumulador no scatter).
+            if !f.is_finite() || f.fract() != 0.0 || f < 0.0 {
+                return Err(anyhow!("GATHER: índice inválido na posição {} (valor {})", j, f));
+            }
+            if mode == GATHER_MODE_GATHER && f as usize >= dim {
+                return Err(anyhow!("GATHER: índice OOB na posição {} (valor {}, dim {})", j, f, dim));
+            }
+            idx.push(f as usize);
+        }
+        let outer: usize = tmeta.shape[..ax].iter().product();
+        let inner: usize = tmeta.shape[ax + 1..].iter().product();
+        // Eixo da tabela/valores em rsrc1: `dim` (tabela cheia, modo GATHER)
+        // ou `n_idx` (valores a espalhar, modo scatter). Leitura usa o real.
+        let t_ax = tmeta.shape[ax];
+        let tflat = self.memory.read_f32_tensor(t_addr, outer * t_ax * inner)?;
+        let mut out_shape = tmeta.shape.clone();
+        out_shape[ax] = n_idx;
+        let out: Vec<f32> = match mode {
+            GATHER_MODE_GATHER => {
+                let mut v = vec![0.0f32; outer * n_idx * inner];
+                for o in 0..outer {
+                    for (j, &r) in idx.iter().enumerate() {
+                        for k in 0..inner {
+                            v[(o * n_idx + j) * inner + k] = tflat[(o * dim + r) * inner + k];
+                        }
+                    }
+                }
+                v
+            }
+            GATHER_MODE_SCATTER_ADD | GATHER_MODE_SCATTER_MAX => {
+                if instr.rsrc3 == 0xFF {
+                    return Err(anyhow!("GATHER: modo scatter exige acumulador em rsrc3"));
+                }
+                let ameta = self.memory.get_tensor_meta(acc_addr).cloned()
+                    .ok_or_else(|| anyhow!("GATHER: acumulador 0x{:x} não encontrado", acc_addr))?;
+                if ameta.is_sparse {
+                    return Err(anyhow!("GATHER: acumulador esparso não suportado"));
+                }
+                // Valores (rsrc1): eixo = n_idx; demais eixos = shape do acumulador.
+                if t_ax != n_idx {
+                    return Err(anyhow!("GATHER: scatter espera valores com eixo {} = n_idx {}, achado {}", ax, n_idx, t_ax));
+                }
+                if ameta.shape.len() != rank {
+                    return Err(anyhow!("GATHER: acumulador rank {} != rank {} da tabela", ameta.shape.len(), rank));
+                }
+                for (a, (&vs, &as_)) in tmeta.shape.iter().zip(ameta.shape.iter()).enumerate() {
+                    if a != ax && vs != as_ {
+                        return Err(anyhow!("GATHER: eixo {}: valores {} != acumulador {}", a, vs, as_));
+                    }
+                }
+                let dst_dim: usize = ameta.shape[ax];
+                let mut v = self.memory.read_f32_tensor(acc_addr, outer * dst_dim * inner)?;
+                let vals = tflat; // rsrc1 = valores no modo scatter
+                for o in 0..outer {
+                    for (j, &r) in idx.iter().enumerate() {
+                        if r >= dst_dim {
+                            return Err(anyhow!("GATHER: índice scatter OOB na posição {} (valor {}, dim {})", j, r, dst_dim));
+                        }
+                        for k in 0..inner {
+                            let dst = (o * dst_dim + r) * inner + k;
+                            let src = (o * n_idx + j) * inner + k;
+                            if mode == GATHER_MODE_SCATTER_ADD {
+                                v[dst] += vals[src];
+                            } else {
+                                v[dst] = v[dst].max(vals[src]);
+                            }
+                        }
+                    }
+                }
+                out_shape = ameta.shape.clone(); // scatter devolve o shape cheio
+                v
+            }
+            _ => return Err(anyhow!("GATHER: MODE {} inválido (0/1/2)", mode)),
+        };
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.gather_execs += 1;
+        log_debug("gather", &format!("ctx {} GATHER axis={} mode={} n={} -> 0x{:x}", ctx_id, axis, mode, n_idx, out_addr));
+        Ok(())
+    }
+
+    /// DISTANCE rD, rQuery[1,D], rBank[N,D] — 4 métricas + top-k fundido.
+    /// Semântica de "distância" (menor = mais próximo): EUCLID=L2,
+    /// COSINE=1-cos (norma zero => 1.0), MANHATTAN=L1, DOT=-dot.
+    /// TOPK=0: saída [1,N] em ordem; TOPK=T: saída [1,2T] (dists, índices
+    /// como f32, exatos para N<2^24), desempate por menor índice.
+    fn exec_distance(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{
+            DIST_METRIC_COSINE, DIST_METRIC_DOT, DIST_METRIC_EUCLID, DIST_METRIC_MANHATTAN,
+        };
+        let (q_addr, b_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let (metric, topk) = instr.distance_params();
+        if !matches!(metric, DIST_METRIC_EUCLID | DIST_METRIC_COSINE | DIST_METRIC_MANHATTAN | DIST_METRIC_DOT) {
+            return Err(anyhow!("DISTANCE: METRIC {} inválida (0-3)", metric));
+        }
+        let qmeta = self.memory.get_tensor_meta(q_addr).cloned()
+            .ok_or_else(|| anyhow!("DISTANCE: query 0x{:x} não encontrada", q_addr))?;
+        let bmeta = self.memory.get_tensor_meta(b_addr).cloned()
+            .ok_or_else(|| anyhow!("DISTANCE: banco 0x{:x} não encontrado", b_addr))?;
+        if qmeta.is_sparse || bmeta.is_sparse {
+            return Err(anyhow!("DISTANCE: esparso não suportado (RFC-0004: denso)"));
+        }
+        if qmeta.shape.len() != 2 || qmeta.shape[0] != 1 {
+            return Err(anyhow!("DISTANCE: query deve ser [1,D], achado {:?}", qmeta.shape));
+        }
+        if bmeta.shape.len() != 2 || bmeta.shape[1] != qmeta.shape[1] {
+            return Err(anyhow!("DISTANCE: banco deve ser [N,D] com D={}, achado {:?}", qmeta.shape[1], bmeta.shape));
+        }
+        let d = qmeta.shape[1];
+        let n = bmeta.shape[0];
+        if n == 0 || d == 0 {
+            return Err(anyhow!("DISTANCE: query/banco vazios (N={}, D={})", n, d));
+        }
+        let q = self.memory.read_f32_tensor(q_addr, d)?;
+        let bank = self.memory.read_f32_tensor(b_addr, n * d)?;
+        let qnorm2: f32 = q.iter().map(|x| x * x).sum();
+        let mut dists = Vec::with_capacity(n);
+        for i in 0..n {
+            let row = &bank[i * d..(i + 1) * d];
+            let dist = match metric {
+                DIST_METRIC_EUCLID => row.iter().zip(q.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt(),
+                DIST_METRIC_MANHATTAN => row.iter().zip(q.iter()).map(|(a, b)| (a - b).abs()).sum(),
+                DIST_METRIC_DOT => -row.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>(),
+                _ => {
+                    let rn: f32 = row.iter().map(|x| x * x).sum();
+                    if qnorm2 == 0.0 || rn == 0.0 {
+                        1.0
+                    } else {
+                        let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                        1.0 - dot / (qnorm2.sqrt() * rn.sqrt())
+                    }
+                }
+            };
+            dists.push(if dist.is_finite() { dist } else { f32::MAX });
+        }
+        let (out_shape, out): (Vec<usize>, Vec<f32>) = if topk == 0 {
+            (vec![1, n], dists)
+        } else {
+            let t = (topk as usize).min(n);
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| {
+                dists[a].partial_cmp(&dists[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+            });
+            order.truncate(t);
+            let mut v = Vec::with_capacity(2 * t);
+            v.extend(order.iter().map(|&i| dists[i]));
+            v.extend(order.iter().map(|&i| i as f32));
+            (vec![1, 2 * t], v)
+        };
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.distance_execs += 1;
+        log_debug("distance", &format!("ctx {} DISTANCE metric={} topk={} N={} D={} -> 0x{:x}", ctx_id, metric, topk, n, d, out_addr));
+        Ok(())
+    }
+
+    /// RANK1_UPDATE rH[d,k], rV[d], rK[k] — H' CoW (logicamente in-place).
+    /// hebbian: H'=αH+β·v⊗k · delta: H'=αH+β·((v−Hk)⊗k)/(1+β‖k‖²) ·
+    /// forget: H'=α·(m⊙H)+β·v⊗k (m=rsrc3 ou 1; α validado em (0,1]).
+    /// Novo H alocado por passo; handle da camada religado (I-Persist-safe).
+    fn exec_rank1_update(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{RANK1_MODE_DELTA, RANK1_MODE_FORGET, RANK1_MODE_HEBBIAN};
+        let h_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rdest)?
+        };
+        let (v_addr, k_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let (alpha, beta, mode, layer) = instr.rank1_params();
+        if !matches!(mode, RANK1_MODE_HEBBIAN | RANK1_MODE_DELTA | RANK1_MODE_FORGET) {
+            return Err(anyhow!("RANK1_UPDATE: MODE {} inválido (0/1/2)", mode));
+        }
+        if !(alpha.is_finite() && beta.is_finite()) {
+            return Err(anyhow!("RANK1_UPDATE: ALPHA/BETA não-finitos"));
+        }
+        let hmeta = self.memory.get_tensor_meta(h_addr).cloned()
+            .ok_or_else(|| anyhow!("RANK1_UPDATE: H 0x{:x} não encontrado", h_addr))?;
+        if hmeta.is_sparse || hmeta.shape.len() != 2 {
+            return Err(anyhow!("RANK1_UPDATE: H deve ser denso [d,k], achado {:?}", hmeta.shape));
+        }
+        let (dd, kk) = (hmeta.shape[0], hmeta.shape[1]);
+        let read_vec = |addr: u128, expect: usize, what: &str| -> Result<Vec<f32>> {
+            let m = self.memory.get_tensor_meta(addr).cloned()
+                .ok_or_else(|| anyhow!("RANK1_UPDATE: {} 0x{:x} não encontrado", what, addr))?;
+            if m.is_sparse {
+                return Err(anyhow!("RANK1_UPDATE: {} esparso não suportado", what));
+            }
+            let flat: usize = m.shape.iter().product();
+            if flat != expect {
+                return Err(anyhow!("RANK1_UPDATE: {} com {} elems, esperado {}", what, flat, expect));
+            }
+            self.memory.read_f32_tensor(addr, expect)
+        };
+        let v = read_vec(v_addr, dd, "V")?;
+        let k = read_vec(k_addr, kk, "K")?;
+        let h = self.memory.read_f32_tensor(h_addr, dd * kk)?;
+        let mask: Option<Vec<f32>> = if instr.rsrc3 != 0xFF {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            let m_addr = ctx.reg(instr.rsrc3)?;
+            Some(read_vec(m_addr, dd * kk, "máscara")?)
+        } else {
+            None
+        };
+        if mode == RANK1_MODE_FORGET {
+            if !(alpha > 0.0 && alpha <= 1.0) {
+                return Err(anyhow!("RANK1_UPDATE: FORGET exige ALPHA em (0,1], achado {}", alpha));
+            }
+            if mask.is_none() && (alpha - 1.0).abs() > f32::EPSILON {
+                // Sem máscara, FORGET escalar com α<1 ainda é definido; segue.
+            }
+        }
+        // Hk e ‖k‖² (compartilhados pelo modo delta).
+        let mut hk = vec![0.0f32; dd];
+        let mut knorm2 = 0.0f32;
+        for x in k.iter() {
+            knorm2 += x * x;
+        }
+        for i in 0..dd {
+            let mut s = 0.0f32;
+            for j in 0..kk {
+                s += h[i * kk + j] * k[j];
+            }
+            hk[i] = s;
+        }
+        let denom = 1.0 + beta * knorm2;
+        let mut out = vec![0.0f32; dd * kk];
+        for i in 0..dd {
+            for j in 0..kk {
+                let gate = mask.as_ref().map(|m| m[i * kk + j]).unwrap_or(1.0);
+                let upd = match mode {
+                    RANK1_MODE_DELTA => beta * (v[i] - hk[i]) * k[j] / denom,
+                    _ => beta * v[i] * k[j],
+                };
+                out[i * kk + j] = alpha * gate * h[i * kk + j] + upd;
+            }
+        }
+        if !out.iter().all(|x| x.is_finite()) {
+            return Err(anyhow!("RANK1_UPDATE: resultado não-finito (ALPHA/BETA/entradas?)"));
+        }
+        let new_addr = self.memory.alloc_tensor(&[dd, kk], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(new_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, new_addr)?;
+        }
+        self.rank1_layers.insert(layer, new_addr);
+        self.stats.rank1_execs += 1;
+        log_debug("rank1", &format!("ctx {} RANK1_UPDATE layer={} mode={} [{}x{}] 0x{:x} -> 0x{:x}", ctx_id, layer, mode, dd, kk, h_addr, new_addr));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0005: determinismo (0x60–0x66). Escalares via regs (u128, precedente
+    // SAMPLE); tensores como stream canônico f32-LE.
+    // -----------------------------------------------------------------------
+
+    fn exec_rng_seed(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let seed = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            if instr.rsrc1 != 0xFF {
+                ctx.reg(instr.rsrc1)? as u64
+            } else {
+                crate::determinism::DEFAULT_RNG_SEED
+            }
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.rng_state = seed;
+        }
+        self.stats.rng_seed_execs += 1;
+        log_debug("rng", &format!("ctx {} RNG_SEED 0x{:016x}", ctx_id, seed));
+        Ok(())
+    }
+
+    fn exec_rng_next(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let mut st = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.rng_state;
+        let v = crate::determinism::splitmix64(&mut st);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.rng_state = st;
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, v as u128)?;
+            }
+        }
+        self.stats.rng_next_execs += 1;
+        log_debug("rng", &format!("ctx {} RNG_NEXT 0x{:016x}", ctx_id, v));
+        Ok(())
+    }
+
+    fn exec_rng_uniform(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (a, b) = instr.uniform_range();
+        if !(a.is_finite() && b.is_finite() && a < b) {
+            return Err(anyhow!("RNG_UNIFORM: intervalo inválido [{}, {})", a, b));
+        }
+        let mut st = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.rng_state;
+        let x = crate::determinism::uniform_f32(&mut st, a, b);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.rng_state = st;
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, (x.to_bits() as u64) as u128)?;
+            }
+        }
+        self.stats.rng_uniform_execs += 1;
+        log_debug("rng", &format!("ctx {} RNG_UNIFORM [{},{}) -> {}", ctx_id, a, b, x));
+        Ok(())
+    }
+
+    fn exec_rng_normal(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (mean, std) = instr.normal_params();
+        if !(mean.is_finite() && std.is_finite() && std > 0.0) {
+            return Err(anyhow!("RNG_NORMAL: parâmetros inválidos (mean={}, std={})", mean, std));
+        }
+        let mut st = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.rng_state;
+        let x = crate::determinism::normal_f32(&mut st, mean, std);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.rng_state = st;
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, (x.to_bits() as u64) as u128)?;
+            }
+        }
+        self.stats.rng_normal_execs += 1;
+        log_debug("rng", &format!("ctx {} RNG_NORMAL({}, {}) -> {}", ctx_id, mean, std, x));
+        Ok(())
+    }
+
+    /// Stream canônico de bytes de um tensor denso: f32-LE concatenados.
+    /// Esparso e vazio são erro explícito (hash de identidade silenciosa
+    /// seria mentira de integridade).
+    fn tensor_canonical_bytes(&self, addr: u128, what: &str) -> Result<Vec<u8>> {
+        let m = self.memory.get_tensor_meta(addr).cloned()
+            .ok_or_else(|| anyhow!("{}: tensor 0x{:x} não encontrado", what, addr))?;
+        if m.is_sparse {
+            return Err(anyhow!("{}: tensor esparso não suportado", what));
+        }
+        let n: usize = m.shape.iter().product();
+        if n == 0 {
+            return Err(anyhow!("{}: tensor vazio não tem hash", what));
+        }
+        let v = self.memory.read_f32_tensor(addr, n)?;
+        let mut out = Vec::with_capacity(n * 4);
+        for x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    fn exec_hash(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let bytes = self.tensor_canonical_bytes(t_addr, "HASH")?;
+        let h = crate::determinism::fnv1a64(&bytes);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, h as u128)?;
+            }
+        }
+        self.stats.hash_execs += 1;
+        log_debug("hash", &format!("ctx {} HASH 0x{:x} ({}B) -> 0x{:016x}", ctx_id, t_addr, bytes.len(), h));
+        Ok(())
+    }
+
+    fn exec_checksum(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let bytes = self.tensor_canonical_bytes(t_addr, "CHECKSUM")?;
+        let c = crate::determinism::crc32_ieee(&bytes);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, c as u128)?;
+            }
+        }
+        self.stats.checksum_execs += 1;
+        log_debug("hash", &format!("ctx {} CHECKSUM 0x{:x} -> 0x{:08x}", ctx_id, t_addr, c));
+        Ok(())
+    }
+
+    fn exec_hmac(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (k_addr, m_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let key = self.tensor_canonical_bytes(k_addr, "HMAC(key)")?;
+        let msg = self.tensor_canonical_bytes(m_addr, "HMAC(msg)")?;
+        let t = crate::determinism::hmac_sha256_trunc64(&key, &msg);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, t as u128)?;
+            }
+        }
+        self.stats.hmac_execs += 1;
+        log_debug("hash", &format!("ctx {} HMAC -> 0x{:016x}", ctx_id, t));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0006: telemetria (0x6A–0x6F) + scheduler (0x70–0x77).
+    // -----------------------------------------------------------------------
+
+    fn exec_cycles_count(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let t = crate::utils::now_ns();
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, t as u128)?;
+            }
+        } else {
+            return Err(anyhow!("ctx {} não encontrado", ctx_id));
+        }
+        self.stats.cycles_execs += 1;
+        log_debug("tele", &format!("ctx {} CYCLES_COUNT {}", ctx_id, t));
+        Ok(())
+    }
+
+    fn exec_trace_event(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (ev, data) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2).unwrap_or(0))
+        };
+        if self.trace.len() >= TRACE_CAP {
+            self.trace.pop_front();
+        }
+        self.trace.push_back((ev as u64, data));
+        self.stats.trace_execs += 1;
+        log_debug("tele", &format!("ctx {} TRACE_EVENT ev={} data=0x{:x}", ctx_id, ev, data));
+        Ok(())
+    }
+
+    /// SANITY_CHECK rD, rT [, rCount]: copia CoW com não-finitos zerados;
+    /// rD = novo addr; rCount (!=0xFF) = nº de absorvidos.
+    fn exec_sanity_check(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("SANITY_CHECK: tensor 0x{:x} não encontrado", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("SANITY_CHECK: esparso não suportado"));
+        }
+        let n: usize = meta.shape.iter().product();
+        let data = self.memory.read_f32_tensor(t_addr, n)?;
+        let mut out = Vec::with_capacity(n);
+        let mut absorbed = 0u64;
+        for x in data {
+            if x.is_finite() {
+                out.push(x);
+            } else {
+                out.push(0.0);
+                absorbed += 1;
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&meta.shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+            if instr.rsrc3 != 0xFF {
+                ctx.set_reg(instr.rsrc3, absorbed as u128)?;
+            }
+        }
+        self.stats.sanity_execs += 1;
+        log_debug("tele", &format!("ctx {} SANITY_CHECK 0x{:x} absorvidos={} -> 0x{:x}", ctx_id, t_addr, absorbed, out_addr));
+        Ok(())
+    }
+
+    /// PREEMPT_CHECK rD: rdest <- interrupt_flag SEM consumir (poll puro;
+    /// IF_INTERRUPT consome — ver tese §3.15).
+    fn exec_preempt_check(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let flag = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.interrupt_flag;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, u128::from(flag))?;
+            }
+        }
+        self.stats.preempt_check_execs += 1;
+        log_debug("tele", &format!("ctx {} PREEMPT_CHECK {}", ctx_id, flag));
+        Ok(())
+    }
+
+    /// ASSERT Rs [CODE]: trap limpo (Err, sem commit parcial) se reg == 0.
+    fn exec_assert(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let v = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        if v == 0 {
+            return Err(anyhow!("ASSERT falhou (code {})", instr.assert_code()));
+        }
+        self.stats.assert_execs += 1;
+        log_debug("tele", &format!("ctx {} ASSERT ok", ctx_id));
+        Ok(())
+    }
+
+    /// DUMP: log de debug do contexto corrente (só o próprio ctx).
+    fn exec_dump(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let _ = instr;
+        if let Some(ctx) = self.scheduler.get(ctx_id) {
+            log_info("dump", &format!(
+                "ctx {} pc=0x{:x} root_v={} prio={} pipe={} deadline={} cmp={} irq={} regs={:x?}",
+                ctx.id, ctx.pc, ctx.root_version, ctx.priority.as_str(),
+                ctx.pipeline, ctx.deadline, ctx.cmp_equal, ctx.interrupt_flag, ctx.regs,
+            ));
+        } else {
+            return Err(anyhow!("ctx {} não encontrado", ctx_id));
+        }
+        self.stats.dump_execs += 1;
+        Ok(())
+    }
+
+    /// YIELD: cede + maybe_preempt (um RED em espera preempta não-RED).
+    fn exec_yield(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let _ = instr;
+        if self.scheduler.get(ctx_id).is_none() {
+            return Err(anyhow!("ctx {} não encontrado", ctx_id));
+        }
+        self.scheduler.maybe_preempt();
+        self.stats.yield_execs += 1;
+        log_debug("sched", &format!("ctx {} YIELD", ctx_id));
+        Ok(())
+    }
+
+    fn exec_set_deadline(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let dl = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)? as u64
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.deadline = dl;
+        }
+        self.stats.set_deadline_execs += 1;
+        log_debug("sched", &format!("ctx {} SET_DEADLINE {}", ctx_id, dl));
+        Ok(())
+    }
+
+    fn exec_get_deadline(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let dl = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.deadline;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, dl as u128)?;
+            }
+        }
+        self.stats.get_deadline_execs += 1;
+        log_debug("sched", &format!("ctx {} GET_DEADLINE {}", ctx_id, dl));
+        Ok(())
+    }
+
+    /// PRIORITY_SET: 0/1/2 válido, senão Err. Move de fila de verdade
+    /// (dequeue + set + enqueue + preempt) — mais estrito que CTX_SWITCH.
+    fn exec_priority_set(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::context::Priority;
+        let raw = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let prio = match raw {
+            0 => Priority::Green,
+            1 => Priority::Blue,
+            2 => Priority::Red,
+            _ => return Err(anyhow!("PRIORITY_SET: valor {} inválido (0/1/2)", raw)),
+        };
+        // Retira da fila antiga antes de trocar (evita dupla presença).
+        self.scheduler.dequeue_id(ctx_id);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.priority = prio;
+        }
+        self.scheduler.enqueue(ctx_id);
+        self.scheduler.maybe_preempt();
+        self.stats.priority_set_execs += 1;
+        log_debug("sched", &format!("ctx {} PRIORITY_SET {}", ctx_id, prio.as_str()));
+        Ok(())
+    }
+
+    fn exec_priority_get(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let p = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.priority;
+        let v = match p {
+            crate::context::Priority::Green => 0u128,
+            crate::context::Priority::Blue => 1u128,
+            crate::context::Priority::Red => 2u128,
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, v)?;
+            }
+        }
+        self.stats.priority_get_execs += 1;
+        log_debug("sched", &format!("ctx {} PRIORITY_GET {}", ctx_id, v));
+        Ok(())
+    }
+
+    /// LOCK: try-lock não-bloqueante. Livre ou próprio => adquire (reentrante
+    /// p/ o dono); de outro ctx => Err. Sem filas de espera (follow-up EDF).
+    fn exec_lock(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let id = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)? & 0xFFFF_FFFF) as u32
+        };
+        match self.locks.get(&id).copied() {
+            None => {
+                self.locks.insert(id, ctx_id);
+            }
+            Some(holder) if holder == ctx_id => {}
+            Some(holder) => {
+                return Err(anyhow!("LOCK {} retido por ctx {} (try-lock)", id, holder));
+            }
+        }
+        self.stats.lock_execs += 1;
+        log_debug("sched", &format!("ctx {} LOCK {} ok", ctx_id, id));
+        Ok(())
+    }
+
+    /// UNLOCK: libera se dono; senão Err (não-possuído / de outro).
+    fn exec_unlock(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let id = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)? & 0xFFFF_FFFF) as u32
+        };
+        match self.locks.get(&id).copied() {
+            Some(holder) if holder == ctx_id => {
+                self.locks.remove(&id);
+            }
+            Some(holder) => {
+                return Err(anyhow!("UNLOCK {} pertence a ctx {}", id, holder));
+            }
+            None => {
+                return Err(anyhow!("UNLOCK {} não retido", id));
+            }
+        }
+        self.stats.unlock_execs += 1;
+        log_debug("sched", &format!("ctx {} UNLOCK {} ok", ctx_id, id));
+        Ok(())
+    }
+
+    /// FENCE: marcador de visibilidade + compiler fence. Neste alvo não há
+    /// store buffer separado: documentado, não forjado (RFC-0006).
+    fn exec_fence(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let _ = instr;
+        if self.scheduler.get(ctx_id).is_none() {
+            return Err(anyhow!("ctx {} não encontrado", ctx_id));
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        self.stats.fence_execs += 1;
+        log_debug("sched", &format!("ctx {} FENCE", ctx_id));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0007: LOADI (0x78) / MOV (0x79).
+    // -----------------------------------------------------------------------
+
+    /// LOADI rD, imm — materializa literal u128 (payload[0..16]).
+    fn exec_loadi(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let imm = instr.imm_u128();
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, imm)?;
+            }
+        } else {
+            return Err(anyhow!("ctx {} não encontrado", ctx_id));
+        }
+        self.stats.loadi_execs += 1;
+        log_debug("ctrl", &format!("ctx {} LOADI r{} <- {}", ctx_id, instr.rdest, imm));
+        Ok(())
+    }
+
+    /// MOV rD, rS — copia registrador (aliasing, spill/fill, args).
+    fn exec_mov(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let v = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, v)?;
+            }
+        }
+        self.stats.mov_execs += 1;
+        log_debug("ctrl", &format!("ctx {} MOV r{} <- r{} ({})", ctx_id, instr.rdest, instr.rsrc1, v));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0010: KV_TRUNCATE (0x38). Wrapper fino sobre kv_cache_truncate
+    // (maquinário + cobertura de snapshot já existentes e testados).
+    // -----------------------------------------------------------------------
+
+    /// KV_TRUNCATE Rs_len [, STREAM=sid] — trunca TODAS as camadas p/
+    /// min(atual, len). len>=atual e cache vazio: no-op Ok. sid != 0: Err
+    /// explícito (17 streams é follow-up; sem truncamento parcial fantasma).
+    fn exec_kv_truncate(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let stream = instr.kv_stream();
+        if stream != 0 {
+            return Err(anyhow!("KV_TRUNCATE: STREAM={} não suportado (single-stream; 17 streams é follow-up)", stream));
+        }
+        let len = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)? as usize
+        };
+        self.memory.kv_cache_truncate(len);
+        self.stats.kv_truncate_execs += 1;
+        log_debug("kv", &format!("ctx {} KV_TRUNCATE len={} seq={}", ctx_id, len, self.memory.kv_cache_seq_len()));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0013: DENOISE_STEP (0x21). Stateless por passo (função pura):
+    // estado multi-passo viaja em tensores (snapshots existentes cobrem).
+    // -----------------------------------------------------------------------
+
+    /// DENOISE_STEP rD, rX, rE — x_{t-1} = (x_t - coef*eps)/sqrt(α) + σz.
+    /// DDPM ancestral (Ho et al. 2020); σ=0 determinístico e NÃO consome RNG.
+    /// rsrc3 != 0xFF: Err explícito (schedule futuro). Resultado não-finito:
+    /// trap (fail-closed, mesma regra de RANK1/FOREST).
+    fn exec_denoise_step(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rsrc3 != 0xFF {
+            return Err(anyhow!("DENOISE_STEP: rsrc3 com tensor de schedule não suportado (use 0xFF)"));
+        }
+        let (x_addr, e_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let (alpha_bar, beta, sigma, timestep) = instr.denoise_params();
+        if !(alpha_bar.is_finite() && alpha_bar > 0.0 && alpha_bar <= 1.0) {
+            return Err(anyhow!("DENOISE_STEP: ALPHA_BAR {} inválido (0,1]", alpha_bar));
+        }
+        if !(beta.is_finite() && beta >= 0.0 && beta < 1.0) {
+            return Err(anyhow!("DENOISE_STEP: BETA {} inválido [0,1)", beta));
+        }
+        if !(sigma.is_finite() && sigma >= 0.0) {
+            return Err(anyhow!("DENOISE_STEP: SIGMA {} inválido (>=0)", sigma));
+        }
+        let alpha = 1.0 - beta;
+        if alpha <= 0.0 {
+            return Err(anyhow!("DENOISE_STEP: ALPHA derivado {} inválido", alpha));
+        }
+        let xmeta = self.memory.get_tensor_meta(x_addr).cloned()
+            .ok_or_else(|| anyhow!("DENOISE_STEP: x 0x{:x} não encontrado", x_addr))?;
+        let emeta = self.memory.get_tensor_meta(e_addr).cloned()
+            .ok_or_else(|| anyhow!("DENOISE_STEP: eps 0x{:x} não encontrado", e_addr))?;
+        if xmeta.is_sparse || emeta.is_sparse {
+            return Err(anyhow!("DENOISE_STEP: esparso não suportado"));
+        }
+        if xmeta.shape != emeta.shape {
+            return Err(anyhow!("DENOISE_STEP: shapes {:?} != {:?}", xmeta.shape, emeta.shape));
+        }
+        let n: usize = xmeta.shape.iter().product();
+        if n == 0 {
+            return Err(anyhow!("DENOISE_STEP: tensor vazio"));
+        }
+        let x = self.memory.read_f32_tensor(x_addr, n)?;
+        let e = self.memory.read_f32_tensor(e_addr, n)?;
+        let one_minus_bar = 1.0 - alpha_bar;
+        if one_minus_bar <= 0.0 && e.iter().any(|v| *v != 0.0) {
+            return Err(anyhow!("DENOISE_STEP: ALPHA_BAR=1 com eps não-nulo (divisão por zero)"));
+        }
+        let coef = if one_minus_bar <= 0.0 { 0.0 } else { beta / one_minus_bar.sqrt() };
+        let inv_sqrt_alpha = 1.0 / alpha.sqrt();
+        // Draw estocástico SOMENTE se sigma > 0 (sigma=0 não toca no RNG).
+        let mut noise = vec![0.0f32; n];
+        if sigma > 0.0 {
+            let mut st = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?.rng_state;
+            for z in noise.iter_mut() {
+                *z = crate::determinism::normal_f32(&mut st, 0.0, 1.0);
+            }
+            if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+                ctx.rng_state = st;
+            }
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push((x[i] - coef * e[i]) * inv_sqrt_alpha + sigma * noise[i]);
+        }
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err(anyhow!("DENOISE_STEP: resultado não-finito (t={})", timestep));
+        }
+        let out_addr = self.memory.alloc_tensor(&xmeta.shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.denoise_execs += 1;
+        log_debug("denoise", &format!("ctx {} DENOISE_STEP t={} sigma={} -> 0x{:x}", ctx_id, timestep, sigma, out_addr));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0014: ODE_STEP (0x25). Stateless por passo; trajetórias em tensores.
+    // -----------------------------------------------------------------------
+
+    /// Campo f(x,u) = SILU(W·x + b + û), û = u com pad/truncate p/ n.
+    fn ode_field(x: &[f32], u: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
+        let n = x.len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut s = b[i];
+            for j in 0..n {
+                s += w[i * n + j] * x[j];
+            }
+            if i < u.len() {
+                s += u[i];
+            }
+            // SiLU: x·sigmoid(x), estável p/ |x| grande via ramo.
+            let g = if s >= 0.0 {
+                s / (1.0 + (-s).exp())
+            } else {
+                let e = s.exp();
+                s * e / (1.0 + e)
+            };
+            out.push(g);
+        }
+        out
+    }
+
+    /// ODE_STEP rD, rX, rU [, rWb] — x(t+dt) Euler/RK2/RK4.
+    /// rU=0xFF => sem controle; rWb=0xFF => campo default contrativo
+    /// (W=-0.1·I, b=0), documentado. Resultado não-finito: trap.
+    fn exec_ode_step(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{ODE_METHOD_EULER, ODE_METHOD_RK2, ODE_METHOD_RK4};
+        let (x_addr, u_addr, w_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            let xa = ctx.reg(instr.rsrc1)?;
+            let ua = if instr.rsrc2 != 0xFF { ctx.reg(instr.rsrc2)? } else { 0xFF };
+            let wa = if instr.rsrc3 != 0xFF { ctx.reg(instr.rsrc3)? } else { 0xFF };
+            (xa, ua, wa)
+        };
+        let (dt, method, _layer) = instr.ode_params();
+        if !(dt.is_finite() && dt > 0.0) {
+            return Err(anyhow!("ODE_STEP: DT {} inválido (>0)", dt));
+        }
+        if method != ODE_METHOD_EULER && method != ODE_METHOD_RK2 && method != ODE_METHOD_RK4 {
+            return Err(anyhow!("ODE_STEP: METHOD {} inválido (0/1/2)", method));
+        }
+        let xmeta = self.memory.get_tensor_meta(x_addr).cloned()
+            .ok_or_else(|| anyhow!("ODE_STEP: x 0x{:x} não encontrado", x_addr))?;
+        if xmeta.is_sparse {
+            return Err(anyhow!("ODE_STEP: esparso não suportado"));
+        }
+        let n: usize = xmeta.shape.iter().product();
+        if n == 0 {
+            return Err(anyhow!("ODE_STEP: estado vazio"));
+        }
+        let x = self.memory.read_f32_tensor(x_addr, n)?;
+        let u: Vec<f32> = if u_addr != 0xFF {
+            let um = self.memory.get_tensor_meta(u_addr).cloned()
+                .ok_or_else(|| anyhow!("ODE_STEP: u 0x{:x} não encontrado", u_addr))?;
+            if um.is_sparse {
+                return Err(anyhow!("ODE_STEP: controle esparso não suportado"));
+            }
+            let m: usize = um.shape.iter().product();
+            self.memory.read_f32_tensor(u_addr, m)?
+        } else {
+            Vec::new()
+        };
+        let (w, b): (Vec<f32>, Vec<f32>) = if w_addr != 0xFF {
+            let wm = self.memory.get_tensor_meta(w_addr).cloned()
+                .ok_or_else(|| anyhow!("ODE_STEP: pack Wb 0x{:x} não encontrado", w_addr))?;
+            if wm.is_sparse {
+                return Err(anyhow!("ODE_STEP: pack esparso não suportado"));
+            }
+            let flat: usize = wm.shape.iter().product();
+            if flat != n * (n + 1) {
+                return Err(anyhow!("ODE_STEP: pack com {} elems, esperado {} ([n,n+1])", flat, n * (n + 1)));
+            }
+            let pack = self.memory.read_f32_tensor(w_addr, flat)?;
+            (pack[..n * n].to_vec(), pack[n * n..].to_vec())
+        } else {
+            // Default contrativo: W=-0.1·I, b=0.
+            let mut w0 = vec![0.0f32; n * n];
+            for i in 0..n {
+                w0[i * n + i] = -0.1;
+            }
+            (w0, vec![0.0f32; n])
+        };
+        let f = |s: &[f32]| Self::ode_field(s, &u, &w, &b);
+        let fx = f(&x);
+        let out: Vec<f32> = match method {
+            ODE_METHOD_EULER => x.iter().zip(fx.iter()).map(|(a, k)| a + dt * k).collect(),
+            ODE_METHOD_RK2 => {
+                let mid: Vec<f32> = x.iter().zip(fx.iter()).map(|(a, k)| a + dt * 0.5 * k).collect();
+                let k2 = f(&mid);
+                x.iter().zip(k2.iter()).map(|(a, k)| a + dt * k).collect()
+            }
+            _ => {
+                let k1 = fx;
+                let s2: Vec<f32> = x.iter().zip(k1.iter()).map(|(a, k)| a + dt * 0.5 * k).collect();
+                let k2 = f(&s2);
+                let s3: Vec<f32> = x.iter().zip(k2.iter()).map(|(a, k)| a + dt * 0.5 * k).collect();
+                let k3 = f(&s3);
+                let s4: Vec<f32> = x.iter().zip(k3.iter()).map(|(a, k)| a + dt * k).collect();
+                let k4 = f(&s4);
+                x.iter()
+                    .zip(k1.iter())
+                    .zip(k2.iter())
+                    .zip(k3.iter())
+                    .zip(k4.iter())
+                    .map(|((((a, k1), k2), k3), k4)| a + dt * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0)
+                    .collect()
+            }
+        };
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err(anyhow!("ODE_STEP: resultado não-finito (dt={}, method={})", dt, method));
+        }
+        let out_addr = self.memory.alloc_tensor(&xmeta.shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.ode_execs += 1;
+        log_debug("ode", &format!("ctx {} ODE_STEP n={} dt={} m={} -> 0x{:x}", ctx_id, n, dt, method, out_addr));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0015: SPIKE_STEP (0x20). LIF discreto; estado em tensores CoW
+    // (V + refr), handles por camada com push/pop como rank1_layers.
+    // -----------------------------------------------------------------------
+
+    /// SPIKE_STEP rD, rV, rI [, rPack] — integrate-and-fire discreto.
+    /// rsrc1 (V) religado ao novo tensor (CoW); rdest = spikes [1,n] 0/1.
+    /// Pack [thresh,decay,reset,refr] vence payload. Refrão em countdown f32.
+    fn exec_spike_step(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (v_addr, i_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let (mut thresh, mut decay, mut reset, layer, mut refr_steps) = instr.spike_params();
+        if instr.rsrc3 != 0xFF {
+            let p_addr = {
+                let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+                ctx.reg(instr.rsrc3)?
+            };
+            let pmeta = self.memory.get_tensor_meta(p_addr).cloned()
+                .ok_or_else(|| anyhow!("SPIKE_STEP: pack 0x{:x} não encontrado", p_addr))?;
+            if pmeta.is_sparse {
+                return Err(anyhow!("SPIKE_STEP: pack esparso não suportado"));
+            }
+            let pflat: usize = pmeta.shape.iter().product();
+            if pflat != 4 {
+                return Err(anyhow!("SPIKE_STEP: pack com {} elems, esperado 4 [thresh,decay,reset,refr]", pflat));
+            }
+            let p = self.memory.read_f32_tensor(p_addr, 4)?;
+            thresh = p[0];
+            decay = p[1];
+            reset = p[2];
+            if !(p[3].is_finite() && p[3] >= 0.0 && p[3] <= 255.0 && p[3].fract() == 0.0) {
+                return Err(anyhow!("SPIKE_STEP: refr_steps {} inválido (0-255 integral)", p[3]));
+            }
+            refr_steps = p[3] as u8;
+        }
+        if !thresh.is_finite() {
+            return Err(anyhow!("SPIKE_STEP: THRESH não-finito"));
+        }
+        if !(decay.is_finite() && (0.0..=1.0).contains(&decay)) {
+            return Err(anyhow!("SPIKE_STEP: DECAY {} inválido [0,1]", decay));
+        }
+        if !reset.is_finite() {
+            return Err(anyhow!("SPIKE_STEP: RESET não-finito"));
+        }
+        let vmeta = self.memory.get_tensor_meta(v_addr).cloned()
+            .ok_or_else(|| anyhow!("SPIKE_STEP: V 0x{:x} não encontrado", v_addr))?;
+        let imeta = self.memory.get_tensor_meta(i_addr).cloned()
+            .ok_or_else(|| anyhow!("SPIKE_STEP: I 0x{:x} não encontrado", i_addr))?;
+        if vmeta.is_sparse || imeta.is_sparse {
+            return Err(anyhow!("SPIKE_STEP: esparso não suportado"));
+        }
+        let n: usize = vmeta.shape.iter().product();
+        let m: usize = imeta.shape.iter().product();
+        if n == 0 || m == 0 {
+            return Err(anyhow!("SPIKE_STEP: tensor vazio"));
+        }
+        if m != n {
+            return Err(anyhow!("SPIKE_STEP: V com {} elems != I com {} (shapes {:?} vs {:?})", n, m, vmeta.shape, imeta.shape));
+        }
+        let v = self.memory.read_f32_tensor(v_addr, n)?;
+        let inp = self.memory.read_f32_tensor(i_addr, n)?;
+        if !v.iter().chain(inp.iter()).all(|z| z.is_finite()) {
+            return Err(anyhow!("SPIKE_STEP: V/I não-finitos na entrada"));
+        }
+        // Refrão corrente: mapa da camada, ou zeros na 1ª execução.
+        let refr_cur: Vec<f32> = match self.snn_layers.get(&layer) {
+            Some((_, r_addr)) => {
+                let rm = self.memory.get_tensor_meta(*r_addr).cloned()
+                    .ok_or_else(|| anyhow!("SPIKE_STEP: refr da camada {} perdido", layer))?;
+                let rn: usize = rm.shape.iter().product();
+                if rn != n {
+                    return Err(anyhow!("SPIKE_STEP: refr da camada {} com {} elems, esperado {}", layer, rn, n));
+                }
+                self.memory.read_f32_tensor(*r_addr, n)?
+            }
+            None => vec![0.0f32; n],
+        };
+        let mut v_new = Vec::with_capacity(n);
+        let mut r_new = Vec::with_capacity(n);
+        let mut spikes = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut vv = (v[i] + inp[i]) * decay;
+            let mut rr = if refr_cur[i] > 0.0 { refr_cur[i] - 1.0 } else { 0.0 };
+            let fired = refr_cur[i] <= 0.0 && vv >= thresh;
+            if fired {
+                vv = reset;
+                rr = refr_steps as f32;
+                spikes.push(1.0);
+            } else {
+                spikes.push(0.0);
+            }
+            v_new.push(vv);
+            r_new.push(rr);
+        }
+        if !v_new.iter().all(|z| z.is_finite()) {
+            return Err(anyhow!("SPIKE_STEP: V resultante não-finito (layer {})", layer));
+        }
+        let shape1 = vec![1, n];
+        let v_addr_new = self.memory.alloc_tensor(&shape1, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(v_addr_new, &v_new)?;
+        let r_addr_new = self.memory.alloc_tensor(&shape1, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(r_addr_new, &r_new)?;
+        let s_addr = self.memory.alloc_tensor(&shape1, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(s_addr, &spikes)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rsrc1, v_addr_new)?;
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, s_addr)?;
+            }
+        }
+        self.snn_layers.insert(layer, (v_addr_new, r_addr_new));
+        self.stats.spike_execs += 1;
+        log_debug("spike", &format!("ctx {} SPIKE_STEP layer={} n={} spikes={} -> 0x{:x}", ctx_id, layer, n,
+            spikes.iter().filter(|&&s| s == 1.0).count(), s_addr));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0012: FOREST (0x22). Stateless (Family 1): sem snapshot, preempção
+    // descarta o chunk. Walk vetorizado com teto max_depth (terminação
+    // garantida mesmo p/ tabelas cíclicas).
+    // -----------------------------------------------------------------------
+
+    /// FOREST rD, rF, rT, rL — ensemble sobre tabela plana (ver RFC-0012).
+    /// Folha = left < 0; valor NaN em folha = Err (fail-closed).
+    fn exec_forest(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{FOREST_MODE_MEAN, FOREST_MODE_VOTE};
+        let (f_addr, t_addr, l_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?, ctx.reg(instr.rsrc3)?)
+        };
+        let (n_trees, max_depth, mode) = instr.forest_params();
+        if mode != FOREST_MODE_VOTE && mode != FOREST_MODE_MEAN {
+            return Err(anyhow!("FOREST: MODE {} inválido (0/1)", mode));
+        }
+        if n_trees == 0 || max_depth == 0 || max_depth > 16 {
+            return Err(anyhow!("FOREST: TREES/DEPTH fora da faixa"));
+        }
+        let fmeta = self.memory.get_tensor_meta(f_addr).cloned()
+            .ok_or_else(|| anyhow!("FOREST: features 0x{:x} não encontradas", f_addr))?;
+        let tmeta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("FOREST: tabela 0x{:x} não encontrada", t_addr))?;
+        let lmeta = self.memory.get_tensor_meta(l_addr).cloned()
+            .ok_or_else(|| anyhow!("FOREST: folhas 0x{:x} não encontradas", l_addr))?;
+        if fmeta.is_sparse || tmeta.is_sparse || lmeta.is_sparse {
+            return Err(anyhow!("FOREST: esparso não suportado"));
+        }
+        let n_feat: usize = fmeta.shape.iter().product();
+        if n_feat == 0 {
+            return Err(anyhow!("FOREST: features vazias"));
+        }
+        let stride = (1usize << max_depth) - 1;
+        let need_rows = (n_trees as usize) * stride;
+        let t_rows = if tmeta.shape.len() == 2 { tmeta.shape[0] } else { 0 };
+        let t_cols = if tmeta.shape.len() == 2 { tmeta.shape[1] } else { 0 };
+        if tmeta.shape.len() != 2 || t_cols != 4 || t_rows < need_rows {
+            return Err(anyhow!("FOREST: tabela deve ser [>={}, 4], achado {:?}", need_rows, tmeta.shape));
+        }
+        let l_flat: usize = lmeta.shape.iter().product();
+        if l_flat < need_rows {
+            return Err(anyhow!("FOREST: folhas com {} elems, esperado >={}", l_flat, need_rows));
+        }
+        let feats = self.memory.read_f32_tensor(f_addr, n_feat)?;
+        let table = self.memory.read_f32_tensor(t_addr, t_rows * 4)?;
+        let leaves = self.memory.read_f32_tensor(l_addr, l_flat)?;
+        let mut scores = Vec::with_capacity(n_trees as usize);
+        for t in 0..(n_trees as usize) {
+            let base = t * stride;
+            let mut node = 0usize;
+            let mut value = leaves[base];
+            for _ in 0..max_depth {
+                let row = base + node;
+                let fi = table[row * 4] as usize;
+                // feat_idx deve ser integral, finito e < F.
+                if !table[row * 4].is_finite() || table[row * 4].fract() != 0.0 || fi >= n_feat {
+                    return Err(anyhow!("FOREST: feat_idx inválido na árvore {} nó {}", t, node));
+                }
+                let (thresh, left, right) = (table[row * 4 + 1], table[row * 4 + 2], table[row * 4 + 3]);
+                if left < 0.0 {
+                    value = leaves[base + node];
+                    break;
+                }
+                if !left.is_finite() || !right.is_finite() || left.fract() != 0.0 || right.fract() != 0.0 {
+                    return Err(anyhow!("FOREST: filho inválido na árvore {} nó {}", t, node));
+                }
+                let (l, r) = (left as usize, right as usize);
+                if l >= stride || r >= stride {
+                    return Err(anyhow!("FOREST: filho OOB na árvore {} nó {} (stride {})", t, node, stride));
+                }
+                node = if feats[fi] > thresh { r } else { l };
+                value = leaves[base + node];
+            }
+            if !value.is_finite() {
+                return Err(anyhow!("FOREST: folha NaN/Inf na árvore {} (use SANITY_CHECK a montante)", t));
+            }
+            scores.push(value);
+        }
+        let (out_shape, out): (Vec<usize>, Vec<f32>) = if mode == FOREST_MODE_MEAN {
+            let m = scores.iter().sum::<f32>() / scores.len() as f32;
+            if !m.is_finite() {
+                return Err(anyhow!("FOREST: média não-finita"));
+            }
+            (vec![1, 1], vec![m])
+        } else {
+            (vec![1, scores.len()], scores)
+        };
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.forest_execs += 1;
+        log_debug("forest", &format!("ctx {} FOREST trees={} depth={} mode={} -> 0x{:x}", ctx_id, n_trees, max_depth, mode, out_addr));
         Ok(())
     }
 
@@ -2026,5 +3844,1375 @@ mod tests {
         assert_eq!(ctx2.reg(0).unwrap(), 0);
         assert_ne!(ctx2.reg(1).unwrap(), 0);
         assert_eq!(stats2.tensor_allocs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ssm_scan_tensor_matches_reference() {
+        use crate::opcodes::{instr_ssm_reset, instr_ssm_scan};
+        // di=1, ds=1, defaults dt=1 A=-1 B=C=1 D=0: x=1 -> h=1, y=1 (golden ssm.rs).
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let prog = vec![
+            instr_tensor(0, 0xFF, 0xFF, 1, 1, 0), // x
+            instr_tensor(1, 0xFF, 0xFF, 1, 1, 0), // h
+            instr_ssm_scan(2, 0, 1, 0xFF, 1, 1, 0),
+            instr_ssm_reset(1, 1, 1, 0),
+            instr_halt(),
+        ];
+        vm.load_program(prog);
+        // x=ones? TENSOR init é (i+1)*0.5 => x=[0.5]. h init=[0.5]! Sobrescreve p/ golden.
+        let ctx_id = 1;
+        // Ajusta x=1.0, h=0.0 antes do scan executando manualmente os 2 primeiros passos:
+        // mais simples: roda programa parcial via step e reescreve.
+        // Aqui validamos via step_instruction direto para controle total.
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let xa = vm2.memory.alloc_tensor(&[1, 1], crate::memory::DType::F32).unwrap();
+        vm2.memory.write_f32_tensor(xa, &[1.0]).unwrap();
+        let ha = vm2.memory.alloc_tensor(&[1, 1], crate::memory::DType::F32).unwrap();
+        vm2.memory.write_f32_tensor(ha, &[0.0]).unwrap();
+        let root = vm2.memory.current_version();
+        let cid = vm2.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        vm2.scheduler.get_mut(cid).unwrap().set_reg(0, xa).unwrap();
+        vm2.scheduler.get_mut(cid).unwrap().set_reg(1, ha).unwrap();
+        let scan = instr_ssm_scan(2, 0, 1, 0xFF, 1, 1, 0);
+        vm2.step_instruction(cid, &scan).unwrap();
+        let y_addr = vm2.scheduler.get(cid).unwrap().reg(2).unwrap();
+        assert!((vm2.memory.read_f32_tensor(y_addr, 1).unwrap()[0] - 1.0).abs() < 1e-5);
+        assert!((vm2.memory.read_f32_tensor(ha, 1).unwrap()[0] - 1.0).abs() < 1e-5);
+        // RESET zera h
+        let reset = instr_ssm_reset(1, 1, 1, 0);
+        vm2.step_instruction(cid, &reset).unwrap();
+        assert_eq!(vm2.memory.read_f32_tensor(ha, 1).unwrap()[0], 0.0);
+        assert_eq!(vm2.stats.ssm_scans, 1);
+        assert_eq!(vm2.stats.ssm_resets, 1);
+        // Programa completo roda sem erro (init não-golden, só smoke).
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.ssm_scans, 1);
+        assert_eq!(stats.ssm_resets, 1);
+        let _ = ctx_id;
+    }
+
+    #[tokio::test]
+    async fn test_ssm_scan_hybrid_state_and_abort_rollback() {
+        use crate::opcodes::{instr_fork, instr_ssm_reset, instr_ssm_scan};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let xa = vm.memory.alloc_tensor(&[1, 2], crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(xa, &[1.0, 0.5]).unwrap();
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, xa).unwrap();
+        // Rh=0xFF => estado na Vm, layer 0, di=2 ds=2
+        let scan = instr_ssm_scan(2, 0, 0xFF, 0xFF, 2, 2, 0);
+        vm.step_instruction(cid, &scan).unwrap();
+        assert_eq!(vm.ssm_states.len(), 1);
+        assert!(vm.ssm_states[0].ssm.iter().any(|&v| v != 0.0));
+        // FORK empilha snapshot; novo scan suja; ABORT restaura.
+        let fork = instr_fork(5, 0);
+        vm.step_instruction(cid, &fork).unwrap();
+        vm.step_instruction(cid, &scan).unwrap();
+        let dirty: Vec<f32> = vm.ssm_states[0].ssm.clone();
+        // ABORT no filho (id em r5) faz pop do snapshot
+        let child = vm.scheduler.get(cid).unwrap().reg(5).unwrap() as u64;
+        assert_ne!(child, 0);
+        let abort = crate::opcodes::instr_abort(5, 0xFF);
+        vm.step_instruction(cid, &abort).unwrap();
+        assert_ne!(vm.ssm_states[0].ssm, dirty);
+        // RESET híbrido zera
+        let reset = instr_ssm_reset(0xFF, 2, 2, 0);
+        let mut reset = reset;
+        reset.rsrc1 = 0xFF;
+        vm.step_instruction(cid, &reset).unwrap();
+        assert!(vm.ssm_states[0].ssm.iter().all(|&v| v == 0.0));
+    }
+
+    #[tokio::test]
+    async fn test_codec_enc_dec_roundtrip() {
+        use crate::opcodes::{instr_codec_dec, instr_codec_enc, instr_sense};
+        use crate::opcodes::{SENSE_AUDIO_PCM, SENSE_CODEC_FRAME};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // SENSE PCM (7680B) -> ENC (32B) -> DEC (7680B)
+        let prog = vec![
+            instr_sense(0, SENSE_AUDIO_PCM),
+            instr_codec_enc(1, 0, false),
+            instr_codec_dec(2, 1, false),
+            instr_sense(3, SENSE_CODEC_FRAME),
+            instr_halt(),
+        ];
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.codec_encs, 1);
+        assert_eq!(stats.codec_decs, 1);
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let codes_addr = ctx.reg(1).unwrap();
+        let raw = vm.memory.read(codes_addr, 32).unwrap();
+        let codes = crate::mimi::codes_from_bytes(&raw).unwrap();
+        // synth 440Hz não é silêncio
+        assert!(codes.iter().any(|&c| c != crate::mimi::MIMI_SILENCE_CODE));
+        let pcm_addr = ctx.reg(2).unwrap();
+        let raw_pcm = vm.memory.read(pcm_addr, 1920 * 4).unwrap();
+        assert_eq!(raw_pcm.len(), 1920 * 4);
+        let cf_addr = ctx.reg(3).unwrap();
+        assert_eq!(vm.memory.read(cf_addr, 32).unwrap().len(), 32);
+        // Path tensor: ENC TENSOR -> DEC TENSOR preserva energia grosseiramente
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let pa = vm2.memory.alloc_tensor(&[1, 1920], crate::memory::DType::F32).unwrap();
+        let synth = crate::mimi::synth_frame_440hz();
+        vm2.memory.write_f32_tensor(pa, &synth).unwrap();
+        let root = vm2.memory.current_version();
+        let cid = vm2.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        vm2.scheduler.get_mut(cid).unwrap().set_reg(0, pa).unwrap();
+        let mut enc = instr_codec_enc(1, 0, true);
+        enc.flags = crate::opcodes::CODEC_FLAG_AS_TENSOR;
+        vm2.step_instruction(cid, &enc).unwrap();
+        let ca = vm2.scheduler.get(cid).unwrap().reg(1).unwrap();
+        let mut dec = instr_codec_dec(2, 1, true);
+        dec.flags = crate::opcodes::CODEC_FLAG_AS_TENSOR;
+        vm2.scheduler.get_mut(cid).unwrap().set_reg(1, ca).unwrap();
+        vm2.step_instruction(cid, &dec).unwrap();
+        let da = vm2.scheduler.get(cid).unwrap().reg(2).unwrap();
+        let back = vm2.memory.read_f32_tensor(da, 1920).unwrap();
+        let e_in: f32 = synth.iter().map(|v| v * v).sum::<f32>() / synth.len() as f32;
+        let e_out: f32 = back.iter().map(|v| v * v).sum::<f32>() / back.len() as f32;
+        assert!((e_out - e_in).abs() / e_in < 0.9, "e_in {} e_out {}", e_in, e_out);
+    }
+
+    #[tokio::test]
+    async fn test_rope_identity_and_rotation() {
+        use crate::opcodes::instr_rope;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // pos=0 => identidade
+        let xa = vm.memory.alloc_tensor(&[1, 4], crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(xa, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, xa).unwrap();
+        vm.step_instruction(cid, &instr_rope(1, 0, 0, 4, 1, 10_000.0)).unwrap();
+        let ya = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+        let y = vm.memory.read_f32_tensor(ya, 4).unwrap();
+        for (a, b) in [1.0, 2.0, 3.0, 4.0].iter().zip(y.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        // pos!=0 gira (norma preservada, valores mudam)
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, xa).unwrap();
+        vm.step_instruction(cid, &instr_rope(1, 0, 7, 4, 1, 10_000.0)).unwrap();
+        let ya2 = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+        let y2 = vm.memory.read_f32_tensor(ya2, 4).unwrap();
+        let n0: f32 = [1.0f32, 2.0, 3.0, 4.0].iter().map(|v| v * v).sum();
+        let n1: f32 = y2.iter().map(|v| v * v).sum();
+        assert!((n0 - n1).abs() < 1e-3, "{} vs {}", n0, n1);
+        assert!((y2[0] - 1.0).abs() + (y2[1] - 2.0).abs() > 1e-3);
+        assert_eq!(vm.stats.ropes, 2);
+    }
+
+    #[tokio::test]
+    async fn test_audio_align_and_ctx_switch() {
+        use crate::opcodes::{instr_audio_align, instr_ctx_switch, PIPE_MAMBA};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        // ts imediatos via regs (sem tensor): r0=1s, r1=1.08s (80ms depois = 1 frame Mimi)
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 1_000_000_000).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, 1_080_000_000).unwrap();
+        vm.step_instruction(cid, &instr_audio_align(2, 0, 1)).unwrap();
+        let aa = vm.scheduler.get(cid).unwrap().reg(2).unwrap();
+        let v = vm.memory.read_f32_tensor(aa, 4).unwrap();
+        assert_eq!(v[3] as u64, 1); // 80ms => frame 1
+        assert_eq!(vm.stats.audio_aligns, 1);
+        // CTX_SWITCH MAMBA, RED
+        assert_eq!(vm.scheduler.get(cid).unwrap().pipeline, crate::context::PIPE_TRANSFORMER_CTX);
+        vm.step_instruction(cid, &instr_ctx_switch(PIPE_MAMBA, 0b10)).unwrap();
+        let ctx = vm.scheduler.get(cid).unwrap();
+        assert_eq!(ctx.pipeline, PIPE_MAMBA);
+        assert_eq!(ctx.priority, crate::context::Priority::Red);
+        assert_eq!(vm.stats.ctx_switches, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ssm_scan_flags_reservadas_falham_explicito() {
+        use crate::opcodes::{instr_ssm_scan, SSM_SCAN_FLAG_CONV, SSM_SCAN_FLAG_GATE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(10), ..Default::default() });
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        for flag in [SSM_SCAN_FLAG_CONV, SSM_SCAN_FLAG_GATE] {
+            let mut scan = instr_ssm_scan(2, 0, 0xFF, 0xFF, 1, 1, 0);
+            scan.flags = flag;
+            assert!(vm.step_instruction(cid, &scan).is_err(), "flag 0x{:02x} deveria falhar", flag);
+        }
+        assert_eq!(vm.stats.ssm_scans, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ssm_scan_com_pack_explicito() {
+        use crate::opcodes::instr_ssm_scan;
+        // Pack montado com o helper público == referência ssm::selective_scan_update.
+        let (di, ds) = (2usize, 2usize);
+        let x = vec![1.0f32, 0.5];
+        let dt = vec![0.5f32, 1.0];
+        let a = vec![-1.0f32; 4];
+        let b = vec![1.0f32, 0.5];
+        let c = vec![1.0f32, 1.0];
+        let d = vec![0.1f32, 0.0];
+        let pack = crate::ssm::pack_params(&dt, &a, &b, &c, &d, di, ds);
+        let mut expect_h = vec![0.0f32; 4];
+        let expect_y = crate::ssm::selective_scan_update(&mut expect_h, &x, &dt, &a, &b, &c, &d, di, ds);
+
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(10), ..Default::default() });
+        let xa = vm.memory.alloc_tensor(&[1, di], crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(xa, &x).unwrap();
+        let ha = vm.memory.alloc_tensor(&[di, ds], crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(ha, &[0.0; 4]).unwrap();
+        let pa = vm.memory.alloc_tensor(&[1, pack.len()], crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(pa, &pack).unwrap();
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, xa).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, ha).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, pa).unwrap();
+        vm.step_instruction(cid, &instr_ssm_scan(3, 0, 1, 2, di, ds, 0)).unwrap();
+        let ya = vm.scheduler.get(cid).unwrap().reg(3).unwrap();
+        let y = vm.memory.read_f32_tensor(ya, di).unwrap();
+        for (got, want) in y.iter().zip(expect_y.iter()) {
+            assert!((got - want).abs() < 1e-5, "{} vs {}", got, want);
+        }
+        assert_eq!(vm.memory.read_f32_tensor(ha, 4).unwrap(), expect_h);
+    }
+
+    #[tokio::test]
+    async fn test_new_isa_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            TENSOR r0 1 2 f32
+            TENSOR r1 2 1 f32
+            SSM_SCAN r5, r0, r1, r0 D_INNER=2 D_STATE=1 LAYER=0
+            SSM_RESET r1 D_INNER=2 D_STATE=1
+            SENSE r6, AUDIO_PCM
+            CODEC_ENC r7, r6
+            CODEC_DEC r8, r7
+            AUDIO_ALIGN r4, r0, r0
+            CTX_SWITCH TRANSFORMER, GREEN
+            ROPE r2, r0 POS=0 HDIM=2 NHEADS=1
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.ssm_scans, 1);
+        assert_eq!(stats.ssm_resets, 1);
+        assert_eq!(stats.codec_encs, 1);
+        assert_eq!(stats.codec_decs, 1);
+        assert_eq!(stats.audio_aligns, 1);
+        assert_eq!(stats.ctx_switches, 1);
+        assert_eq!(stats.ropes, 1);
+    }
+
+    // ---- RFC-0004: goldens GATHER / DISTANCE / RANK1 / SAMPLE-TOPK ----
+
+    fn rfc0004_ctx_with(vm: &mut Vm, regs: &[(u8, u128)]) -> u64 {
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        for (r, v) in regs {
+            vm.scheduler.get_mut(cid).unwrap().set_reg(*r, *v).unwrap();
+        }
+        cid
+    }
+
+    fn rfc0004_f32(vm: &mut Vm, shape: &[usize], data: &[f32]) -> u128 {
+        let a = vm.memory.alloc_tensor(shape, crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(a, data).unwrap();
+        a
+    }
+
+    #[tokio::test]
+    async fn test_gather_golden_and_oob() {
+        use crate::opcodes::{
+            instr_gather, GATHER_MODE_GATHER, GATHER_MODE_SCATTER_ADD, GATHER_MODE_SCATTER_MAX,
+        };
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let table = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let idx = rfc0004_f32(&mut vm, &[2], &[1.0, 0.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, table), (1, idx)]);
+        // axis 0: linhas [1,0] => [[3,4],[1,2]]
+        vm.step_instruction(cid, &instr_gather(5, 0, 1, 0xFF, 0, GATHER_MODE_GATHER)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(5).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 4).unwrap(), vec![3.0, 4.0, 1.0, 2.0]);
+        // axis 1: coluna [1] => [[2],[4]]
+        let idx1 = rfc0004_f32(&mut vm, &[1], &[1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, idx1).unwrap();
+        vm.step_instruction(cid, &instr_gather(5, 0, 1, 0xFF, 1, GATHER_MODE_GATHER)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(5).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 2).unwrap(), vec![2.0, 4.0]);
+        // scatter_add: acc zeros + valores [[10,20]] idx [1] => [[0,0],[10,20]]
+        let acc = rfc0004_f32(&mut vm, &[2, 2], &[0.0; 4]);
+        let vals = rfc0004_f32(&mut vm, &[1, 2], &[10.0, 20.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, vals).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, acc).unwrap();
+        vm.step_instruction(cid, &instr_gather(5, 0, 1, 2, 0, GATHER_MODE_SCATTER_ADD)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(5).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 4).unwrap(), vec![0.0, 0.0, 10.0, 20.0]);
+        // scatter_max sobre o resultado: max com [[5,25]] idx [1] => [[0,0],[10,25]]
+        let vals2 = rfc0004_f32(&mut vm, &[1, 2], &[5.0, 25.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, vals2).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, out).unwrap();
+        vm.step_instruction(cid, &instr_gather(5, 0, 1, 2, 0, GATHER_MODE_SCATTER_MAX)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(5).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 4).unwrap(), vec![0.0, 0.0, 10.0, 25.0]);
+        // OOB e erros determinísticos.
+        let bad = rfc0004_f32(&mut vm, &[1], &[5.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, bad).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, table).unwrap();
+        assert!(vm.step_instruction(cid, &instr_gather(5, 0, 1, 0xFF, 0, GATHER_MODE_GATHER)).is_err());
+        assert!(vm.step_instruction(cid, &instr_gather(5, 0, 1, 0xFF, 7, GATHER_MODE_GATHER)).is_err());
+        assert!(vm.step_instruction(cid, &instr_gather(5, 0, 1, 0xFF, 0, 9)).is_err());
+        assert_eq!(vm.stats.gather_execs, 4);
+    }
+
+    #[tokio::test]
+    async fn test_distance_four_metrics_and_topk() {
+        use crate::opcodes::{
+            instr_distance, DIST_METRIC_COSINE, DIST_METRIC_DOT, DIST_METRIC_EUCLID,
+            DIST_METRIC_MANHATTAN,
+        };
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let q = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 0.0]);
+        let bank = rfc0004_f32(&mut vm, &[3, 2], &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, q), (1, bank)]);
+        let run = |vm: &mut Vm, cid: u64, metric: u8, topk: u16| -> (Vec<usize>, Vec<f32>) {
+            vm.step_instruction(cid, &instr_distance(5, 0, 1, metric, topk)).unwrap();
+            let out = vm.scheduler.get(cid).unwrap().reg(5).unwrap();
+            let meta = vm.memory.get_tensor_meta(out).cloned().unwrap();
+            let n: usize = meta.shape.iter().product();
+            (meta.shape.clone(), vm.memory.read_f32_tensor(out, n).unwrap())
+        };
+        let (_, e) = run(&mut vm, cid, DIST_METRIC_EUCLID, 0);
+        assert!((e[0] - 0.0).abs() < 1e-5 && (e[1] - 2f32.sqrt()).abs() < 1e-5 && (e[2] - 2.0).abs() < 1e-5);
+        let (_, c) = run(&mut vm, cid, DIST_METRIC_COSINE, 0);
+        assert!((c[0] - 0.0).abs() < 1e-5 && (c[1] - 1.0).abs() < 1e-5 && (c[2] - 2.0).abs() < 1e-5);
+        let (_, m) = run(&mut vm, cid, DIST_METRIC_MANHATTAN, 0);
+        assert_eq!(m, vec![0.0, 2.0, 2.0]);
+        let (_, d) = run(&mut vm, cid, DIST_METRIC_DOT, 0);
+        assert_eq!(d, vec![-1.0, 0.0, 1.0]);
+        // topk=2 euclid: dists [0, √2], índices [0, 1], shape [1,4].
+        let (shape, t) = run(&mut vm, cid, DIST_METRIC_EUCLID, 2);
+        assert_eq!(shape, vec![1, 4]);
+        assert!((t[0] - 0.0).abs() < 1e-5 && (t[1] - 2f32.sqrt()).abs() < 1e-5);
+        assert_eq!(&t[2..], &[0.0, 1.0]);
+        // Métrica inválida e shape inválido: erro limpo.
+        let mut badm = instr_distance(5, 0, 1, 0, 0);
+        badm.payload[0] = 9;
+        assert!(vm.step_instruction(cid, &badm).is_err());
+        assert_eq!(vm.stats.distance_execs, 5);
+    }
+
+    #[tokio::test]
+    async fn test_rank1_modes_and_rollback() {
+        use crate::opcodes::{
+            instr_fork, instr_rank1_update, RANK1_MODE_DELTA, RANK1_MODE_FORGET,
+            RANK1_MODE_HEBBIAN,
+        };
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let h = rfc0004_f32(&mut vm, &[2, 2], &[0.0; 4]);
+        let v = rfc0004_f32(&mut vm, &[2], &[1.0, 2.0]);
+        let k = rfc0004_f32(&mut vm, &[2], &[3.0, 4.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(7, h), (1, v), (2, k)]);
+        // hebbian α=1 β=1: H = v⊗k = [[3,4],[6,8]].
+        vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, RANK1_MODE_HEBBIAN, 0)).unwrap();
+        let h1 = vm.scheduler.get(cid).unwrap().reg(7).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(h1, 4).unwrap(), vec![3.0, 4.0, 6.0, 8.0]);
+        assert_eq!(vm.rank1_layers.get(&0), Some(&h1));
+        // delta sobre H identidade: v=[1,0], k=[1,0] => Hk=[1,0], denom=2,
+        // upd=0 => H inalterada.
+        let hi = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        let v2 = rfc0004_f32(&mut vm, &[2], &[1.0, 0.0]);
+        let k2 = rfc0004_f32(&mut vm, &[2], &[1.0, 0.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, hi).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, v2).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, k2).unwrap();
+        vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, RANK1_MODE_DELTA, 1)).unwrap();
+        let h2 = vm.scheduler.get(cid).unwrap().reg(7).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(h2, 4).unwrap(), vec![1.0, 0.0, 0.0, 1.0]);
+        // forget com máscara: H'=0.5*(m⊙H)+v⊗k, m=[[1,0],[0,1]], H=ones.
+        let ho = rfc0004_f32(&mut vm, &[2, 2], &[1.0; 4]);
+        let m = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, ho).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, v).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, k).unwrap();
+        let mut f = instr_rank1_update(7, 1, 2, 0.5, 1.0, RANK1_MODE_FORGET, 2);
+        f.rsrc3 = 3;
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, m).unwrap();
+        vm.step_instruction(cid, &f).unwrap();
+        let h3 = vm.scheduler.get(cid).unwrap().reg(7).unwrap();
+        // 0.5*[[1,0],[0,1]] + [[3,4],[6,8]] = [[3.5,4],[6,8.5]]
+        assert_eq!(vm.memory.read_f32_tensor(h3, 4).unwrap(), vec![3.5, 4.0, 6.0, 8.5]);
+        // FORK empilha handles; passo suja; ABORT restaura o handle (CoW: o
+        // tensor antigo segue intacto e legível).
+        let before = vm.rank1_layers.clone();
+        vm.step_instruction(cid, &instr_fork(5, 0)).unwrap();
+        vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, RANK1_MODE_HEBBIAN, 2)).unwrap();
+        let dirty = vm.scheduler.get(cid).unwrap().reg(7).unwrap();
+        assert_ne!(dirty, h3);
+        let child = vm.scheduler.get(cid).unwrap().reg(5).unwrap() as u64;
+        assert_ne!(child, cid);
+        // r5 = id do filho, ts = 0xFF (sem restore de memória; isola o mapa RANK1).
+        vm.step_instruction(cid, &crate::opcodes::instr_abort(5, 0xFF)).unwrap();
+        assert_eq!(vm.rank1_layers, before);
+        // O handle da camada voltou a apontar ao H pré-FORK e o tensor
+        // antigo segue intacto (CoW). NOTA: registradores do contexto NÃO
+        // fazem parte do rollback (desenho pré-existente do FORK/ABORT, vale
+        // p/ todos os opcodes) — r7 segue com o addr sujo; o estado
+        // autoritativo é o mapa restaurado. Ver follow-up na RFC-0004.
+        assert_eq!(vm.rank1_layers.get(&2), Some(&h3));
+        assert_eq!(vm.memory.read_f32_tensor(h3, 4).unwrap(), vec![3.5, 4.0, 6.0, 8.5]);
+        // Modo inválido e ALPHA fora de (0,1] no FORGET: erro limpo.
+        assert!(vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, 9, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 2.0, 1.0, RANK1_MODE_FORGET, 0)).is_err());
+        assert_eq!(vm.stats.rank1_execs, 4);
+    }
+
+    #[tokio::test]
+    async fn test_sample_topk_indices() {
+        use crate::opcodes::instr_sample_topk;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // Empate 0.9/0.9 desempata por menor índice: [1, 3].
+        let l = rfc0004_f32(&mut vm, &[4], &[0.1, 0.9, 0.5, 0.9]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, l)]);
+        let before = vm.last_sample;
+        vm.step_instruction(cid, &instr_sample_topk(4, 0, 2)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 2).unwrap(), vec![1.0, 3.0]);
+        assert_eq!(vm.last_sample, before, "TOPK não toca em last_sample");
+    }
+
+    #[tokio::test]
+    async fn test_rfc0004_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // Pipeline combinado: SAMPLE-TOPK -> GATHER, DISTANCE, RANK1, FORK/ABORT.
+        let src = r#"
+            TENSOR r0 1 4 f32
+            TENSOR r1 4 2 f32
+            SAMPLE r2, r0 TOPK=1
+            GATHER r3, r1, r2 AXIS=0
+            TENSOR r4 1 4 f32
+            TENSOR r5 8 4 f32
+            DISTANCE r6, r4, r5 METRIC=DOT TOPK=2
+            TENSOR r7 2 2 f32
+            TENSOR r8 2 1 f32
+            TENSOR r9 2 1 f32
+            RANK1_UPDATE r7, r8, r9 ALPHA=1.0 BETA=1.0 MODE=HEBBIAN LAYER=0
+            FORK r10, GREEN
+            RANK1_UPDATE r7, r8, r9 ALPHA=1.0 BETA=1.0 MODE=HEBBIAN LAYER=0
+            ABORT r10, r11
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.sample_execs, 1);
+        assert_eq!(stats.gather_execs, 1);
+        assert_eq!(stats.distance_execs, 1);
+        // RANK1 x3: pai antes + pai depois do FORK + filho (nasce após o FORK
+        // e executa o RANK1 pós-FORK antes do seu ABORT-alvo-0, que não conta).
+        assert_eq!(stats.rank1_execs, 3);
+        assert_eq!(stats.forks, 1);
+        assert_eq!(stats.aborts, 1);
+    }
+
+    // ---- RFC-0005: determinismo -------------------------------------
+
+    fn rfc0005_reg_u64(vm: &Vm, cid: u64, r: u8) -> u64 {
+        vm.scheduler.get(cid).unwrap().reg(r).unwrap() as u64
+    }
+
+    #[tokio::test]
+    async fn test_rng_determinism_reseed_fork() {
+        use crate::opcodes::{instr_fork, instr_rng_next, instr_rng_seed};
+        async fn run_seq(seed: Option<u64>) -> Vec<u64> {
+            let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+            let cid = rfc0004_ctx_with(&mut vm, &[]);
+            match seed {
+                Some(s) => {
+                    vm.scheduler.get_mut(cid).unwrap().set_reg(0, s as u128).unwrap();
+                    vm.step_instruction(cid, &instr_rng_seed(0)).unwrap();
+                }
+                None => {
+                    vm.step_instruction(cid, &instr_rng_seed(0xFF)).unwrap();
+                }
+            }
+            let mut out = Vec::new();
+            for _ in 0..5 {
+                vm.step_instruction(cid, &instr_rng_next(1)).unwrap();
+                out.push(rfc0005_reg_u64(&vm, cid, 1));
+            }
+            out
+        }
+        // Mesma semente explícita => mesma sequência; default == default.
+        assert_eq!(run_seq(Some(12345)).await, run_seq(Some(12345)).await);
+        assert_eq!(run_seq(None).await, run_seq(None).await);
+        assert_ne!(run_seq(Some(12345)).await, run_seq(Some(999)).await);
+        // FORK herda o stream: pai e filho geram o mesmo próximo valor.
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 777u128).unwrap();
+        vm.step_instruction(cid, &instr_rng_seed(0)).unwrap();
+        vm.step_instruction(cid, &instr_rng_next(1)).unwrap();
+        let first = rfc0005_reg_u64(&vm, cid, 1);
+        vm.step_instruction(cid, &instr_fork(2, 0)).unwrap();
+        let child = vm.scheduler.get(cid).unwrap().reg(2).unwrap() as u64;
+        // Filho continua de onde o pai parou (1 NEXT consumido por ambos os
+        // lados de forma independente => próximos valores divergem a partir
+        // do mesmo estado herdado: pai e filho geram IGUAL agora).
+        vm.step_instruction(cid, &instr_rng_next(3)).unwrap();
+        vm.step_instruction(child, &instr_rng_next(3)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 3), rfc0005_reg_u64(&vm, child, 3));
+        assert_ne!(first, rfc0005_reg_u64(&vm, cid, 3));
+    }
+
+    #[tokio::test]
+    async fn test_rng_uniform_normal_hash_goldens() {
+        use crate::opcodes::{instr_checksum, instr_hash, instr_hmac, instr_rng_normal, instr_rng_uniform};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let t = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, t)]);
+        // UNIFORM dentro de [a,b).
+        vm.step_instruction(cid, &instr_rng_uniform(1, -2.0, 5.0)).unwrap();
+        let x = f32::from_bits(rfc0005_reg_u64(&vm, cid, 1) as u32);
+        assert!((-2.0..5.0).contains(&x));
+        // Intervalo inválido: erro limpo.
+        assert!(vm.step_instruction(cid, &instr_rng_uniform(1, 5.0, 5.0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_rng_uniform(1, f32::NAN, 1.0)).is_err());
+        // NORMAL finita; std inválido: erro limpo.
+        vm.step_instruction(cid, &instr_rng_normal(1, 10.0, 2.0)).unwrap();
+        let y = f32::from_bits(rfc0005_reg_u64(&vm, cid, 1) as u32);
+        assert!(y.is_finite());
+        assert!(vm.step_instruction(cid, &instr_rng_normal(1, 0.0, -1.0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_rng_normal(1, 0.0, f32::INFINITY)).is_err());
+        // HASH/CHECKSUM batem com as funções puras sobre o mesmo stream.
+        vm.step_instruction(cid, &instr_hash(1, 0)).unwrap();
+        vm.step_instruction(cid, &instr_checksum(2, 0)).unwrap();
+        let flat = vm.memory.read_f32_tensor(t, 4).unwrap();
+        let mut bytes = Vec::new();
+        for v in &flat {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 1), crate::determinism::fnv1a64(&bytes));
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 2), crate::determinism::crc32_ieee(&bytes) as u64);
+        // HMAC contra a primitiva direta (vetor RFC 4231 vive em determinism.rs).
+        let k = rfc0004_f32(&mut vm, &[5], &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, k).unwrap();
+        vm.step_instruction(cid, &instr_hmac(4, 3, 0)).unwrap();
+        let kb = {
+            let kv = vm.memory.read_f32_tensor(k, 5).unwrap();
+            let mut b = Vec::new();
+            for v in &kv {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        };
+        assert_eq!(
+            rfc0005_reg_u64(&vm, cid, 4),
+            crate::determinism::hmac_sha256_trunc64(&kb, &bytes)
+        );
+        assert_eq!(vm.stats.rng_uniform_execs, 1);
+        assert_eq!(vm.stats.rng_normal_execs, 1);
+        assert_eq!(vm.stats.hash_execs, 1);
+        assert_eq!(vm.stats.checksum_execs, 1);
+        assert_eq!(vm.stats.hmac_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0005_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            RNG_SEED DEFAULT
+            RNG_NEXT r1
+            RNG_NEXT r2
+            RNG_UNIFORM r3 A=-2.0 B=5.0
+            RNG_NORMAL r4 MEAN=10.0 STD=2.0
+            TENSOR r5 2 2 f32
+            HASH r6, r5
+            CHECKSUM r7, r5
+            HMAC r8, r5, r5
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.rng_seed_execs, 1);
+        assert_eq!(stats.rng_next_execs, 2);
+        assert_eq!(stats.rng_uniform_execs, 1);
+        assert_eq!(stats.rng_normal_execs, 1);
+        assert_eq!(stats.hash_execs, 1);
+        assert_eq!(stats.checksum_execs, 1);
+        assert_eq!(stats.hmac_execs, 1);
+        // Determinismo ponta a ponta: mesma seed => mesmos registradores.
+        let main_id = *vm.scheduler.contexts().keys().next().expect("ctx principal");
+        let regs_once = {
+            let ctx = vm.scheduler.get(main_id).unwrap();
+            (ctx.reg(1).unwrap(), ctx.reg(2).unwrap())
+        };
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm2.load_program(assemble(src).unwrap());
+        vm2.run().unwrap();
+        let main2 = *vm2.scheduler.contexts().keys().next().expect("ctx principal");
+        let ctx2 = vm2.scheduler.get(main2).unwrap();
+        assert_eq!((ctx2.reg(1).unwrap(), ctx2.reg(2).unwrap()), regs_once);
+    }
+
+    // ---- RFC-0011: stacks versionadas ---------------------------------
+
+    fn rfc0011_set_ssm(vm: &mut Vm, val: f32) {
+        if vm.ssm_states.is_empty() {
+            vm.ssm_states.push(crate::ssm::MambaState::new(2, 1, 4));
+        }
+        for x in vm.ssm_states[0].ssm.iter_mut() {
+            *x = val;
+        }
+    }
+
+    fn rfc0011_ssm(vm: &Vm) -> Vec<f32> {
+        vm.ssm_states[0].ssm.clone()
+    }
+
+    #[tokio::test]
+    async fn test_abort_version_gated_nested() {
+        use crate::opcodes::{instr_abort, instr_fork};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // Estado A, FORK(v1), estado B, FORK(v2), estado C.
+        rfc0011_set_ssm(&mut vm, 1.0);
+        vm.step_instruction(cid, &instr_fork(5, 0)).unwrap();
+        let v1 = vm.memory.current_version();
+        rfc0011_set_ssm(&mut vm, 2.0);
+        vm.step_instruction(cid, &instr_fork(6, 0)).unwrap();
+        let v2 = vm.memory.current_version();
+        assert!(v2 > v1);
+        rfc0011_set_ssm(&mut vm, 3.0);
+        // ABORT nomeando v1 (alvo: filho 2 em r6; ts=v1 em r7):
+        // descarta (v2,B), aplica (v1,A).
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, v1 as u128).unwrap();
+        vm.step_instruction(cid, &instr_abort(6, 7)).unwrap();
+        assert_eq!(rfc0011_ssm(&vm), vec![1.0; 2]);
+        assert!(vm.ssm_snapshots.is_empty(), "entradas consumidas, sem resíduo");
+        // Segundo ABORT no mesmo ts (alvo já removido => warn, segue):
+        // no-op estável (antes: comia o outer).
+        vm.step_instruction(cid, &instr_abort(6, 7)).unwrap();
+        assert_eq!(rfc0011_ssm(&vm), vec![1.0; 2]);
+    }
+
+    #[tokio::test]
+    async fn test_abort_without_fork_is_noop() {
+        use crate::opcodes::instr_abort;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        rfc0011_set_ssm(&mut vm, 9.0);
+        // Alvo válido (o próprio ctx sobrevive? não — usa ctx inexistente:
+        // remove falha com warn, stacks vazias => no-op, estado intacto).
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, 4242u128).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, 0u128).unwrap();
+        vm.step_instruction(cid, &instr_abort(5, 6)).unwrap();
+        assert_eq!(rfc0011_ssm(&vm), vec![9.0; 2]);
+        assert!(vm.ssm_snapshots.is_empty());
+        assert!(vm.rank1_snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rank1_stack_version_gated() {
+        use crate::opcodes::{instr_abort, instr_fork, instr_rank1_update, RANK1_MODE_HEBBIAN};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let h = rfc0004_f32(&mut vm, &[2, 2], &[0.0; 4]);
+        let v = rfc0004_f32(&mut vm, &[2], &[1.0, 1.0]);
+        let k = rfc0004_f32(&mut vm, &[2], &[1.0, 1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(7, h), (1, v), (2, k)]);
+        // Passo base ANTES da 1ª FORK: v1 carrega {0: h_a}.
+        vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, RANK1_MODE_HEBBIAN, 0)).unwrap();
+        let ha = vm.rank1_layers.get(&0).copied().unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(ha, 4).unwrap(), vec![1.0; 4]);
+        vm.step_instruction(cid, &instr_fork(5, 0)).unwrap();
+        let v1 = vm.memory.current_version();
+        vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, RANK1_MODE_HEBBIAN, 0)).unwrap();
+        let dirty = vm.rank1_layers.get(&0).copied().unwrap();
+        assert_ne!(dirty, ha);
+        vm.step_instruction(cid, &instr_fork(6, 0)).unwrap();
+        vm.step_instruction(cid, &instr_rank1_update(7, 1, 2, 1.0, 1.0, RANK1_MODE_HEBBIAN, 0)).unwrap();
+        assert_ne!(vm.rank1_layers.get(&0).copied().unwrap(), dirty);
+        // ABORT nomeando v1 (alvo: filho 2 em r6; ts=v1 em r3):
+        // descarta v2, aplica v1 => mapa volta a {0: h_a}.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, v1 as u128).unwrap();
+        vm.step_instruction(cid, &instr_abort(6, 3)).unwrap();
+        assert_eq!(vm.rank1_layers.get(&0).copied(), Some(ha));
+        // H_a intacto (CoW): 4 uns.
+        assert_eq!(vm.memory.read_f32_tensor(ha, 4).unwrap(), vec![1.0; 4]);
+    }
+
+    // ---- RFC-0010: KV_TRUNCATE --------------------------------------
+
+    #[tokio::test]
+    async fn test_kv_truncate_shrink_noop_rollback() {
+        use crate::opcodes::instr_kv_truncate;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        vm.memory.kv_cache_init(4, 8);
+        let k = vec![1.0f32; 8];
+        let v = vec![2.0f32; 8];
+        for _ in 0..5 {
+            for layer in 0..4 {
+                vm.memory.kv_cache_append(layer, &k, &v).unwrap();
+            }
+        }
+        assert_eq!(vm.memory.kv_cache_seq_len(), 5);
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // Shrink p/ 2 via reg.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 2u128).unwrap();
+        vm.step_instruction(cid, &instr_kv_truncate(0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 2);
+        // len >= atual: no-op Ok.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 99u128).unwrap();
+        vm.step_instruction(cid, &instr_kv_truncate(0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 2);
+        // Rollback: snapshot -> append -> truncate -> restore volta.
+        let snap = vm.memory.snapshot();
+        for layer in 0..4 {
+            vm.memory.kv_cache_append(layer, &k, &v).unwrap();
+        }
+        assert_eq!(vm.memory.kv_cache_seq_len(), 3);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 1u128).unwrap();
+        vm.step_instruction(cid, &instr_kv_truncate(0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 1);
+        vm.memory.restore(snap).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 2);
+        // Stream != 0: erro explícito, sem truncar.
+        let mut bad = instr_kv_truncate(0, 0);
+        bad.set_kv_stream(3);
+        assert!(vm.step_instruction(cid, &bad).is_err());
+        assert_eq!(vm.memory.kv_cache_seq_len(), 2);
+        assert_eq!(vm.stats.kv_truncate_execs, 3);
+    }
+
+    #[tokio::test]
+    async fn test_kv_truncate_empty_is_noop() {
+        use crate::opcodes::instr_kv_truncate;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        vm.memory.kv_cache_init(2, 4);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, 0u128)]);
+        vm.step_instruction(cid, &instr_kv_truncate(0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 0);
+        assert_eq!(vm.stats.kv_truncate_execs, 1);
+    }
+
+    // ---- RFC-0009: SAMPLE seeded ------------------------------------
+
+    #[tokio::test]
+    async fn test_sample_seeded_two_vms_agree() {
+        use crate::opcodes::{instr_rng_seed, instr_sample};
+        // Programa: seed fixa -> SAMPLE. Duas VMs => mesmo token, last igual.
+        async fn run_once() -> (u32, u32) {
+            let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+            let cid = rfc0004_ctx_with(&mut vm, &[]);
+            let la = rfc0004_f32(&mut vm, &[4], &[0.2, 1.5, -0.7, 0.9]);
+            vm.scheduler.get_mut(cid).unwrap().set_reg(0, la).unwrap();
+            vm.scheduler.get_mut(cid).unwrap().set_reg(1, 424242u128).unwrap();
+            vm.step_instruction(cid, &instr_rng_seed(1)).unwrap();
+            vm.step_instruction(cid, &instr_sample(2, 0, 1.0)).unwrap();
+            let tok = vm.scheduler.get(cid).unwrap().reg(2).unwrap() as u32;
+            (tok, vm.last_sample)
+        }
+        let (t1, l1) = run_once().await;
+        let (t2, l2) = run_once().await;
+        assert_eq!((t1, l1), (t2, l2), "seed fixa => replay exato entre VMs");
+        // Reseed replays: mesma seed de novo => mesmo token.
+        let (t3, _) = run_once().await;
+        assert_eq!(t1, t3);
+    }
+
+    // ---- RFC-0006: telemetria + scheduler ---------------------------
+
+    #[tokio::test]
+    async fn test_telemetry_sanity_preempt_assert_dump() {
+        use crate::opcodes::{
+            instr_assert, instr_cycles_count, instr_dump, instr_preempt_check,
+            instr_sanity_check, instr_trace_event,
+        };
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // Tensor com NaN/Inf: [1.0, NaN, 2.0, +Inf] => saneado [1,0,2,0], count 2.
+        let t = rfc0004_f32(&mut vm, &[4], &[1.0, f32::NAN, 2.0, f32::INFINITY]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, t)]);
+        vm.step_instruction(cid, &instr_sanity_check(4, 0, 1)).unwrap();
+        let clean = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(clean, 4).unwrap(), vec![1.0, 0.0, 2.0, 0.0]);
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(1).unwrap(), 2);
+        // Original intacto (CoW): ainda tem NaN.
+        assert!(vm.memory.read_f32_tensor(t, 4).unwrap()[1].is_nan());
+        // Sem rCount: funciona, descarta contagem.
+        vm.step_instruction(cid, &instr_sanity_check(4, 0, 0xFF)).unwrap();
+        // PREEMPT_CHECK sem consumir: flag 0 => 0; com flag => 1 e segue setada.
+        vm.step_instruction(cid, &instr_preempt_check(5)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(5).unwrap(), 0);
+        vm.scheduler.get_mut(cid).unwrap().interrupt_flag = true;
+        vm.step_instruction(cid, &instr_preempt_check(5)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(5).unwrap(), 1);
+        assert!(vm.scheduler.get(cid).unwrap().interrupt_flag, "PREEMPT_CHECK não consome");
+        vm.scheduler.get_mut(cid).unwrap().interrupt_flag = false;
+        // ASSERT: passa com != 0 (qualquer code), trap com == 0 e code exato.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, 7).unwrap();
+        vm.step_instruction(cid, &instr_assert(6, 42)).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, 0).unwrap();
+        let err = vm.step_instruction(cid, &instr_assert(6, 42)).unwrap_err();
+        assert!(err.to_string().contains("42"), "trap carrega o code: {}", err);
+        // CYCLES_COUNT / TRACE_EVENT / DUMP executam e contabilizam.
+        vm.step_instruction(cid, &instr_cycles_count(7)).unwrap();
+        assert!(vm.scheduler.get(cid).unwrap().reg(7).unwrap() > 0);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(8, 99).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(9, 0xABCD).unwrap();
+        vm.step_instruction(cid, &instr_trace_event(8, 9)).unwrap();
+        assert_eq!(vm.trace.back(), Some(&(99, 0xABCD)));
+        vm.step_instruction(cid, &instr_dump()).unwrap();
+        assert_eq!(vm.stats.sanity_execs, 2);
+        assert_eq!(vm.stats.preempt_check_execs, 2);
+        assert_eq!(vm.stats.assert_execs, 1);
+        assert_eq!(vm.stats.cycles_execs, 1);
+        assert_eq!(vm.stats.trace_execs, 1);
+        assert_eq!(vm.stats.dump_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_deadline_priority_locks_fence() {
+        use crate::opcodes::{
+            instr_fence, instr_get_deadline, instr_lock, instr_priority_get,
+            instr_priority_set, instr_set_deadline, instr_unlock, instr_yield,
+        };
+        use crate::context::Priority;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // Deadline default = MAX (best-effort); set/get roundtrip.
+        vm.step_instruction(cid, &instr_get_deadline(0)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(0).unwrap(), u64::MAX as u128);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 1_000_000u128).unwrap();
+        vm.step_instruction(cid, &instr_set_deadline(0)).unwrap();
+        vm.step_instruction(cid, &instr_get_deadline(1)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(1).unwrap(), 1_000_000);
+        // Prioridade: GET=Green(0); SET RED via reg; GET=2; volta p/ Green.
+        vm.step_instruction(cid, &instr_priority_get(2)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(2).unwrap(), 0);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, 2u128).unwrap();
+        vm.step_instruction(cid, &instr_priority_set(3)).unwrap();
+        assert!(matches!(vm.scheduler.get(cid).unwrap().priority, Priority::Red));
+        vm.step_instruction(cid, &instr_priority_get(2)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(2).unwrap(), 2);
+        // Valor inválido: erro limpo, prioridade intacta.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, 7u128).unwrap();
+        assert!(vm.step_instruction(cid, &instr_priority_set(3)).is_err());
+        assert!(matches!(vm.scheduler.get(cid).unwrap().priority, Priority::Red));
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, 0u128).unwrap();
+        vm.step_instruction(cid, &instr_priority_set(3)).unwrap();
+        assert!(matches!(vm.scheduler.get(cid).unwrap().priority, Priority::Green));
+        // LOCK: adquire, reentrante p/ o dono, UNLOCK libera.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, 77u128).unwrap();
+        vm.step_instruction(cid, &instr_lock(4)).unwrap();
+        assert_eq!(vm.locks.get(&77), Some(&cid));
+        vm.step_instruction(cid, &instr_lock(4)).unwrap(); // reentrante ok
+        vm.step_instruction(cid, &instr_unlock(4)).unwrap();
+        assert!(!vm.locks.contains_key(&77));
+        // UNLOCK sem posse: erro; LOCK de outro ctx: contenção.
+        assert!(vm.step_instruction(cid, &instr_unlock(4)).is_err());
+        let cid2 = rfc0004_ctx_with(&mut vm, &[(4, 77u128)]);
+        vm.step_instruction(cid, &instr_lock(4)).unwrap();
+        assert!(vm.step_instruction(cid2, &instr_lock(4)).is_err());
+        assert!(vm.step_instruction(cid2, &instr_unlock(4)).is_err());
+        vm.step_instruction(cid, &instr_unlock(4)).unwrap();
+        vm.step_instruction(cid2, &instr_lock(4)).unwrap(); // liberou => ok
+        // YIELD + FENCE executam.
+        vm.step_instruction(cid, &instr_yield()).unwrap();
+        vm.step_instruction(cid, &instr_fence()).unwrap();
+        assert_eq!(vm.stats.set_deadline_execs, 1);
+        assert_eq!(vm.stats.priority_set_execs, 2);
+        assert_eq!(vm.stats.lock_execs, 4);
+        assert_eq!(vm.stats.unlock_execs, 2);
+        assert_eq!(vm.stats.yield_execs, 1);
+        assert_eq!(vm.stats.fence_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0006_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // ASSERT sobre r0 (CYCLES>0 garante passa; ASSERT sobre r4==0 travaria).
+        let src = r#"
+            CYCLES_COUNT r0
+            TRACE_EVENT r0, r0
+            TENSOR r1 2 2 f32
+            SANITY_CHECK r2, r1, r3
+            PREEMPT_CHECK r4
+            ASSERT r0
+            DUMP
+            YIELD
+            SET_DEADLINE r0
+            GET_DEADLINE r5
+            PRIORITY_GET r6
+            FENCE
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.cycles_execs, 1);
+        assert_eq!(stats.trace_execs, 1);
+        assert_eq!(stats.sanity_execs, 1);
+        assert_eq!(stats.preempt_check_execs, 1);
+        assert_eq!(stats.assert_execs, 1);
+        assert_eq!(stats.dump_execs, 1);
+        assert_eq!(stats.yield_execs, 1);
+        assert_eq!(stats.set_deadline_execs, 1);
+        assert_eq!(stats.get_deadline_execs, 1);
+        assert_eq!(stats.priority_get_execs, 1);
+        assert_eq!(stats.fence_execs, 1);
+    }
+
+    // ---- RFC-0007: LOADI / MOV / predicados -------------------------
+
+    #[tokio::test]
+    async fn test_loadi_mov_chain() {
+        use crate::opcodes::{instr_loadi, instr_mov};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        vm.step_instruction(cid, &instr_loadi(0, 80_000_000)).unwrap();
+        vm.step_instruction(cid, &instr_loadi(1, u128::MAX)).unwrap();
+        vm.step_instruction(cid, &instr_mov(2, 0)).unwrap();
+        vm.step_instruction(cid, &instr_mov(3, 1)).unwrap();
+        let ctx = vm.scheduler.get(cid).unwrap();
+        assert_eq!(ctx.reg(0).unwrap(), 80_000_000);
+        assert_eq!(ctx.reg(1).unwrap(), u128::MAX);
+        assert_eq!(ctx.reg(2).unwrap(), 80_000_000);
+        assert_eq!(ctx.reg(3).unwrap(), u128::MAX);
+        assert_eq!(vm.stats.loadi_execs, 2);
+        assert_eq!(vm.stats.mov_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_compare_all_predicates() {
+        use crate::opcodes::{instr_compare, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // (a, b, pred) -> esperado. Inclui fronteiras 0 e MAX.
+        let cases: Vec<(u128, u128, u8, bool)> = vec![
+            (5, 5, crate::opcodes::CMP_EQ, true),
+            (5, 6, crate::opcodes::CMP_EQ, false),
+            (5, 6, CMP_NE, true),
+            (5, 5, CMP_NE, false),
+            (5, 6, CMP_LT, true),
+            (6, 5, CMP_LT, false),
+            (5, 5, CMP_LT, false),
+            (5, 5, CMP_LE, true),
+            (6, 5, CMP_LE, false),
+            (6, 5, CMP_GT, true),
+            (5, 6, CMP_GT, false),
+            (5, 5, CMP_GE, true),
+            (4, 5, CMP_GE, false),
+            (0, 0, CMP_LE, true),
+            (0, 1, CMP_LT, true),
+            (u128::MAX, u128::MAX, CMP_GE, true),
+            (u128::MAX, 0, CMP_GT, true),
+            (0, u128::MAX, CMP_LT, true),
+        ];
+        for (a, b, pred, want) in cases {
+            let mut ins = instr_compare(0, 0xFF, b);
+            // rsrc1=0 carrega `a` via reg 0.
+            vm.scheduler.get_mut(cid).unwrap().set_reg(0, a).unwrap();
+            ins.rsrc1 = 0;
+            ins.set_compare_pred(pred);
+            vm.step_instruction(cid, &ins).unwrap();
+            assert_eq!(vm.scheduler.get(cid).unwrap().cmp_equal, want, "cmp {} pred={} {}", a, pred, b);
+        }
+        // Predicado inválido: trap limpo.
+        let mut bad = instr_compare(0, 0xFF, 1);
+        bad.set_compare_pred(9);
+        assert!(vm.step_instruction(cid, &bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rfc0007_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // Deadline + lock-id + prioridade como literais (o gap chicken-and-egg).
+        let src = r#"
+            LOADI r0, 80000000
+            LOADI r1, 77
+            LOADI r2, 2
+            MOV r3, r0
+            SET_DEADLINE r0
+            GET_DEADLINE r4
+            PRIORITY_SET r2
+            PRIORITY_GET r5
+            LOCK r1
+            UNLOCK r1
+            COMPARE r3, r0 PRED=EQ
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.loadi_execs, 3);
+        assert_eq!(stats.mov_execs, 1);
+        assert_eq!(stats.set_deadline_execs, 1);
+        assert_eq!(stats.priority_set_execs, 1);
+        assert_eq!(stats.lock_execs, 1);
+        assert_eq!(stats.unlock_execs, 1);
+        let ctx_id = *vm.scheduler.contexts().keys().next().expect("ctx");
+        let ctx = vm.scheduler.get(ctx_id).unwrap();
+        assert_eq!(ctx.reg(3).unwrap(), 80_000_000);
+        assert_eq!(ctx.reg(4).unwrap(), 80_000_000);
+        assert!(ctx.cmp_equal, "80M == 80M via PRED=EQ");
+    }
+
+    // ---- RFC-0012: FOREST goldens -----------------------------------
+
+    /// Ensemble de referência: 2 árvores, depth 2 (stride 3).
+    /// T0: f0>0.5 ? L20 : L10 · T1: f1>1.0 ? L50 : L40.
+    fn rfc0012_ensemble(vm: &mut Vm) -> (u128, u128, u128) {
+        let feats = rfc0004_f32(vm, &[2], &[0.7, 0.3]);
+        let table = rfc0004_f32(
+            vm,
+            &[6, 4],
+            &[
+                0.0, 0.5, 1.0, 2.0, // t0n0 root
+                0.0, 0.0, -1.0, -1.0, // t0n1 leaf
+                0.0, 0.0, -1.0, -1.0, // t0n2 leaf
+                1.0, 1.0, 1.0, 2.0, // t1n0 root
+                0.0, 0.0, -1.0, -1.0, // t1n1 leaf
+                0.0, 0.0, -1.0, -1.0, // t1n2 leaf
+            ],
+        );
+        let leaves = rfc0004_f32(vm, &[6], &[9.0, 10.0, 20.0, 30.0, 40.0, 50.0]);
+        (feats, table, leaves)
+    }
+
+    #[tokio::test]
+    async fn test_forest_golden_vote_mean() {
+        use crate::opcodes::{instr_forest, FOREST_MODE_MEAN, FOREST_MODE_VOTE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let (f, t, l) = rfc0012_ensemble(&mut vm);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, f), (1, t), (2, l)]);
+        // f=[0.7,0.3]: T0 -> dir (20), T1 -> esq (40).
+        vm.step_instruction(cid, &instr_forest(4, 0, 1, 2, 2, 2, FOREST_MODE_VOTE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 2).unwrap(), vec![20.0, 40.0]);
+        vm.step_instruction(cid, &instr_forest(4, 0, 1, 2, 2, 2, FOREST_MODE_MEAN)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 1).unwrap(), vec![30.0]);
+        assert_eq!(vm.stats.forest_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_forest_errors_and_termination() {
+        use crate::opcodes::{instr_forest, FOREST_MODE_VOTE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let (f, t, l) = rfc0012_ensemble(&mut vm);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, f), (1, t), (2, l)]);
+        // feat OOB: tabela com feat_idx=5, F=2.
+        let bad_t = rfc0004_f32(&mut vm, &[3, 4], &[5.0, 0.0, 1.0, 2.0, 0.0, 0.0, -1.0, -1.0, 0.0, 0.0, -1.0, -1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, bad_t).unwrap();
+        assert!(vm.step_instruction(cid, &instr_forest(4, 0, 1, 2, 1, 2, FOREST_MODE_VOTE)).is_err());
+        // filho OOB: right=99, stride=3.
+        let bad_c = rfc0004_f32(&mut vm, &[3, 4], &[0.0, 0.0, 1.0, 99.0, 0.0, 0.0, -1.0, -1.0, 0.0, 0.0, -1.0, -1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, bad_c).unwrap();
+        assert!(vm.step_instruction(cid, &instr_forest(4, 0, 1, 2, 1, 2, FOREST_MODE_VOTE)).is_err());
+        // Folha NaN: trap (fail-closed). feats[0]=0.7>0.5 => slot 2 => NaN.
+        let one = rfc0004_f32(&mut vm, &[3, 4], &[0.0, 0.5, 1.0, 2.0, 0.0, 0.0, -1.0, -1.0, 0.0, 0.0, -1.0, -1.0]);
+        let nan_l = rfc0004_f32(&mut vm, &[3], &[0.0, 0.0, f32::NAN]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, one).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, nan_l).unwrap();
+        assert!(vm.step_instruction(cid, &instr_forest(4, 0, 1, 2, 1, 2, FOREST_MODE_VOTE)).is_err());
+        // Tabela cíclica (zeros): termina pelo teto depth, sem hang.
+        let cyc = rfc0004_f32(&mut vm, &[3, 4], &[0.0; 12]);
+        let cyc_l = rfc0004_f32(&mut vm, &[3], &[7.0, 0.0, 0.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, cyc).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, cyc_l).unwrap();
+        vm.step_instruction(cid, &instr_forest(4, 0, 1, 2, 1, 2, FOREST_MODE_VOTE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 1).unwrap(), vec![7.0]);
+        // Modo inválido via ctor direto: erro limpo.
+        let mut badm = instr_forest(4, 0, 1, 2, 1, 2, FOREST_MODE_VOTE);
+        badm.payload[4] = 9;
+        assert!(vm.step_instruction(cid, &badm).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rfc0012_ramp_table_traps() {
+        // TENSOR inicializa em ramp (i+1)*0.5: tabelas ramp NUNCA têm
+        // índices integrais => FOREST sobre TENSOR cru dá Err determinístico.
+        // Programa .m3asm não constrói tabelas válidas sem fill de literais
+        // (follow-up RFC-0012); goldens acima cobrem a execução real.
+        use crate::opcodes::assemble;
+        let prog = assemble("TENSOR r0 1 2 f32\nTENSOR r1 2 4 f32\nTENSOR r2 2 f32\nFOREST r4, r0, r1, r2 TREES=1 DEPTH=1 MODE=VOTE\nHALT").unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let root = vm.memory.current_version();
+        let cid = vm.scheduler.create_context(crate::context::Priority::Green, 0x1000, root);
+        for ins in prog.iter().take(3) {
+            vm.step_instruction(cid, ins).unwrap();
+        }
+        assert!(vm.step_instruction(cid, &prog[3]).is_err());
+        assert_eq!(vm.stats.forest_execs, 0);
+    }
+
+    // ---- RFC-0013: DENOISE goldens ----------------------------------
+
+    #[tokio::test]
+    async fn test_denoise_sigma0_manual() {
+        use crate::opcodes::instr_denoise_step;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // x=[4,2], eps=[1,0], abar=0.25, beta=0.36:
+        // alpha=0.64, coef=0.36/sqrt(0.75), out=[4.480385, 2.5] (1e-4).
+        let x = rfc0004_f32(&mut vm, &[2], &[4.0, 2.0]);
+        let e = rfc0004_f32(&mut vm, &[2], &[1.0, 0.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, e)]);
+        let st_before = vm.scheduler.get(cid).unwrap().rng_state;
+        vm.step_instruction(cid, &instr_denoise_step(4, 0, 1, 0xFF, 0.25, 0.36, 0.0, 7)).unwrap();
+        // sigma=0 NÃO consome RNG (reseed semantics limpas).
+        assert_eq!(vm.scheduler.get(cid).unwrap().rng_state, st_before);
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        let v = vm.memory.read_f32_tensor(out, 2).unwrap();
+        assert!((v[0] - 4.480385).abs() < 1e-4, "got {}", v[0]);
+        assert!((v[1] - 2.5).abs() < 1e-4, "got {}", v[1]);
+        assert_eq!(vm.stats.denoise_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_denoise_seeded_replay() {
+        use crate::opcodes::{instr_denoise_step, instr_rng_seed};
+        async fn run_once() -> (Vec<f32>, u64) {
+            let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+            let x = rfc0004_f32(&mut vm, &[4], &[0.5, -1.0, 2.0, 0.0]);
+            let e = rfc0004_f32(&mut vm, &[4], &[0.1, 0.2, -0.3, 0.4]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, e), (2, 777u128)]);
+            vm.step_instruction(cid, &instr_rng_seed(2)).unwrap();
+            vm.step_instruction(cid, &instr_denoise_step(4, 0, 1, 0xFF, 0.9, 0.05, 0.3, 42)).unwrap();
+            let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+            let st = vm.scheduler.get(cid).unwrap().rng_state;
+            (vm.memory.read_f32_tensor(out, 4).unwrap(), st)
+        }
+        let (a, sa) = run_once().await;
+        let (b, sb) = run_once().await;
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert_eq!(a, b, "mesma seed => mesmo rollout estocástico");
+        assert_eq!(sa, sb, "stream avança igual");
+        // Checagem independente da fiação: mesmos draws manuais.
+        let mut st = 777u64;
+        // NOTE: RNG_SEED usa o valor do reg como semente direta.
+        let mut draws = Vec::new();
+        for _ in 0..4 {
+            draws.push(crate::determinism::normal_f32(&mut st, 0.0, 1.0));
+        }
+        let (abar, beta, sigma) = (0.9f32, 0.05f32, 0.3f32);
+        let alpha = 1.0 - beta;
+        let coef = beta / (1.0 - abar).sqrt();
+        let inv = 1.0 / alpha.sqrt();
+        let x = [0.5f32, -1.0, 2.0, 0.0];
+        let e = [0.1f32, 0.2, -0.3, 0.4];
+        for (i, (got, z)) in a.iter().zip(draws.iter()).enumerate() {
+            let want = (x[i] - coef * e[i]) * inv + sigma * z;
+            assert!((got - want).abs() < 1e-5, "i={} got={} want={}", i, got, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_denoise_param_errors() {
+        use crate::opcodes::instr_denoise_step;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let x = rfc0004_f32(&mut vm, &[2], &[1.0, 2.0]);
+        let e = rfc0004_f32(&mut vm, &[2], &[0.1, 0.2]);
+        let bad = rfc0004_f32(&mut vm, &[3], &[0.0; 3]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, e), (2, bad)]);
+        // Parâmetros inválidos.
+        for (a, b, s) in [
+            (0.0, 0.02, 0.0),   // abar <= 0
+            (-0.5, 0.02, 0.0),  // abar negativo
+            (1.5, 0.02, 0.0),   // abar > 1
+            (0.9, -0.1, 0.0),   // beta negativo
+            (0.9, 1.0, 0.0),    // beta >= 1
+            (0.9, 0.02, -0.5),  // sigma negativo
+            (f32::NAN, 0.02, 0.0),
+            (0.9, f32::INFINITY, 0.0),
+        ] {
+            assert!(
+                vm.step_instruction(cid, &instr_denoise_step(4, 0, 1, 0xFF, a, b, s, 1)).is_err(),
+                "params ({},{},{}) devem falhar",
+                a, b, s
+            );
+        }
+        // abar=1 com eps não-nulo: divisão por zero.
+        assert!(vm.step_instruction(cid, &instr_denoise_step(4, 0, 1, 0xFF, 1.0, 0.02, 0.0, 1)).is_err());
+        // Shape mismatch e rsrc3 com tensor.
+        assert!(vm.step_instruction(cid, &instr_denoise_step(4, 0, 2, 0xFF, 0.9, 0.02, 0.0, 1)).is_err());
+        assert!(vm.step_instruction(cid, &instr_denoise_step(4, 0, 1, 2, 0.9, 0.02, 0.0, 1)).is_err());
+        assert_eq!(vm.stats.denoise_execs, 0, "erros não contabilizam");
+    }
+
+    // ---- RFC-0014: ODE goldens --------------------------------------
+
+    fn rfc0014_pack(vm: &mut Vm, w: &[f32], b: &[f32]) -> u128 {
+        let mut flat = w.to_vec();
+        flat.extend_from_slice(b);
+        rfc0004_f32(vm, &[flat.len()], &flat)
+    }
+
+    #[tokio::test]
+    async fn test_ode_euler_manual() {
+        use crate::opcodes::{instr_ode_step, ODE_METHOD_EULER};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // n=1, W=[0], b=[1]: f = SILU(1) = 0.7310586; x0=2, dt=0.5:
+        // out = 2 + 0.5*0.7310586 = 2.3655293.
+        let x = rfc0004_f32(&mut vm, &[1], &[2.0]);
+        let wb = rfc0014_pack(&mut vm, &[0.0], &[1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (2, wb)]);
+        vm.step_instruction(cid, &instr_ode_step(3, 0, 0xFF, 2, 0.5, ODE_METHOD_EULER, 0)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(3).unwrap();
+        let v = vm.memory.read_f32_tensor(out, 1).unwrap();
+        assert!((v[0] - 2.3655293).abs() < 1e-5, "got {}", v[0]);
+        assert_eq!(vm.stats.ode_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ode_rk4_vs_fine_euler() {
+        use crate::opcodes::{instr_ode_step, ODE_METHOD_RK4};
+        // Campo default (W=-0.1I) com controle: RK4 dt=0.1 vs referência
+        // Euler dt=0.0001 (implementação independente inline, não ode_field).
+        fn silu_ref(v: f32) -> f32 {
+            if v >= 0.0 { v / (1.0 + (-v).exp()) } else { let e = v.exp(); v * e / (1.0 + e) }
+        }
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let x = rfc0004_f32(&mut vm, &[2], &[1.0, -0.5]);
+        let u = rfc0004_f32(&mut vm, &[1], &[0.2]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, u)]);
+        vm.step_instruction(cid, &instr_ode_step(3, 0, 1, 0xFF, 0.1, ODE_METHOD_RK4, 0)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(3).unwrap();
+        let got = vm.memory.read_f32_tensor(out, 2).unwrap();
+        // Referência: Euler fino, campo reescrito à mão.
+        let mut xr = [1.0f32, -0.5f32];
+        let dt = 0.0001f32;
+        for _ in 0..1000 {
+            // f = SILU(-0.1x + û), û=[0.2, 0].
+            let f0 = silu_ref(-0.1 * xr[0] + 0.2);
+            let f1 = silu_ref(-0.1 * xr[1]);
+            xr[0] += dt * f0;
+            xr[1] += dt * f1;
+        }
+        assert!((got[0] - xr[0]).abs() < 1e-3, "got {} want {}", got[0], xr[0]);
+        assert!((got[1] - xr[1]).abs() < 1e-3, "got {} want {}", got[1], xr[1]);
+    }
+
+    #[tokio::test]
+    async fn test_ode_default_contracts_and_errors() {
+        use crate::opcodes::{instr_ode_step, ODE_METHOD_EULER};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let x = rfc0004_f32(&mut vm, &[2], &[2.0, -2.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x)]);
+        // Default contrativo: |x| encolhe num passo Euler.
+        vm.step_instruction(cid, &instr_ode_step(3, 0, 0xFF, 0xFF, 0.1, ODE_METHOD_EULER, 0)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(3).unwrap();
+        let v = vm.memory.read_f32_tensor(out, 2).unwrap();
+        assert!(v[0] < 2.0 && v[1] > -2.0, "contração: {:?}", v);
+        assert!(v.iter().all(|z| z.is_finite()));
+        // Params inválidos e shapes ruins: erro limpo, sem contabilizar.
+        let bad_dt = instr_ode_step(3, 0, 0xFF, 0xFF, 0.0, ODE_METHOD_EULER, 0);
+        assert!(vm.step_instruction(cid, &bad_dt).is_err());
+        let mut bad_dt = instr_ode_step(3, 0, 0xFF, 0xFF, 0.1, ODE_METHOD_EULER, 0);
+        bad_dt.payload[0..4].copy_from_slice(&(-1.0f32).to_le_bytes());
+        assert!(vm.step_instruction(cid, &bad_dt).is_err());
+        let mut bad_m = instr_ode_step(3, 0, 0xFF, 0xFF, 0.1, ODE_METHOD_EULER, 0);
+        bad_m.payload[4] = 9;
+        assert!(vm.step_instruction(cid, &bad_m).is_err());
+        // Pack com tamanho errado: n=2 precisa 2*3=6 elems.
+        let short = rfc0004_f32(&mut vm, &[4], &[1.0; 4]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, short).unwrap();
+        assert!(vm.step_instruction(cid, &instr_ode_step(3, 0, 0xFF, 5, 0.1, ODE_METHOD_EULER, 0)).is_err());
+        // x inexistente.
+        let nox = instr_ode_step(3, 0, 0xFF, 0xFF, 0.1, ODE_METHOD_EULER, 0);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, 0xDEADu128).unwrap();
+        assert!(vm.step_instruction(cid, &nox).is_err());
+        assert_eq!(vm.stats.ode_execs, 1);
+    }
+
+    // ---- RFC-0015: SPIKE goldens ------------------------------------
+
+    #[tokio::test]
+    async fn test_spike_lif_golden_refractory() {
+        use crate::opcodes::instr_spike_step;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        // n=3, thresh=1, decay=0.5, reset=0, refr=2, I=[2,0.5,4] constante.
+        // Passo 1: V=[1,.25,2] -> spikes [1,0,1] (==thresh dispara),
+        //   V=[0,.25,0], refr=[2,0,2].
+        // Passo 2: V=[1,.375,2], refr=[2,0,2] => ninguém dispara (refratários
+        //   seguram 0 e 2), spikes [0,0,0], refr=[1,0,1].
+        // Passo 4 (após passo 3 sem disparos): [1,0,1] de novo (ciclo).
+        let v = rfc0004_f32(&mut vm, &[3], &[0.0, 0.0, 0.0]);
+        let inp = rfc0004_f32(&mut vm, &[3], &[2.0, 0.5, 4.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(1, v), (2, inp)]);
+        let step = instr_spike_step(3, 1, 2, 0xFF, 1.0, 0.5, 0.0, 0, 2);
+        let run = |vm: &mut Vm, cid: u64| -> (Vec<f32>, Vec<f32>) {
+            vm.step_instruction(cid, &step).unwrap();
+            let s = vm.scheduler.get(cid).unwrap().reg(3).unwrap();
+            let vv = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+            (
+                vm.memory.read_f32_tensor(s, 3).unwrap(),
+                vm.memory.read_f32_tensor(vv, 3).unwrap(),
+            )
+        };
+        // Passo 1: V inicial é religado (CoW) — realimenta via r1.
+        let (s1, v1) = run(&mut vm, cid);
+        assert_eq!(s1, vec![1.0, 0.0, 1.0]);
+        assert_eq!(v1, vec![0.0, 0.25, 0.0]);
+        let (s2, v2) = run(&mut vm, cid);
+        assert_eq!(s2, vec![0.0, 0.0, 0.0]);
+        assert_eq!(v2, vec![1.0, 0.375, 2.0]);
+        let (s3, _) = run(&mut vm, cid);
+        assert_eq!(s3, vec![0.0, 0.0, 0.0]);
+        let (s4, v4) = run(&mut vm, cid);
+        assert_eq!(s4, vec![1.0, 0.0, 1.0], "ciclo refratário fecha");
+        assert_eq!(v4, vec![0.0, 0.46875, 0.0]);
+        assert_eq!(vm.stats.spike_execs, 4);
+    }
+
+    #[tokio::test]
+    async fn test_spike_pack_errors_rollback() {
+        use crate::opcodes::{instr_abort, instr_fork, instr_spike_step};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let v = rfc0004_f32(&mut vm, &[2], &[0.0, 0.0]);
+        let inp = rfc0004_f32(&mut vm, &[2], &[5.0, 0.1]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(1, v), (2, inp)]);
+        // Pack [thresh,decay,reset,refr] vence payload.
+        let pack = rfc0004_f32(&mut vm, &[4], &[0.5, 1.0, -1.0, 1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, pack).unwrap();
+        // Payload diria thresh=99 (nunca dispara); pack diz 0.5 (dispara n0).
+        vm.step_instruction(cid, &instr_spike_step(3, 1, 2, 0, 99.0, 0.9, 0.0, 1, 2)).unwrap();
+        let s = vm.scheduler.get(cid).unwrap().reg(3).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(s, 2).unwrap(), vec![1.0, 0.0]);
+        // V religado: n0 resetou p/ -1 (do pack), n1 = (0+0.1)*1 = 0.1.
+        let vv = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(vv, 2).unwrap(), vec![-1.0, 0.1]);
+        // Pack inválido: len, refr fracionário, decay fora de [0,1].
+        let bad_len = rfc0004_f32(&mut vm, &[3], &[1.0; 3]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, bad_len).unwrap();
+        assert!(vm.step_instruction(cid, &instr_spike_step(3, 1, 2, 0, 1.0, 0.9, 0.0, 1, 2)).is_err());
+        let bad_r = rfc0004_f32(&mut vm, &[4], &[1.0, 0.9, 0.0, 2.5]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, bad_r).unwrap();
+        assert!(vm.step_instruction(cid, &instr_spike_step(3, 1, 2, 0, 1.0, 0.9, 0.0, 1, 2)).is_err());
+        // decay via payload fora de [0,1].
+        let mut bad_d = instr_spike_step(3, 1, 2, 0xFF, 1.0, 1.5, 0.0, 1, 2);
+        let _ = &bad_d;
+        assert!(vm.step_instruction(cid, &bad_d).is_err());
+        // Shape mismatch V/I.
+        let bad_i = rfc0004_f32(&mut vm, &[3], &[1.0; 3]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, bad_i).unwrap();
+        assert!(vm.step_instruction(cid, &instr_spike_step(3, 1, 2, 0xFF, 1.0, 0.9, 0.0, 1, 2)).is_err());
+        // Rollback: FORK, passo suja, ABORT(ts=v1) restaura handles; V velho intacto.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, inp).unwrap();
+        vm.step_instruction(cid, &instr_fork(5, 0)).unwrap();
+        let v1 = vm.memory.current_version();
+        let before = vm.snn_layers.clone();
+        vm.step_instruction(cid, &instr_spike_step(3, 1, 2, 0xFF, 1.0, 0.9, 0.0, 1, 2)).unwrap();
+        assert_ne!(vm.snn_layers.get(&1).copied(), before.get(&1).copied());
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, v1 as u128).unwrap();
+        vm.step_instruction(cid, &instr_abort(5, 4)).unwrap();
+        assert_eq!(vm.snn_layers, before);
+        assert_eq!(vm.stats.spike_execs, 2);
     }
 }

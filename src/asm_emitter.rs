@@ -71,25 +71,48 @@ impl AsmEmitter {
         out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
         out.push(String::new());
 
+        let is_mamba = self.config.is_mamba();
+        let head_dim = if self.config.n_heads > 0 && self.config.hidden % self.config.n_heads == 0 {
+            self.config.hidden / self.config.n_heads
+        } else {
+            self.config.hidden
+        };
+        let n_heads = if self.config.n_heads > 0 && self.config.hidden % self.config.n_heads == 0 {
+            self.config.n_heads
+        } else {
+            1
+        };
         for layer in 0..self.config.n_layers {
             out.push(format!("    ; ===== camada {} ===== ({} layers total)", layer, self.config.n_layers));
             // NORM1: R1 = RMSNorm(R0) [1, hidden]
             out.push(format!("    NORM r1, r0, r0, r0   ; R1 = norm(R0) layer {}", layer));
-            // Q/K/V/O projections via MATVEC + ATTN (usa pesos reais quando shape colide com GGUF)
-            // Para Fase 1, emitimos MATVEC com shapes que mapeiam para GGUF distintos via try_gguf used-set:
-            // Q/K/V/O todos [hidden, hidden] (4M) mapeiam para blk.{}.attn_q/k/v/output distintos.
-            out.push(format!("    TENSOR r6 {} {} f32 ; q_proj layer {} [hidden, hidden]", self.config.hidden, self.config.hidden, layer));
-            out.push(format!("    MATVEC r2, r1, r6      ; R2 = R1 * q_proj layer {}", layer));
-            out.push(format!("    TENSOR r7 {} {} f32 ; k_proj layer {}", self.config.hidden, self.config.hidden, layer));
-            out.push(format!("    MATVEC r3, r1, r7      ; R3 = R1 * k_proj layer {}", layer));
-            out.push(format!("    TENSOR r8 {} {} f32 ; v_proj layer {}", self.config.hidden, self.config.hidden, layer));
-            out.push(format!("    MATVEC r4, r1, r8      ; R4 = R1 * v_proj layer {}", layer));
-            out.push(format!("    ATTN r5, r2, r3, r4   ; R5 = attn(Q=R2,K=R3,V=R4) layer {}", layer));
-            out.push(format!("    TENSOR r6 {} {} f32 ; o_proj layer {} [hidden, hidden]", self.config.hidden, self.config.hidden, layer));
-            out.push(format!("    MATVEC r5, r5, r6      ; R5 = R5 * o_proj layer {}", layer));
-            out.push("    SENSE r15, USER_INPUT".to_string());
-            out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
-            out.push(format!("    ADD r0, r0, r5       ; R0 += attn_out layer {}", layer));
+            if is_mamba {
+                // Mamba: scan recorrente O(1) sobre estado da Vm (Rh=_ => ssm_states[layer]).
+                // Pack de params (dt/A/B/C/D) viria do GGUF; sem pack usa defaults (dt=1,A=-1,B=C=1,D=0).
+                out.push(format!("    CTX_SWITCH MAMBA, GREEN ; pipeline SSM layer {}", layer));
+                out.push(format!("    SSM_SCAN r5, r1, _, _ D_INNER={} D_STATE={} LAYER={} ; R5 = scan(R1) layer {}", self.config.d_inner, self.config.d_state, layer % 256, layer));
+                out.push("    SENSE r15, USER_INPUT".to_string());
+                out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
+                out.push(format!("    ADD r0, r0, r5       ; R0 += ssm_out layer {}", layer));
+            } else {
+                // Q/K/V/O projections via MATVEC + ROPE + ATTN (usa pesos reais quando shape colide com GGUF)
+                // Para Fase 1, emitimos MATVEC com shapes que mapeiam para GGUF distintos via try_gguf used-set:
+                // Q/K/V/O todos [hidden, hidden] (4M) mapeiam para blk.{}.attn_q/k/v/output distintos.
+                out.push(format!("    TENSOR r6 {} {} f32 ; q_proj layer {} [hidden, hidden]", self.config.hidden, self.config.hidden, layer));
+                out.push(format!("    MATVEC r2, r1, r6      ; R2 = R1 * q_proj layer {}", layer));
+                out.push(format!("    TENSOR r7 {} {} f32 ; k_proj layer {}", self.config.hidden, self.config.hidden, layer));
+                out.push(format!("    MATVEC r3, r1, r7      ; R3 = R1 * k_proj layer {}", layer));
+                out.push(format!("    ROPE r2, r2 POS={} HDIM={} NHEADS={} ; RoPE(Q) layer {}", layer % 2048, head_dim, n_heads, layer));
+                out.push(format!("    ROPE r3, r3 POS={} HDIM={} NHEADS={} ; RoPE(K) layer {}", layer % 2048, head_dim, n_heads, layer));
+                out.push(format!("    TENSOR r8 {} {} f32 ; v_proj layer {}", self.config.hidden, self.config.hidden, layer));
+                out.push(format!("    MATVEC r4, r1, r8      ; R4 = R1 * v_proj layer {}", layer));
+                out.push(format!("    ATTN r5, r2, r3, r4   ; R5 = attn(Q=R2,K=R3,V=R4) layer {}", layer));
+                out.push(format!("    TENSOR r6 {} {} f32 ; o_proj layer {} [hidden, hidden]", self.config.hidden, self.config.hidden, layer));
+                out.push(format!("    MATVEC r5, r5, r6      ; R5 = R5 * o_proj layer {}", layer));
+                out.push("    SENSE r15, USER_INPUT".to_string());
+                out.push("    IF_INTERRUPT HANDLE_ABORT".to_string());
+                out.push(format!("    ADD r0, r0, r5       ; R0 += attn_out layer {}", layer));
+            }
             // NORM2
             out.push(format!("    NORM r1, r0, r0, r0   ; norm2 layer {}", layer));
             // FFN stub: usa W1/W2 dummy 64 (Fase 2 fará gate/up/down reais com SILU+MUL)
@@ -122,8 +145,13 @@ impl AsmEmitter {
     }
 
     pub fn estimate_instr_count(&self) -> usize {
-        // prólogo 3 + MAIN_LOOP 5 + n_layers*24 (NORM+4×TENSOR+4×MATVEC+ATTN+SILU+MUL+ADD) + epílogo 7
-        3 + 5 + self.config.n_layers * 24 + 7
+        // prólogo 5 (3×TENSOR+SENSE+IF_INTERRUPT) + MAIN_LOOP 4 (SENSE+FORK+SENSE+IF_INTERRUPT)
+        // + n_layers*20 transformer (NORM+2×(TENSOR+MATVEC)+2×ROPE+TENSOR+MATVEC+ATTN+TENSOR+MATVEC
+        //   +SENSE+IF_INTERRUPT+ADD+NORM+FFN+SENSE+IF_INTERRUPT+ADD)
+        //   ou n_layers*6 mamba (NORM+CTX_SWITCH+SSM_SCAN+SENSE+IF_INTERRUPT+ADD)
+        // + epílogo 9 (SAMPLE+STREAM+SENSE+IF_INTERRUPT+COMPARE+IF_EQUAL+JUMP+JUMP+HALT)
+        let per_layer = if self.config.is_mamba() { 6 } else { 20 };
+        5 + 4 + self.config.n_layers * per_layer + 9
     }
 
     /// Escreve arquivo `.m3asm` no path informado.

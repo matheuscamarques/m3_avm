@@ -28,6 +28,7 @@ pub mod matvec_quant;
 pub mod mimi;
 pub mod moshi;
 pub mod ssm;
+pub mod determinism;
 #[cfg(feature = "wgpu")]
 pub mod inference_gpu;
 pub mod tui;
@@ -552,7 +553,17 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
             | opcodes::OP_COMPARE
             | opcodes::OP_JUMP
             | opcodes::OP_IF_EQUAL
-            | opcodes::OP_IF_INTERRUPT => vm.step_instruction(ctx_id, &instr),
+            | opcodes::OP_IF_INTERRUPT
+            | opcodes::OP_MATVEC
+            | opcodes::OP_MUL
+            | opcodes::OP_SILU
+            | opcodes::OP_SSM_SCAN
+            | opcodes::OP_SSM_RESET
+            | opcodes::OP_CODEC_ENC
+            | opcodes::OP_CODEC_DEC
+            | opcodes::OP_AUDIO_ALIGN
+            | opcodes::OP_CTX_SWITCH
+            | opcodes::OP_ROPE => vm.step_instruction(ctx_id, &instr),
             opcodes::OP_ATTN => {
                 // Checa interrupção antes (watch 0 custo)
                 if let Some(sig) = bus.has_interrupt() { if sig.target_ctx == ctx_id { eprintln!("[ATTN preemptado por ABORT antes]"); } }
@@ -616,7 +627,7 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
                             vm.memory.read(src, 16).ok().map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()).unwrap_or(vec![0.5;4])
                         }
                     } else { vec![0.5;4] };
-                    let tok = vm.sample_logits(&logits);
+                    let tok = crate::determinism::sample_logits_host(&logits);
                     vm.last_sample = tok;
                     if trace { eprintln!("[SAMPLE tok {} from {} logits]", tok, logits.len()); }
                     let entropy = rollback::compute_entropy(&logits);
@@ -664,7 +675,7 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
                             vm.memory.read(src, 16).ok().map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()).unwrap_or(vec![0.5;4])
                         }
                     } else { vec![0.5;4] };
-                    let tok = vm.sample_logits(&logits);
+                    let tok = crate::determinism::sample_logits_host(&logits);
                     vm.last_sample = tok;
                     if trace { eprintln!("[SAMPLE tok {} from {} logits]", tok, logits.len()); }
                     let entropy = rollback::compute_entropy(&logits);
@@ -737,13 +748,14 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
                 let label_pc = u128::from_le_bytes(ibb);
                 let child_pc = if label_pc != 0 { label_pc } else { parent.pc.wrapping_add(32) };
                 let new_id = vm.scheduler.create_context(prio, child_pc, snap);
-                if let Some(child) = vm.scheduler.get_mut(new_id) { child.regs = parent.regs; }
+                if let Some(child) = vm.scheduler.get_mut(new_id) { child.regs = parent.regs; child.rng_state = parent.rng_state; }
                 if let Some(p) = vm.scheduler.get_mut(ctx_id) { let _ = p.set_reg(instr.rdest, new_id as u128); }
                 vm.stats.forks += 1;
                 let _ = bus.publish_sched(crate::bus::SchedSignal{ new_ctx: new_id, prio });
                 // Salva checkpoint tese (a cada FORK) — 39µs CoW — V1 usa para rollback por entropia
                 let cp_pc = child_pc;
                 checkpoints.push(Checkpoint { version: snap, pc: cp_pc, token_idx: output_buffer.len() });
+                crate::rollback::prune_oldest(&mut checkpoints, crate::rollback::HOST_CHECKPOINT_WINDOW);
                 if trace { eprintln!("[Checkpoint v{} pc 0x{:x} tok {}]", snap, cp_pc, output_buffer.len()); }
                 Ok(true)
             }
@@ -974,6 +986,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
                     // Checkpoint inicial
                     let ver = vm.memory.snapshot();
                     checkpoints.push(Checkpoint{ version: ver, token_idx: 0 });
+                    crate::rollback::prune_oldest(&mut checkpoints, crate::rollback::HOST_CHECKPOINT_WINDOW);
                 }
             },
             tui::Input::Eof => {
@@ -1025,6 +1038,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
             if output_buffer.len() % 1 == 0 {
                 let ver = vm.memory.snapshot();
                 checkpoints.push(Checkpoint{ version: ver, token_idx: output_buffer.len() });
+            crate::rollback::prune_oldest(&mut checkpoints, crate::rollback::HOST_CHECKPOINT_WINDOW);
             }
             current_token = next;
             steps += 1; vm.stats.steps += 1; vm.stats.streams += 1;
@@ -1059,6 +1073,7 @@ async fn run_real_interactive(mut vm: vm::Vm, mut real: crate::inference::RealIn
         if output_buffer.len() % 1 == 0 {
             let ver = vm.memory.snapshot();
             checkpoints.push(Checkpoint{ version: ver, token_idx: output_buffer.len() });
+            crate::rollback::prune_oldest(&mut checkpoints, crate::rollback::HOST_CHECKPOINT_WINDOW);
             if trace { eprintln!("[Real Checkpoint v{} tok {}]", ver, output_buffer.len()); }
         }
 
@@ -1137,5 +1152,5 @@ fn is_probably_bin(bytes: &[u8]) -> bool {
         return false;
     }
     let opcode = bytes[0];
-    matches!(opcode, 0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0xFF)
+    matches!(opcode, 0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F | 0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0xFF)
 }

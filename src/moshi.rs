@@ -3,7 +3,7 @@
 //! PersonaPlex-7B é base Kyutai Moshi (`moshiko` weights):
 //! Temporal 32 layers dim=4096 32 heads SwiGLU (ff=11264) + Depformer 6 layers
 //! dim=1024 16 heads + Mimi 16 codebooks 12.5Hz 24kHz, 17 streams
-//! (1 texto + 8 user + 8 agent). Ref: `docs/PLANO_MOSHI_NATIVO.md`.
+//! (1 texto + 8 user + 8 agent). Ref: `docs/ESPEC.md` §14.
 //!
 //! Escopo F1+F3a: config/loader/nomes + forward temporal/depformer (stub com
 //! pesos injetáveis; pesos GGUF reais entram em F3b via `matvec_quant`).
@@ -39,6 +39,8 @@ pub const MOSHI_DEP_HEADS: usize = 16;
 pub const MOSHI_DEP_FF: usize = 2816;
 /// `dep_q` do Depformer (pesos por codebook).
 pub const MOSHI_DEP_Q: usize = 16;
+/// Janela do KV do depformer (`depformer_context: 8` no config real).
+pub const DEPFORMER_CONTEXT: usize = 8;
 pub const MOSHI_ROPE_THETA: f32 = 10_000.0;
 pub const MOSHI_NORM_EPS: f32 = 1e-5;
 
@@ -165,8 +167,8 @@ impl MoshiConfig {
         if let Some(v) = get(&["hidden_dim", "intermediate_size", "ffn_dim"]) { cfg.intermediate = v; }
         if let Some(v) = get(&["depformer_num_layers", "num_depformer_layers"]) { cfg.dep_layers = v; }
         if let Some(v) = get(&["depformer_dim"]) { cfg.dep_dim = v; }
-        if let Some(v) = get(&["num_codebooks", "n_codebooks", "codebooks"]) { cfg.codebooks = v; }
-        if let Some(v) = get(&["vocab_size", "text_vocab_size"]) { cfg.text_vocab = v; }
+        if let Some(v) = get(&["num_codebooks", "n_codebooks", "codebooks", "n_q", "dep_q"]) { cfg.codebooks = v; }
+        if let Some(v) = get(&["vocab_size", "text_vocab_size", "text_card"]) { cfg.text_vocab = v; }
         cfg
     }
 }
@@ -309,7 +311,7 @@ pub fn count_moshi_tensors(gg: &GgufFile, cfg: &MoshiConfig) -> usize {
     names.iter().map(|l| [l.q, l.k, l.v, l.o, l.gate, l.up, l.down, l.attn_norm, l.ffn_norm].into_iter().flatten().count()).sum()
 }
 
-/// Mapa textual para `docs/MOSHI_MAP.md` (gerado, não lido em runtime).
+/// Mapa textual para `docs/ESPEC.md` §14 (gerado, não lido em runtime).
 pub fn describe_map(cfg: &MoshiConfig) -> String {
     let mut s = String::new();
     s.push_str(&format!("# MOSHI_MAP (gerado): arch={} hidden={} layers={} heads={} ff={} dep={}x{} codebooks={}\n\n", cfg.arch, cfg.hidden, cfg.n_layers, cfg.n_heads, cfg.intermediate, cfg.dep_layers, cfg.dep_dim, cfg.codebooks));
@@ -356,6 +358,8 @@ pub enum MoshiStack {
 pub trait MoshiWeights {
     fn matvec(&mut self, stack: MoshiStack, layer: usize, kind: &str, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32>;
     fn norm_gamma(&mut self, stack: MoshiStack, layer: usize, kind: &str, dim: usize) -> Vec<f32>;
+    /// Início de frame: limpa memo de fused (pesos reais). Default no-op.
+    fn begin_frame(&mut self) {}
 }
 
 /// Pesos dummy: `y[j] = 0.5*sum(x)`, gamma 1.0.
@@ -444,6 +448,7 @@ impl<W: MoshiWeights> MoshiInference<W> {
         let t_total = std::time::Instant::now();
         let h = self.cfg.hidden;
         assert_eq!(frame_mix.len(), h, "frame_mix deve ter hidden={} floats", h);
+        self.weights.begin_frame();
 
         // Delay acústico simplificado: média com o frame anterior.
         let input: Vec<f32> = delay_mix(self.delay_prev.as_deref(), frame_mix);
@@ -517,20 +522,14 @@ impl<W: MoshiWeights> MoshiInference<W> {
         hidden_cur
     }
 
-    /// Depformer: projeta hidden->dep_dim, `dep_layers` blocos com KV próprio,
-    /// 16 códigos por média de chunks quantizada.
+    /// Depformer: projeta hidden->dep_dim, `dep_layers` blocos com KV próprio
+    /// (janela `DEPFORMER_CONTEXT`), 16 códigos por média de chunks quantizada.
+    /// Sem RoPE: `depformer_pos_emb none` no config real.
     fn forward_depformer(&mut self, hidden: &[f32]) -> (Vec<f32>, [u16; MOSHI_N_CODEBOOKS]) {
         let h = self.cfg.hidden;
         let d = self.cfg.dep_dim;
         let heads_cfg = self.cfg.dep_heads.max(1);
         let (n_heads, head_dim) = if d % heads_cfg == 0 { (heads_cfg, d / heads_cfg) } else { (1, d) };
-        let pos = self.frames;
-        let freqs: Vec<(f32, f32)> = (0..head_dim.max(2) / 2)
-            .map(|i| {
-                let f = pos as f32 * self.cfg.rope_theta.powf(-2.0 * i as f32 / head_dim.max(1) as f32);
-                (f.cos(), f.sin())
-            })
-            .collect();
 
         let mut dep = self.weights.matvec(MoshiStack::Depformer, 0, "proj", hidden, h, d);
         let mut normed = vec![0.0f32; d];
@@ -542,16 +541,17 @@ impl<W: MoshiWeights> MoshiInference<W> {
             let proj = self.weights.matvec(MoshiStack::Depformer, l, "in_proj", &normed, d, d);
             let mut dep2 = vec![0.0f32; d];
             for i in 0..d { dep2[i] = dep[i] + proj[i]; }
-            // Atenção do depformer sobre seu KV (1 passo/frame no stub).
+            // Atenção do depformer sobre seu KV (1 passo/frame no stub, sem RoPE).
             let q = self.weights.matvec(MoshiStack::Depformer, l, "q", &dep2, d, d);
             let k = self.weights.matvec(MoshiStack::Depformer, l, "k", &dep2, d, d);
             let v = self.weights.matvec(MoshiStack::Depformer, l, "v", &dep2, d, d);
-            let mut q = q;
-            let mut k = k;
-            apply_rope(&mut q, n_heads, head_dim, &freqs);
-            apply_rope(&mut k, n_heads, head_dim, &freqs);
             self.dep_kv_k[l].extend_from_slice(&k);
             self.dep_kv_v[l].extend_from_slice(&v);
+            // Janela deslizante (`depformer_context: 8` no config real).
+            while self.dep_kv_k[l].len() / d > DEPFORMER_CONTEXT {
+                self.dep_kv_k[l].drain(..d);
+                self.dep_kv_v[l].drain(..d);
+            }
             let seq = self.dep_kv_k[l].len() / d;
             let mut agg = vec![0.0f32; d];
             per_head_attn(&q, &self.dep_kv_k[l], &self.dep_kv_v[l], n_heads, head_dim, seq, &mut agg);
@@ -624,6 +624,304 @@ fn per_head_attn(q: &[f32], k_cache: &[f32], v_cache: &[f32], n_heads: usize, he
             let w = scores[i];
             for j in 0..head_dim { out[hb + j] += w * vb[j]; }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pesos GGUF reais, formato moshi.cpp `lm.*` fused (F3b)
+// ---------------------------------------------------------------------------
+// Layout medido em `models/personaplex-7b-v1-q4_k.gguf` (655 tensores,
+// `n_kv=0`, dtypes Q4_K=545/F32=77/Q4_0=33). Ver `docs/ESPEC.md` §14.
+// Temporal por camada: `in_projs.0 [4096,12288]` (QKV packed), `out_projs.0`
+// [4096,4096], `gating.linear_in [4096,22528]` (gate+up packed, ff=11264),
+// `gating.linear_out [11264,4096]`, `norm1/norm2.alpha [4096]` F32.
+// Depformer por camada: `in_projs.0 [1024,3072]`, `out_projs.0 [1024,1024]`,
+// `gating.{c}.linear_in [1024,5632]` x16 codebooks (F3b usa `gating.0` p/
+// todos; per-codebook em F4), `gating.0.linear_out [2816,1024]`, norms F32.
+// Entrada depformer: `depformer_in.0 [4096,1024]` (F3b usa `.0` p/ todos).
+
+/// Nome de tensor temporal moshi.cpp por (camada, kind fused).
+pub fn temporal_cpp_name(layer: usize, kind: &str) -> String {
+    let b = format!("lm.transformer.layers.{}", layer);
+    match kind {
+        "qkv" => format!("{}.self_attn.in_projs.0.weight", b),
+        "o" => format!("{}.self_attn.out_projs.0.weight", b),
+        "fused_gate" => format!("{}.gating.linear_in.weight", b),
+        "down" => format!("{}.gating.linear_out.weight", b),
+        "norm1" => format!("{}.norm1.alpha", b),
+        "norm2" => format!("{}.norm2.alpha", b),
+        _ => String::new(),
+    }
+}
+
+/// Nome de tensor depformer moshi.cpp por (camada, kind fused).
+pub fn depformer_cpp_name(layer: usize, kind: &str) -> String {
+    let b = format!("lm.depformer.layers.{}", layer);
+    match kind {
+        "qkv" => format!("{}.self_attn.in_projs.0.weight", b),
+        "o" => format!("{}.self_attn.out_projs.0.weight", b),
+        "fused_gate" => format!("{}.gating.0.linear_in.weight", b),
+        "down" => format!("{}.gating.0.linear_out.weight", b),
+        "norm1" => format!("{}.norm1.alpha", b),
+        "norm2" => format!("{}.norm2.alpha", b),
+        _ => String::new(),
+    }
+}
+
+/// Índices fused do Temporal por camada (`None` = ausente → dummy).
+#[derive(Debug, Clone, Default)]
+pub struct MoshiCppTemporal {
+    pub qkv: Option<usize>,
+    pub o: Option<usize>,
+    pub fused_gate: Option<usize>,
+    pub down: Option<usize>,
+    pub norm1: Option<usize>,
+    pub norm2: Option<usize>,
+}
+
+/// Índices fused do Depformer por camada.
+#[derive(Debug, Clone, Default)]
+pub struct MoshiCppDep {
+    pub qkv: Option<usize>,
+    pub o: Option<usize>,
+    pub fused_gate: Option<usize>,
+    pub down: Option<usize>,
+    pub norm1: Option<usize>,
+    pub norm2: Option<usize>,
+}
+
+fn resolve_cpp_in(gg: &GgufFile, name: &str) -> Option<usize> {
+    if name.is_empty() { return None; }
+    gg.tensors.iter().position(|t| t.name == name)
+}
+
+/// Sonda camadas `0..` até a primeira sem nenhum tensor conhecido.
+/// Retorna (temporal, depformer, depformer_in.0).
+pub fn resolve_moshi_cpp(gg: &GgufFile) -> (Vec<MoshiCppTemporal>, Vec<MoshiCppDep>, Option<usize>) {
+    let mut t = Vec::new();
+    for l in 0..256 {
+        let layer = MoshiCppTemporal {
+            qkv: resolve_cpp_in(gg, &temporal_cpp_name(l, "qkv")),
+            o: resolve_cpp_in(gg, &temporal_cpp_name(l, "o")),
+            fused_gate: resolve_cpp_in(gg, &temporal_cpp_name(l, "fused_gate")),
+            down: resolve_cpp_in(gg, &temporal_cpp_name(l, "down")),
+            norm1: resolve_cpp_in(gg, &temporal_cpp_name(l, "norm1")),
+            norm2: resolve_cpp_in(gg, &temporal_cpp_name(l, "norm2")),
+        };
+        let any = layer.qkv.is_some() || layer.o.is_some() || layer.fused_gate.is_some()
+            || layer.down.is_some() || layer.norm1.is_some() || layer.norm2.is_some();
+        if !any { break; }
+        t.push(layer);
+    }
+    let mut d = Vec::new();
+    for l in 0..64 {
+        let layer = MoshiCppDep {
+            qkv: resolve_cpp_in(gg, &depformer_cpp_name(l, "qkv")),
+            o: resolve_cpp_in(gg, &depformer_cpp_name(l, "o")),
+            fused_gate: resolve_cpp_in(gg, &depformer_cpp_name(l, "fused_gate")),
+            down: resolve_cpp_in(gg, &depformer_cpp_name(l, "down")),
+            norm1: resolve_cpp_in(gg, &depformer_cpp_name(l, "norm1")),
+            norm2: resolve_cpp_in(gg, &depformer_cpp_name(l, "norm2")),
+        };
+        let any = layer.qkv.is_some() || layer.o.is_some() || layer.fused_gate.is_some()
+            || layer.down.is_some() || layer.norm1.is_some() || layer.norm2.is_some();
+        if !any { break; }
+        d.push(layer);
+    }
+    let proj = resolve_cpp_in(gg, "lm.depformer_in.0.weight");
+    (t, d, proj)
+}
+
+/// Quantos tensores fused moshi.cpp existem no GGUF (0 = outro formato).
+pub fn count_moshi_cpp_tensors(gg: &GgufFile) -> usize {
+    let (t, d, proj) = resolve_moshi_cpp(gg);
+    let ct: usize = t.iter().map(|l| [l.qkv, l.o, l.fused_gate, l.down, l.norm1, l.norm2].into_iter().flatten().count()).sum();
+    let cd: usize = d.iter().map(|l| [l.qkv, l.o, l.fused_gate, l.down, l.norm1, l.norm2].into_iter().flatten().count()).sum();
+    ct + cd + proj.map(|_| 1).unwrap_or(0)
+}
+
+/// Pesos GGUF reais via `matvec_quant` fused + dequant cache.
+/// `q/k/v` computam o fused `qkv` 1×/frame (memo em `begin_frame`) e dividem
+/// em terços; `gate/up` idem sobre `fused_gate` (metades). Tensor ausente ou
+/// com shape inesperado → dummy 0.5 (mesmo fallback de `DummyMoshiWeights`).
+pub struct GgufMoshiWeights<'a> {
+    gg: &'a GgufFile,
+    mem: &'a crate::vm::MemBackend,
+    t: Vec<MoshiCppTemporal>,
+    d: Vec<MoshiCppDep>,
+    proj_in: Option<usize>,
+    dequant_cache: std::collections::HashMap<usize, Vec<f32>>,
+    /// Memo fused por frame: (stack 0=temporal/1=dep, layer, which 0=qkv/1=gate).
+    fused_memo: std::collections::HashMap<(u8, usize, u8), Vec<f32>>,
+}
+
+impl<'a> GgufMoshiWeights<'a> {
+    pub fn new(gg: &'a GgufFile, mem: &'a crate::vm::MemBackend) -> Self {
+        let (t, d, proj_in) = resolve_moshi_cpp(gg);
+        Self { gg, mem, t, d, proj_in, dequant_cache: std::collections::HashMap::new(), fused_memo: std::collections::HashMap::new() }
+    }
+
+    /// Camadas temporais resolvidas (para checar cobertura em testes/CLI).
+    pub fn n_temporal(&self) -> usize {
+        self.t.len()
+    }
+
+    /// Camadas depformer resolvidas.
+    pub fn n_depformer(&self) -> usize {
+        self.d.len()
+    }
+
+    fn raw_of(&self, idx: usize, len: usize) -> Option<Vec<u8>> {
+        let info = self.gg.tensors.get(idx)?;
+        let file_offset = self.gg.data_offset + info.offset;
+        if let Some(s) = self.mem.read_model_raw(file_offset, len) {
+            return Some(s.to_vec());
+        }
+        let paddr = crate::memory::make_persistent_addr(file_offset as u128);
+        self.mem.read(paddr, len).ok()
+    }
+
+    /// Caminho direto: fused `matvec_quant` (Q4_K/Q4_0/Q8_0/Q6_K) ou dequant
+    /// cache + `matvec` (F32/F16). `None` = sem peso (caller usa dummy).
+    pub(crate) fn fused_or_cached(&mut self, idx: usize, x: &[f32], in_dim: usize, out_dim: usize) -> Option<Vec<f32>> {
+        let info = self.gg.tensors.get(idx)?;
+        if info.n_elements != in_dim * out_dim {
+            return None;
+        }
+        if let Some(raw_len) = crate::matvec_quant::quant_raw_len(info.dtype, info.n_elements) {
+            if let Some(raw) = self.raw_of(idx, raw_len) {
+                if let Some(y) = crate::matvec_quant::matvec_quant(x, &raw, info.dtype, in_dim, out_dim) {
+                    return Some(y);
+                }
+            }
+        }
+        if let Some(w) = self.dequant_cache.get(&idx) {
+            return Some(crate::matvec::matvec(x, w, in_dim, out_dim));
+        }
+        let raw_len = match info.dtype {
+            0 => info.n_elements * 4,
+            1 => info.n_elements * 2,
+            _ => return None,
+        };
+        let raw = self.raw_of(idx, raw_len)?;
+        let mut dst = vec![0.0f32; info.n_elements];
+        if !crate::quant::dequantize(&raw, info.dtype, &mut dst, info.n_elements) {
+            return None;
+        }
+        let y = crate::matvec::matvec(x, &dst, in_dim, out_dim);
+        self.dequant_cache.insert(idx, dst);
+        Some(y)
+    }
+
+    /// Fused memoizado (qkv ou gate) + divisão em partes iguais.
+    fn fused_part(&mut self, stack: u8, layer: usize, which: u8, idx: usize, x: &[f32], in_dim: usize, parts: usize, part: usize) -> Option<Vec<f32>> {
+        let key = (stack, layer, which);
+        if let Some(full) = self.fused_memo.get(&key) {
+            return Some(split_part(full, parts, part));
+        }
+        let info = self.gg.tensors.get(idx)?;
+        if info.n_elements % in_dim != 0 {
+            return None;
+        }
+        let fused_out = info.n_elements / in_dim;
+        let full = self.fused_or_cached(idx, x, in_dim, fused_out)?;
+        let out = split_part(&full, parts, part);
+        self.fused_memo.insert(key, full);
+        Some(out)
+    }
+
+    fn layer_idx(&self, stack: MoshiStack, layer: usize, kind: &str) -> Option<(u8, usize, u8, usize, usize, usize)> {
+        // Retorna (stack_id, layer, which, idx, parts, part) para fused,
+        // ou idx direto via which=255 para tensores não-fused.
+        match stack {
+            MoshiStack::Temporal => {
+                let l = self.t.get(layer)?;
+                match kind {
+                    "q" => Some((0, layer, 0, l.qkv?, 3, 0)),
+                    "k" => Some((0, layer, 0, l.qkv?, 3, 1)),
+                    "v" => Some((0, layer, 0, l.qkv?, 3, 2)),
+                    "o" => Some((0, layer, 255, l.o?, 1, 0)),
+                    "gate" => Some((0, layer, 1, l.fused_gate?, 2, 0)),
+                    "up" => Some((0, layer, 1, l.fused_gate?, 2, 1)),
+                    "down" => Some((0, layer, 255, l.down?, 1, 0)),
+                    _ => None,
+                }
+            }
+            MoshiStack::Depformer => {
+                let l = self.d.get(layer)?;
+                match kind {
+                    "q" => Some((1, layer, 0, l.qkv?, 3, 0)),
+                    "k" => Some((1, layer, 0, l.qkv?, 3, 1)),
+                    "v" => Some((1, layer, 0, l.qkv?, 3, 2)),
+                    "in_proj" => Some((1, layer, 0, l.qkv?, 3, 0)),
+                    "o" => Some((1, layer, 255, l.o?, 1, 0)),
+                    "gate" => Some((1, layer, 1, l.fused_gate?, 2, 0)),
+                    "up" => Some((1, layer, 1, l.fused_gate?, 2, 1)),
+                    "down" => Some((1, layer, 255, l.down?, 1, 0)),
+                    "proj" => Some((1, layer, 255, self.proj_in?, 1, 0)),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+/// Divide vetor fused em `parts` partes iguais, retornando a `part`.
+fn split_part(full: &[f32], parts: usize, part: usize) -> Vec<f32> {
+    let n = full.len() / parts;
+    full[part * n..(part + 1) * n].to_vec()
+}
+
+fn dummy_matvec(x: &[f32], out_dim: usize) -> Vec<f32> {
+    vec![0.5 * x.iter().sum::<f32>(); out_dim]
+}
+
+impl<'a> MoshiWeights for GgufMoshiWeights<'a> {
+    fn begin_frame(&mut self) {
+        self.fused_memo.clear();
+    }
+
+    fn matvec(&mut self, stack: MoshiStack, layer: usize, kind: &str, x: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
+        // "proj" temporal->dep usa depformer_in.0 (in=hidden, out=dep_dim).
+        if let Some((_s, _l, which, idx, parts, part)) = self.layer_idx(stack, layer, kind) {
+            if which == 255 {
+                if let Some(y) = self.fused_or_cached(idx, x, in_dim, out_dim) {
+                    return y;
+                }
+            } else if let Some(y) = self.fused_part(_s, _l, which, idx, x, in_dim, parts, part) {
+                return y;
+            }
+        }
+        dummy_matvec(x, out_dim)
+    }
+
+    fn norm_gamma(&mut self, stack: MoshiStack, layer: usize, kind: &str, dim: usize) -> Vec<f32> {
+        let idx = match stack {
+            MoshiStack::Temporal => self.t.get(layer).and_then(|l| match kind {
+                "attn_norm" => l.norm1,
+                "ffn_norm" => l.norm2,
+                _ => None,
+            }),
+            MoshiStack::Depformer => self.d.get(layer).and_then(|l| match kind {
+                "norm" | "attn_norm" => l.norm1,
+                "ffn_norm" => l.norm2,
+                _ => None,
+            }),
+        };
+        if let Some(i) = idx {
+            if let Some(info) = self.gg.tensors.get(i) {
+                if info.n_elements == dim && (info.dtype == 0 || info.dtype == 1) {
+                    let raw_len = if info.dtype == 0 { dim * 4 } else { dim * 2 };
+                    if let Some(raw) = self.raw_of(i, raw_len) {
+                        let mut dst = vec![0.0f32; dim];
+                        if crate::quant::dequantize(&raw, info.dtype, &mut dst, dim) {
+                            return dst;
+                        }
+                    }
+                }
+            }
+        }
+        vec![1.0; dim]
     }
 }
 
@@ -838,5 +1136,99 @@ mod tests {
         assert!(inf.last_ms.total_ms >= 0.0);
         assert!(inf.last_ms.temporal_ms >= 0.0);
         assert!(inf.last_ms.depformer_ms >= 0.0);
+    }
+
+    // --- GGUF real PersonaPlex Q4_K (pula sem o arquivo) ---
+
+    const PP_GGUF: &str = "./models/personaplex-7b-v1-q4_k.gguf";
+
+    fn pp_available() -> bool {
+        std::path::Path::new(PP_GGUF).exists()
+    }
+
+    fn pp_mem() -> Option<(crate::gguf::GgufFile, crate::vm::MemBackend)> {
+        if !pp_available() {
+            return None;
+        }
+        let gg = crate::gguf::GgufFile::open(PP_GGUF).ok()?;
+        let mut mgr = crate::memory::MemoryManager::new_in_memory();
+        mgr.load_gguf_model(PP_GGUF).ok()?;
+        Some((gg, crate::vm::MemBackend::Cpu(mgr)))
+    }
+
+    #[test]
+    fn test_personaplex_header_real() {
+        let Some((gg, _mem)) = pp_mem() else {
+            eprintln!("skip sem GGUF PersonaPlex");
+            return;
+        };
+        assert_eq!(gg.n_tensors, 655, "conversão moshi.cpp tem 655 tensores");
+        let (t, d, proj) = resolve_moshi_cpp(&gg);
+        assert_eq!(t.len(), 32, "temporal 32 layers");
+        assert_eq!(d.len(), 6, "depformer 6 layers");
+        assert!(proj.is_some(), "depformer_in.0");
+        assert!(t.iter().all(|l| l.qkv.is_some() && l.o.is_some() && l.fused_gate.is_some() && l.down.is_some() && l.norm1.is_some() && l.norm2.is_some()));
+        assert!(d.iter().all(|l| l.qkv.is_some() && l.o.is_some() && l.fused_gate.is_some() && l.down.is_some()));
+        assert_eq!(gg.tensors[t[0].qkv.unwrap()].dtype, 12, "qkv Q4_K");
+        assert_eq!(count_moshi_cpp_tensors(&gg), 32 * 6 + 6 * 6 + 1);
+        // config json do repo (dim/n_q/text_card)
+        let json = std::fs::read_to_string("./models/personaplex-config.json").expect("personaplex-config.json");
+        let cfg = MoshiConfig::from_config_json(&json);
+        assert_eq!(cfg.hidden, 4096);
+        assert_eq!(cfg.n_layers, 32);
+        assert_eq!(cfg.n_heads, 32);
+        assert_eq!(cfg.codebooks, 16);
+        assert_eq!(cfg.text_vocab, 32000);
+        assert_eq!(cfg.dep_layers, 6);
+        assert_eq!(cfg.dep_dim, 1024);
+    }
+
+    #[test]
+    fn test_gguf_matvec_parity_linears() {
+        // lm.linears.0 [1024,2048] Q4_K: fused vs dequant+dot (tol igual matvec_quant).
+        let Some((gg, mem)) = pp_mem() else {
+            eprintln!("skip sem GGUF PersonaPlex");
+            return;
+        };
+        let idx = gg.tensors.iter().position(|t| t.name == "lm.linears.0.weight").expect("lm.linears.0.weight");
+        let mut w = GgufMoshiWeights::new(&gg, &mem);
+        let x: Vec<f32> = (0..1024).map(|i| ((i as f32 * 0.13).sin() * 0.7)).collect();
+        let y_fused = w.fused_or_cached(idx, &x, 1024, 2048).expect("fused linears.0");
+        assert_eq!(y_fused.len(), 2048);
+        // Referência: dequant full + dot
+        let info = &gg.tensors[idx];
+        let raw = w.raw_of(idx, (info.n_elements / 256) * 144).expect("raw");
+        let mut wfull = vec![0.0f32; info.n_elements];
+        assert!(crate::quant::dequantize(&raw, info.dtype, &mut wfull, info.n_elements));
+        let y_ref = crate::matvec::matvec_ndarray(&x, &wfull, 1024, 2048);
+        let max_diff = y_fused.iter().zip(y_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-2, "max_diff {}", max_diff);
+    }
+
+    #[test]
+    fn test_gguf_qkv_split_shapes() {
+        // 1 fused qkv temporal (4096x12288 Q4_K) dividido em q/k/v de 4096.
+        let Some((gg, mem)) = pp_mem() else {
+            eprintln!("skip sem GGUF PersonaPlex");
+            return;
+        };
+        let mut w = GgufMoshiWeights::new(&gg, &mem);
+        assert_eq!(w.n_temporal(), 32);
+        assert_eq!(w.n_depformer(), 6);
+        let x: Vec<f32> = (0..4096).map(|i| ((i as f32 * 0.01).sin() * 0.3)).collect();
+        let q = MoshiWeights::matvec(&mut w, MoshiStack::Temporal, 0, "q", &x, 4096, 4096);
+        let k = MoshiWeights::matvec(&mut w, MoshiStack::Temporal, 0, "k", &x, 4096, 4096);
+        let v = MoshiWeights::matvec(&mut w, MoshiStack::Temporal, 0, "v", &x, 4096, 4096);
+        assert_eq!(q.len(), 4096);
+        assert_ne!(q, k, "q e k devem diferir (terços distintos)");
+        assert_ne!(k, v);
+        for &val in q.iter().chain(k.iter()).chain(v.iter()) {
+            assert!(val.is_finite());
+        }
+        let gate = MoshiWeights::matvec(&mut w, MoshiStack::Temporal, 0, "gate", &x, 4096, 11264);
+        assert_eq!(gate.len(), 11264);
+        let gamma = MoshiWeights::norm_gamma(&mut w, MoshiStack::Temporal, 0, "attn_norm", 4096);
+        assert_eq!(gamma.len(), 4096);
+        assert!(gamma.iter().all(|g| g.is_finite() && *g > 0.0));
     }
 }

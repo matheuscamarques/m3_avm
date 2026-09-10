@@ -46,6 +46,12 @@ pub const KV_CACHE_PHYSICAL_SIZE: usize = 64 * 1024 * 1024; // 64 MiB físico de
 /// Máximo de tokens (seq_len) suportado no cache lógico
 pub const KV_CACHE_MAX_SEQ: usize = 2048;
 
+/// Janela padrão de retenção de snapshots (RFC-0003, ESPEC §6.3 item 3).
+/// Limita o crescimento a O(k·|Σ|) por sessão, preservando as profundidades
+/// documentadas de rollback (fallback entrópico de 5 tokens, janela de áudio
+/// de 80 ms, 17 streams Moshi) com margem.
+pub const DEFAULT_SNAPSHOT_WINDOW: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
     Global,
@@ -242,10 +248,16 @@ pub struct MemoryManager {
 
     // Snapshot / versão (para ABORT e FORK)
     version: u64,
+    /// Teto da janela deslizante de retenção (RFC-0003). `0` = ilimitado
+    /// (opt-out explícito via `set_snapshot_window`).
+    max_snapshots: usize,
     snapshots: HashMap<u64, HashMap<u128, Arc<Vec<u8>>>>,
     sparse_snapshots: HashMap<u64, HashMap<u128, SparseTensor>>,
     kv_snapshots: HashMap<u64, Vec<KvCacheLayer>>,
     kv_heap_snapshots: HashMap<u64, HashMap<u128, Arc<Vec<u8>>>>,
+    /// Metadados por versão (RFC-0016): sem este mapa, allocs pós-snapshot
+    /// deixavam metas penduradas após restore (divergência meta/heap).
+    meta_snapshots: HashMap<u64, HashMap<u128, TensorMeta>>,
 }
 
 impl MemoryManager {
@@ -286,10 +298,12 @@ impl MemoryManager {
             kv_heap: HashMap::new(),
             kv_next_offset: 0x1000,
             version: 0,
+            max_snapshots: DEFAULT_SNAPSHOT_WINDOW,
             snapshots: HashMap::new(),
             sparse_snapshots: HashMap::new(),
             kv_snapshots: HashMap::new(),
             kv_heap_snapshots: HashMap::new(),
+            meta_snapshots: HashMap::new(),
         })
     }
 
@@ -325,10 +339,12 @@ impl MemoryManager {
             kv_heap: HashMap::new(),
             kv_next_offset: 0x1000,
             version: 0,
+            max_snapshots: DEFAULT_SNAPSHOT_WINDOW,
             snapshots: HashMap::new(),
             sparse_snapshots: HashMap::new(),
             kv_snapshots: HashMap::new(),
             kv_heap_snapshots: HashMap::new(),
+            meta_snapshots: HashMap::new(),
         })
     }
 
@@ -363,10 +379,12 @@ impl MemoryManager {
                     kv_heap: HashMap::new(),
                     kv_next_offset: 0x1000,
                     version: 0,
+                    max_snapshots: DEFAULT_SNAPSHOT_WINDOW,
                     snapshots: HashMap::new(),
                     sparse_snapshots: HashMap::new(),
                     kv_snapshots: HashMap::new(),
                     kv_heap_snapshots: HashMap::new(),
+            meta_snapshots: HashMap::new(),
                 }
             })
     }
@@ -1010,6 +1028,8 @@ impl MemoryManager {
 
     /// Cria snapshot da heap GLOBAL (CoW: clones de Arc são baratos).
     /// Também snapshot da sparse_heap para rollback de matriz esparsa e KV cache.
+    /// Aplica a janela de retenção (RFC-0003): versões além das `max_snapshots`
+    /// mais recentes são recicladas; `restore()` delas passa a falhar limpo.
     pub fn snapshot(&mut self) -> u64 {
         self.version += 1;
         let snap = self.global_heap.clone(); // Arc clones
@@ -1021,9 +1041,51 @@ impl MemoryManager {
         self.kv_snapshots.insert(self.version, kv_snap);
         let kv_heap_snap = self.kv_heap.clone();
         self.kv_heap_snapshots.insert(self.version, kv_heap_snap);
+        let meta_snap = self.tensor_meta.clone();
+        self.meta_snapshots.insert(self.version, meta_snap);
+        self.evict_old_snapshots();
         self.version
     }
 
+    /// Ajusta a janela de retenção (RFC-0003). `0` = ilimitado (opt-out
+    /// explícito). Valores `> 0` reciclam imediatamente o excedente.
+    pub fn set_snapshot_window(&mut self, max: usize) {
+        self.max_snapshots = max;
+        self.evict_old_snapshots();
+    }
+
+    /// Número de snapshots retidos (teto: `max_snapshots`, salvo opt-out).
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Recicla as versões mais antigas além da janela, nos CINCO mapas de
+    /// uma vez (mesma chave ou nenhuma — os mapas nunca divergem).
+    fn evict_old_snapshots(&mut self) {
+        if self.max_snapshots == 0 {
+            return; // opt-out explícito: ilimitado
+        }
+        while self.snapshots.len() > self.max_snapshots {
+            match self.snapshots.keys().min().copied() {
+                Some(oldest) => {
+                    self.snapshots.remove(&oldest);
+                    self.sparse_snapshots.remove(&oldest);
+                    self.kv_snapshots.remove(&oldest);
+                    self.kv_heap_snapshots.remove(&oldest);
+                    self.meta_snapshots.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Restaura o estado capturado em `version` (rollback bit-exato do
+    /// conteúdo), SEM rebaixar o contador de versão (I-Mono, ESPEC §6.3).
+    /// O contador é estritamente monotônico: snapshots posteriores ao
+    /// restore recebem ids frescos e nenhum snapshot antigo é soterrado
+    /// (cf. `formal/Formal/Rollback.lean`: `restoreFix`, `fresh_of_inv`).
+    /// A variante anterior (`self.version = version`) permitia reuso de id
+    /// com perda do snapshot antigo (`clobber_demo` no mesmo arquivo Lean).
     pub fn restore(&mut self, version: u64) -> Result<()> {
         let mut ok = false;
         if let Some(snap) = self.snapshots.get(&version) {
@@ -1042,8 +1104,13 @@ impl MemoryManager {
             self.kv_heap = kv_heap_snap.clone();
             ok = true;
         }
+        if let Some(meta_snap) = self.meta_snapshots.get(&version) {
+            self.tensor_meta = meta_snap.clone();
+            ok = true;
+        }
         if ok {
-            self.version = version;
+            // I-Mono: o contador NUNCA rebaixa — restore só troca o estado
+            // corrente (`cur`), preservando todos os ids já emitidos.
             Ok(())
         } else {
             Err(anyhow!("restore: versão {} não encontrada", version))

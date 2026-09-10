@@ -19,6 +19,7 @@ pub mod matvec_quant;
 pub mod mimi;
 pub mod moshi;
 pub mod ssm;
+pub mod determinism;
 #[cfg(feature = "wgpu")]
 pub mod inference_gpu;
 pub mod tui;

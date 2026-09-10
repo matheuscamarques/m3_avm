@@ -1,0 +1,11 @@
+; kv_truncate_demo.m3asm — higiene rolante de KV (RFC-0010)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/kv_truncate_demo.m3asm --max-steps 30
+; Semântica (fumaça de fiação; numéricos nos testes):
+;   LOADI r0, 2 (novo comprimento como literal — RFC-0007 em ação)
+;   KV_TRUNCATE r0 (todas as camadas -> min(atual, 2); cache vazio: no-op)
+;   HALT
+
+LOADI r0, 2
+KV_TRUNCATE r0
+HALT

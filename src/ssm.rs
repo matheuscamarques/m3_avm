@@ -126,6 +126,24 @@ pub fn conv1d_depthwise_update(
     y
 }
 
+/// Monta o vetor de params do `OP_SSM_SCAN` (`vm.rs::read_ssm_pack`):
+/// `dt[d_inner] + A[d_inner*d_state] + B[d_state] + C[d_state] + D[d_inner]`.
+/// Panics se os tamanhos não baterem — falhar cedo na montagem do programa.
+pub fn pack_params(dt: &[f32], a: &[f32], b: &[f32], c: &[f32], d: &[f32], d_inner: usize, d_state: usize) -> Vec<f32> {
+    assert_eq!(dt.len(), d_inner, "dt deve ter d_inner={}", d_inner);
+    assert_eq!(a.len(), d_inner * d_state, "A deve ter d_inner*d_state={}", d_inner * d_state);
+    assert_eq!(b.len(), d_state, "B deve ter d_state={}", d_state);
+    assert_eq!(c.len(), d_state, "C deve ter d_state={}", d_state);
+    assert_eq!(d.len(), d_inner, "D deve ter d_inner={}", d_inner);
+    let mut out = Vec::with_capacity(d_inner + d_inner * d_state + 2 * d_state + d_inner);
+    out.extend_from_slice(dt);
+    out.extend_from_slice(a);
+    out.extend_from_slice(b);
+    out.extend_from_slice(c);
+    out.extend_from_slice(d);
+    out
+}
+
 /// Um passo do selective scan (Euler). Atualiza `state_ssm` in-place e retorna `y`.
 pub fn selective_scan_update(
     state_ssm: &mut [f32],
@@ -225,6 +243,29 @@ mod tests {
         let y3 = selective_scan_update(&mut h2, &[3.0], &[0.5], &a, &b, &c, &d2, 1, 1);
         // h=3*1*0.5=1.5, y=1.5*1+2*3=7.5
         assert!((y3[0] - 7.5).abs() < 1e-5, "{}", y3[0]);
+    }
+
+    #[test]
+    fn test_pack_params_layout_roundtrip() {
+        // Layout precisa espelhar `Vm::read_ssm_pack`: dt+A+B+C+D.
+        let dt = vec![1.0f32, 2.0];
+        let a = vec![-1.0f32; 4];
+        let b = vec![0.5f32, 1.5];
+        let c = vec![1.0f32, 1.0];
+        let d = vec![0.0f32, 0.25];
+        let p = pack_params(&dt, &a, &b, &c, &d, 2, 2);
+        assert_eq!(p.len(), 2 + 4 + 2 + 2 + 2);
+        assert_eq!(&p[0..2], &dt);
+        assert_eq!(&p[2..6], &a);
+        assert_eq!(&p[6..8], &b);
+        assert_eq!(&p[8..10], &c);
+        assert_eq!(&p[10..12], &d);
+    }
+
+    #[test]
+    #[should_panic(expected = "B deve ter")]
+    fn test_pack_params_rejeita_tamanho_errado() {
+        pack_params(&[1.0], &[-1.0], &[1.0, 2.0], &[1.0], &[0.0], 1, 1);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+; gather_moe_demo.m3asm — MoE dispatch: SAMPLE TOPK -> GATHER (RFC-0004)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/gather_moe_demo.m3asm --max-steps 20
+; Semântica (pipeline de despacho por gate):
+;   r0 = gate logits [1,4] (ramp TENSOR: [0.5,1,1.5,2]; numéricos nos goldens)
+;   r1 = tabela de experts [4,2] (linha i = saída do expert i)
+;   SAMPLE TOPK=1 -> r2 = índices [1,1] ([3]: argmax do ramp, sem empate)
+;   GATHER r3, r1, r2 AXIS=0 -> linha do expert vencedor
+;   STREAM r3 -> saída
+
+TENSOR r0 1 4 f32
+TENSOR r1 4 2 f32
+SAMPLE r2, r0 TOPK=1
+GATHER r3, r1, r2 AXIS=0 MODE=GATHER
+STREAM r3, OUTPUT BLOCKING
+HALT

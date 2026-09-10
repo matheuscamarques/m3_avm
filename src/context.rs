@@ -103,6 +103,13 @@ pub struct Context {
     pub interrupt_flag: bool,
     /// Pipeline ativo (CTX_SWITCH). Default Transformer para compat.
     pub pipeline: PipelineId,
+    /// Deadline EDF absoluto (ns). Default MAX = best-effort (RFC-0006).
+    /// Hoje informativo (escalonador segue estrito Red>Blue>Green); o
+    /// hardware de EDF o consumirá sem mudar encoding.
+    pub deadline: u64,
+    /// Estado RNG do contexto (splitmix64; RFC-0005). Semente fixa no boot
+    /// frio => determinismo; FORK herda (clone), re-seed p/ divergir.
+    pub rng_state: u64,
 }
 
 impl Context {
@@ -118,6 +125,8 @@ impl Context {
             cmp_equal: false,
             interrupt_flag: false,
             pipeline: PIPE_TRANSFORMER_CTX,
+            deadline: u64::MAX,
+            rng_state: crate::determinism::DEFAULT_RNG_SEED,
         }
     }
 
@@ -241,7 +250,7 @@ impl Scheduler {
         }
     }
 
-    fn dequeue_id(&mut self, id: u64) {
+    pub(crate) fn dequeue_id(&mut self, id: u64) {
         self.red_q.retain(|&x| x != id);
         self.blue_q.retain(|&x| x != id);
         self.green_q.retain(|&x| x != id);

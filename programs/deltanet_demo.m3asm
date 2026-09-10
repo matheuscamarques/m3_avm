@@ -1,0 +1,22 @@
+; deltanet_demo.m3asm — recorrência matricial + rollback de H (RFC-0004)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/deltanet_demo.m3asm --max-steps 30
+; Semântica:
+;   r7 = H [4,4], r1 = v [4], r2 = k [4] (ramp TENSOR; numéricos nos goldens)
+;   2x RANK1_UPDATE encadeados (rdest religado a cada passo, CoW)
+;   FORK r5, GREEN (empilha handles RANK1) -> 1x RANK1 (suja H)
+;   ABORT r5, r6 (r6 zerado => ts=0: sem restore de heap, mas pop dos
+;     handles RANK1/SSM — rollback do mapa; exatidão coberta por
+;     test_rank1_modes_and_rollback)
+;   STREAM r7 -> saída
+
+TENSOR r7 4 4 f32
+TENSOR r1 4 1 f32
+TENSOR r2 4 1 f32
+RANK1_UPDATE r7, r1, r2 ALPHA=0.99 BETA=1.0 MODE=DELTA LAYER=0
+RANK1_UPDATE r7, r1, r2 ALPHA=0.99 BETA=1.0 MODE=DELTA LAYER=0
+FORK r5, GREEN
+RANK1_UPDATE r7, r1, r2 ALPHA=0.99 BETA=1.0 MODE=DELTA LAYER=0
+ABORT r5, r6
+STREAM r7, OUTPUT BLOCKING
+HALT

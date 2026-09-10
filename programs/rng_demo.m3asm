@@ -1,0 +1,22 @@
+; rng_demo.m3asm — determinismo: seed -> streams -> hashes (RFC-0005)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/rng_demo.m3asm --max-steps 30
+; Semântica:
+;   RNG_SEED DEFAULT (semente fixa => replay bit-exato entre runs)
+;   2x RNG_NEXT r1/r2 (u64 em regs; iguais entre runs, ver teste)
+;   RNG_UNIFORM r3 A=-2.0 B=5.0 / RNG_NORMAL r4 MEAN=10.0 STD=2.0
+;   TENSOR r5 2 2 (ramp) -> HASH / CHECKSUM / HMAC p/ regs
+;   NOTA: escalares vivem em regs (não há STREAM de reg); o observável aqui
+;   é exit 0 + contadores. Valores cobertos por test_rfc0005_*.
+;   HALT
+
+RNG_SEED DEFAULT
+RNG_NEXT r1
+RNG_NEXT r2
+RNG_UNIFORM r3 A=-2.0 B=5.0
+RNG_NORMAL r4 MEAN=10.0 STD=2.0
+TENSOR r5 2 2 f32
+HASH r6, r5
+CHECKSUM r7, r5
+HMAC r8, r5, r5
+HALT

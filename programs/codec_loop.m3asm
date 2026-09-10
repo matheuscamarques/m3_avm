@@ -1,0 +1,17 @@
+; codec_loop.m3asm — SENSE PCM -> CODEC_ENC -> CODEC_DEC -> AUDIO_ALIGN (ISA 0x15/0x16/0x17)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/codec_loop.m3asm --max-steps 40
+; Frame Mimi: 24kHz/80ms = 1920 samples PCM <-> 32B codes (16xu16 @12.5Hz).
+
+MAIN_LOOP:
+    SENSE r0, AUDIO_PCM
+    CODEC_ENC r1, r0
+    CODEC_DEC r2, r1
+    AUDIO_ALIGN r4, r0, r2
+    SENSE r15, USER_INPUT
+    IF_INTERRUPT HANDLE_ABORT
+    JUMP DONE
+HANDLE_ABORT:
+    JUMP MAIN_LOOP
+DONE:
+    HALT

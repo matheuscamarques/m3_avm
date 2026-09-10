@@ -170,6 +170,7 @@ impl Reactor {
     }
 
     async fn execute_nop(&mut self, ctx_id: u64, instr: &Instruction, interrupt_rx: &mut watch::Receiver<Option<InterruptSignal>>) -> Result<bool> {
+        use crate::opcodes::{OP_ADD, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC, OP_COMPARE, OP_CTX_SWITCH, OP_EMBED, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP, OP_MATVEC, OP_MUL, OP_ROPE, OP_SAMPLE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN};
         match instr.opcode {
             OP_TENSOR => { self.exec_tensor_nop(ctx_id, instr)?; Ok(true) },
             OP_ATTN => { self.exec_attn_nop(ctx_id, instr, interrupt_rx).await?; Ok(true) },
@@ -179,6 +180,10 @@ impl Reactor {
             OP_FORK => { self.exec_fork_nop(ctx_id, instr)?; Ok(true) },
             OP_ABORT => { self.exec_abort_nop(ctx_id, instr)?; Ok(true) },
             OP_SENSE => { self.exec_sense_nop(ctx_id, instr)?; Ok(true) },
+            // Novos opcodes 0x09..0x19: semântica pura, delega à Vm (uma implementação só).
+            OP_EMBED | OP_ADD | OP_SAMPLE | OP_COMPARE | OP_JUMP | OP_IF_EQUAL | OP_IF_INTERRUPT
+            | OP_MATVEC | OP_MUL | OP_SILU | OP_SSM_SCAN | OP_SSM_RESET | OP_CODEC_ENC | OP_CODEC_DEC
+            | OP_AUDIO_ALIGN | OP_CTX_SWITCH | OP_ROPE => self.vm.step_instruction(ctx_id, instr),
             _ => Err(anyhow!("opcode desconhecido 0x{:02x}", instr.opcode)),
         }
     }

@@ -48,6 +48,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "physics_bench"
 harness = false
 
+[[bench]]
+name = "hybrid_ops_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

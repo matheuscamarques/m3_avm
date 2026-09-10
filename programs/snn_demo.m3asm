@@ -1,0 +1,16 @@
+; snn_demo.m3asm — LIF smoke (RFC-0015)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/snn_demo.m3asm --max-steps 30
+; Semântica (fumaça de fiação; numéricos nos goldens):
+;   r0 = V [1,4] (ramp [0.5,1,1.5,2]), r1 = I [1,4] (ramp).
+;   THRESH=1.0 DECAY=0.9: V=(V+I)*0.9 => [0.9,1.8,2.7,3.6],
+;   spikes [0,1,1,1]. 3 passos encadeados (rV religado, CoW).
+;   STREAM rD -> saída. HALT.
+
+TENSOR r0 1 4 f32
+TENSOR r1 1 4 f32
+SPIKE_STEP r2, r0, r1 THRESH=1.0 DECAY=0.9 RESET=0.0 LAYER=0 REFRACT=2
+SPIKE_STEP r2, r0, r1 THRESH=1.0 DECAY=0.9 RESET=0.0 LAYER=0 REFRACT=2
+SPIKE_STEP r2, r0, r1 THRESH=1.0 DECAY=0.9 RESET=0.0 LAYER=0 REFRACT=2
+STREAM r2, OUTPUT BLOCKING
+HALT

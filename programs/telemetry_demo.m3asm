@@ -1,0 +1,27 @@
+; telemetry_demo.m3asm — telemetria + scheduler (RFC-0006)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/telemetry_demo.m3asm --max-steps 40
+; Semântica (fumaça de todos os 14 opcodes; numéricos nos testes):
+;   CYCLES_COUNT / TRACE_EVENT / SANITY_CHECK (ramp sem NaN: count 0) /
+;   PREEMPT_CHECK (flag limpa => 0) / ASSERT r0 (CYCLES>0 passa) /
+;   DUMP / YIELD / SET+GET_DEADLINE / PRIORITY_SET r8 (r8=0 GREEN) +
+;   PRIORITY_GET / LOCK+UNLOCK id 77 / FENCE -> HALT.
+;   NOTA: LOCK precisa do id numérico num reg; r8=0 => id 0. Aqui o
+;   LOCK usa r9 zerado (id 0) e PRIORITY_SET usa r8 zerado (GREEN=0).
+
+CYCLES_COUNT r0
+TRACE_EVENT r0, r0
+TENSOR r1 2 2 f32
+SANITY_CHECK r2, r1, r3
+PREEMPT_CHECK r4
+ASSERT r0
+DUMP
+YIELD
+SET_DEADLINE r0
+GET_DEADLINE r5
+PRIORITY_SET r8
+PRIORITY_GET r6
+LOCK r9
+UNLOCK r9
+FENCE
+HALT

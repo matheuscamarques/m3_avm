@@ -1,0 +1,15 @@
+; rag_search_demo.m3asm — busca vetorial: DISTANCE + top-k fundido (RFC-0004)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/rag_search_demo.m3asm --max-steps 20
+; Semântica:
+;   r0 = query [1,4] (ramp TENSOR; métricas reais nos testes golden)
+;   r1 = banco [8,4] (8 vetores ramp distintos => top-k real, sem empate)
+;   DISTANCE r2, r0, r1 METRIC=COSINE TOPK=3
+;   r2 = [1,6]: 3 distâncias + 3 índices ([0,1,2] no empate)
+;   STREAM r2 -> saída
+
+TENSOR r0 1 4 f32
+TENSOR r1 8 4 f32
+DISTANCE r2, r0, r1 METRIC=COSINE TOPK=3
+STREAM r2, OUTPUT BLOCKING
+HALT
