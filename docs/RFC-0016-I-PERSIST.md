@@ -1,7 +1,7 @@
 # RFC-0016 — I-Persist: Snapshot-Coverage Completeness
 
 ```text
-Status      : DRAFT
+Status      : IMPLEMENTED
 Category    : Standards Track
 Updates     : docs/ESPEC.md §6.3 item 1 (I-Persist REQUIRED->IMPL)
 Obsoletes   : None
@@ -77,9 +77,12 @@ Working tree (no PR link; single-commit scope):
 
 - `src/memory.rs`: `meta_snapshots` field (3 ctors), insert/restore/
   evict, doc comment citing this RFC.
-- Conformance: sparse-mutation invisibility, meta-coherence
-  (alloc-restore-meta-absent), dense visibility (existing),
-  full suite green.
+- Conformance: sparse-mutation invisibility (proves deep clone;
+  passes with AND without the fix — pre-existing safety, honestly
+  attributed), meta-coherence (fails without the fifth map — verified
+  by disabling the two meta paths and re-running), dense visibility
+  (pre-existing `rollback_100_50_50`). Suite 239 passed (sole failure:
+  pre-existing unrelated moshi norm-gamma).
 
 Follow-up (NOT this RFC): `TEMPORAL` point-in-time capture (needs a
 design decision on sensor sharing first); sparse snapshot cost
@@ -90,3 +93,6 @@ design decision on sensor sharing first); sparse snapshot cost
 | Version | Date | Changes |
 |:---|:---|:---|
 | 0016-00 | 2026-09-10 | DRAFT: fifth map + visibility proofs + TEMPORAL ruling |
+| 0016-01 | 2026-09-10 | IMPLEMENTED: merged to tree, suite green.
+  Audit finding: discipline already held (make_mut/deep-clone/CoW);
+  the only hole was meta coverage. |

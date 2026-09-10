@@ -279,9 +279,12 @@ State is `(counter, snaps, cur)` per store:
 Discipline [NORMATIVE]:
 
 1. **I-Persist.** After a snapshot, kernels MUST NOT mutate any tensor
-   reachable from it (clone-before-write; persistent/CoW discipline).
-   The current `Arc::clone`-only practice does NOT satisfy this alone.
-   Status: REQUIRED, not yet enforced in code.
+   reachable from it. Status: IMPL — audit (RFC-0016) proves the
+   discipline holds via `Arc::make_mut` CoW (dense heaps), deep clones
+   (sparse/KV/SSM), and CoW rebinding (SNN/RANK1 tensors); the single
+   hole (unsnapshotted `tensor_meta`) closed with the fifth snapshot
+   map; `TEMPORAL` deliberately excluded (input staging, not model
+   state). The `Arc::clone`-only caveat is retired.
 2. **I-Mono.** The version counter MUST be strictly monotonic;
    `restore` MUST NOT lower it. Status: IMPL (`src/memory.rs::restore`
    preserves the counter since restoreFix; arbiters
@@ -571,7 +574,7 @@ outruns the Status column above.
 | `0x10-0x12`, GGUF `mmap` inference, `KV_CACHE` + snapshot/rollback | IMPL | `src/inference.rs`, `src/matvec_quant.rs`, `src/memory.rs` |
 | I-Mono (monotonic version counter, `restoreFix`) | IMPL | `src/memory.rs::restore` (no counter lowering); arbiters `qa::snapshot_restore_monotonic_no_clobber`, `qa::rollback_100_50_50_bit_exact`; model `formal/Formal/Rollback.lean` |
 | `0x1F GATHER` + `0x23 DISTANCE` + `0x24 RANK1_UPDATE` + `SAMPLE TOPK` | IMPL | RFC-0004; goldens `vm::test_gather_golden_and_oob`, `test_distance_four_metrics_and_topk`, `test_rank1_modes_and_rollback`, `test_sample_topk_indices`; demos `gather_moe_demo`, `rag_search_demo`, `deltanet_demo` (`attn_topk_demo` removido: packed precisa de `SLICE`) |
-| I-Persist (post-snapshot immutability) | OPEN | REQUIRED for full T1; not yet enforced |
+| I-Persist (post-snapshot immutability) | IMPL | RFC-0016; make_mut/deep-clone/CoW audit + meta map + visibility proofs; TEMPORAL excluded by design |
 | `0x60-0x66` RNG + hash (determinism block) | IMPL | RFC-0005; vectors NIST/FNV/CRC + fork-inheritance goldens; demo `rng_demo` |
 | `0x6A-0x77` telemetry + scheduler | IMPL | RFC-0006; NaN-absorb/poll/trap/deadline/prio/try-lock goldens; demo `telemetry_demo` |
 | `0x78 LOADI` + `0x79 MOV` + `COMPARE PRED=` | IMPL | RFC-0007; max-u128/chain/6-predicate goldens; demo `loadi_demo` |
@@ -591,7 +594,7 @@ outruns the Status column above.
 | Benches for `0x13-0x19` | IMPL | `benches/hybrid_ops_bench.rs` (7 ops + 80 ms window, §17) |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
-`cargo test --lib`: 237 green + 4 RFC-0015 arbiters at last report (ISA, sparse, bus,
+`cargo test --lib`: 239 green + 2 RFC-0016 arbiters at last report (ISA, sparse, bus,
 reactor, inference, asm_emitter, TUI, VM). One pre-existing failure
 unrelated to this spec: `moshi::test_gguf_qkv_split_shapes` (norm-gamma
 assertion on the local PersonaPlex GGUF; fails identically on the pristine
