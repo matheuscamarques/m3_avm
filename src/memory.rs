@@ -1079,6 +1079,23 @@ impl MemoryManager {
         }
     }
 
+    /// Remove um tensor de todos os stores (RFC-0018 MOVE local).
+    /// Retorna true se algo foi removido. Snapshots já tirados seguem
+    /// intactos (as cópias são independentes — I-Persist).
+    pub fn remove_tensor(&mut self, addr: u128) -> bool {
+        let mut out = false;
+        if self.global_heap.remove(&addr).is_some() {
+            out = true;
+        }
+        if self.tensor_meta.remove(&addr).is_some() {
+            out = true;
+        }
+        if self.sparse_heap.remove(&addr).is_some() {
+            out = true;
+        }
+        out
+    }
+
     /// Restaura o estado capturado em `version` (rollback bit-exato do
     /// conteúdo), SEM rebaixar o contador de versão (I-Mono, ESPEC §6.3).
     /// O contador é estritamente monotônico: snapshots posteriores ao

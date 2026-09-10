@@ -8,7 +8,7 @@
 
 ## 0. Contexto confirmado (lido no repo)
 
-* ISA atual ocupa `0x00 HALT, 0x01..0x0F (15 opcodes tese + thinking/controle), 0x10 MATVEC, 0x11 MUL, 0x12 SILU, 0x13..0x19 (SSM/Codec/Audio/CTX_SWITCH/ROPE), 0xFF NOP` — `src/opcodes.rs:28-57`. **`0x1A..0x1D` livres, sem colisão.**
+* ISA atual ocupa `0x00 HALT, 0x01..0x19` (26 opcodes), `0x1E..0x25` (8 universal), `0x38 KV_TRUNCATE`, `0x60..0x79` (16 RNG/hash), `0xFF NOP` — `src/opcodes.rs:28-57`. **`0x1A..0x1D` livres, sem colisão.**
 * Formato real: `opcode 1B + flags 1B + rdest/rsrc1-3 4B + payload 26B (bytes 6..31)` — `src/opcodes.rs:2-10`. Qualquer tabela de payload de rede precisa caber em **26B**, não 28B.
 * Bus local: `watch<Option<InterruptSignal>> + 2x broadcast` — `src/bus.rs:40-48`. Não atravessa processo; cluster entra como ponte, sem reescrever o bus.
 * Scheduler estrito `Red > Blue > Green`, 3 FIFOs locais, `Context.id: u64` local — `src/context.rs:15,171-181`. Falta `GlobalPid = (node_id, ctx_id)` e tabela de roteamento.

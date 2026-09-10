@@ -88,13 +88,11 @@ Working tree (no PR link; single-commit scope):
   tables (`vm::test_rfc0012_ramp_table_traps`).
 - Suite: `cargo test --lib` green (sole failure: pre-existing
   unrelated moshi norm-gamma).
-- NOTA DE AUDITORIA (descoberta na implementação): `TENSOR` inicializa
-  em ramp `(i+1)*0.5`, logo nenhum programa `.m3asm` monta tabela
-  válida (índices exigem floats integrais) — demos `forest_demo` e
-  `attn_topk_demo` (RFC-0004) foram REMOVIDOS em vez de fingir que
-  rodavam (exit 0 escondia morte de contexto). A cobertura vive nos
-  goldens. Desbloqueio real exige `TENSOR`-INIT/fill de literais ou
-  `SLICE 0x2E` (para fatiar o packed do `DISTANCE`); ambos follow-ups.
+- NOTA DE AUDITORIA, parte 2 (RFC-0019: RESOLVIDO): `TENSOR FILL=0`
+  permite tabelas zeradas e `forest_demo.m3asm` RESSUSCITOU
+  (forest_execs=2, terminação pelo teto depth verificada ao vivo).
+  Segue valendo que tabelas *variadas* exigem INIT de literais
+  (follow-up permanente).
 
 Follow-up (NOT this RFC): categorical splits (float-only today),
 missing-value default directions, `SCATTER_MAX`-style leaf

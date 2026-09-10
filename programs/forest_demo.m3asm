@@ -1,0 +1,17 @@
+; forest_demo.m3asm — ensemble walk com tabela zerada (RFC-0019)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/forest_demo.m3asm --max-steps 30
+; Semântica (fumaça de fiação; numéricos nos goldens):
+;   FILL=0 em tabela/folhas: walk fica no nó 0 pelo teto depth
+;   (terminação garantida, sem hang) e devolve leaves[0]=0.
+;   r0 = features [1,2] (ramp, só comparações), r1 = tabela [2,4] zeros,
+;   r2 = folhas [2] zeros. FOREST VOTE => [0]; MEAN => [0].
+;   STREAM r4 -> saída. HALT.
+
+TENSOR r0 1 2 f32
+TENSOR r1 2 4 f32 FILL=0
+TENSOR r2 2 f32 FILL=0
+FOREST r4, r0, r1, r2 TREES=1 DEPTH=1 MODE=VOTE
+FOREST r5, r0, r1, r2 TREES=1 DEPTH=1 MODE=MEAN
+STREAM r4, OUTPUT BLOCKING
+HALT

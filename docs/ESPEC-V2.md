@@ -213,11 +213,11 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x1A` | `REMOTE_SPAWN` | 32 | RSVD | S | Frozen payload (ESPEC §12) |
-| `0x1B` | `SIGNAL` | 32 | RSVD | S | Kinds ABORT/FORK/HALT/PING; deadline via X-form |
-| `0x1C` | `SEND_TENSOR` | 32 | RSVD | S | CLUSTER_STAGING; WAL rule §12 |
-| `0x1D` | `BARRIER` | 32 | RSVD | S | Timeout+NACK mandatory |
-| `0x1E` | `CONV` | 32 | RSVD | S | N-dim; direct slide |
+| `0x1A` | `REMOTE_SPAWN` | 32 | IMPL | S | Local spawn at label (RFC-0018; remote vetado) |
+| `0x1B` | `SIGNAL` | 32 | IMPL | S | Local ABORT/HALT/PING; FORK_REQ vetado (RFC-0018) |
+| `0x1C` | `SEND_TENSOR` | 32 | IMPL | S | Local COPY/MOVE+invalidation (RFC-0018) |
+| `0x1D` | `BARRIER` | 32 | IMPL | S | One-shot local + lazy timeout (RFC-0018) |
+| `0x1E` | `CONV` | 32 | IMPL | S | Sliding 1D/2D + groups + fused (RFC-0017) |
 | `0x1F` | `GATHER` | 32 | IMPL | S | +SCATTER modes; OOB traps (RFC-0004) |
 | `0x20` | `SPIKE_STEP` | 32 | IMPL | F2 | KV_CACHE (V(t)); CoW (RFC-0015) |
 | `0x21` | `DENOISE_STEP` | 32 | IMPL | F2 | ACTIVATION (x_t); seeded/DDIM (RFC-0013) |
@@ -238,7 +238,7 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x2B` | `MEMSET` | 32 | DRAFT | S | Pattern+len |
 | `0x2C` | `PREFETCH` | 32 | DRAFT | S | Cache hint |
 | `0x2D` | `RESHAPE` | 32 | DRAFT | S | View or copy |
-| `0x2E` | `SLICE` | 32 | DRAFT | S | Axis/start/end/step |
+| `0x2E` | `SLICE` | 32 | IMPL | S | Flat [start,len) => [1,len] (RFC-0019) |
 | `0x2F` | `CONCAT` | 32 | DRAFT | S | Axis |
 
 ### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — DRAFT, 32B
@@ -629,7 +629,7 @@ RFC-0004 — 3 opcodes + SAMPLE-TOPK, 7 conformance tests, 3 demos exit 0
 (`attn_topk_demo` removido em auditoria RFC-0012: packed precisa de
 `SLICE`; goldens cobrem);
 §3.3 statuses flipped to IMPL). W4
-`SPIKE`/`CONV`/`ODE`-last + `FOREST`/`DENOISE` IMPLEMENTED (RFC-0012/RFC-0013). W5 Telemetry+scheduler
+`SPIKE`/`ODE`-last + `FOREST`/`DENOISE`/`CONV` IMPLEMENTED (RFC-0012/0013/0017). W5 Telemetry+scheduler
 (IMPLEMENTED: RFC-0006 — 14 opcodes, behavior goldens, demo exit 0;
 determinism `0x60-0x66` already IMPLEMENTED: RFC-0005). W6
 Memory/arena (`0x26-0x2F`) + `FENCE`/`LOCK`. W7 Retrieval

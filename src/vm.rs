@@ -30,7 +30,8 @@ use crate::opcodes::{
     OP_HASH, OP_CHECKSUM, OP_HMAC, OP_CYCLES_COUNT, OP_TRACE_EVENT, OP_SANITY_CHECK,
     OP_PREEMPT_CHECK, OP_ASSERT, OP_DUMP, OP_YIELD, OP_SET_DEADLINE, OP_GET_DEADLINE,
     OP_PRIORITY_SET, OP_PRIORITY_GET, OP_LOCK, OP_UNLOCK, OP_FENCE, OP_LOADI, OP_MOV, OP_KV_TRUNCATE,
-    OP_FOREST, OP_DENOISE_STEP, OP_ODE_STEP, OP_SPIKE_STEP,
+    OP_FOREST, OP_DENOISE_STEP, OP_ODE_STEP, OP_SPIKE_STEP, OP_CONV,
+    OP_REMOTE_SPAWN, OP_SIGNAL, OP_SEND_TENSOR, OP_BARRIER, OP_SLICE,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -103,10 +104,16 @@ pub struct VmStats {
     pub loadi_execs: u64,
     pub mov_execs: u64,
     pub kv_truncate_execs: u64,
+    pub slice_execs: u64,
     pub forest_execs: u64,
     pub denoise_execs: u64,
     pub ode_execs: u64,
     pub spike_execs: u64,
+    pub conv_execs: u64,
+    pub remote_spawn_execs: u64,
+    pub signal_execs: u64,
+    pub send_tensor_execs: u64,
+    pub barrier_execs: u64,
     pub start_ns: u64,
 }
 
@@ -218,6 +225,12 @@ impl MemBackend {
         match self {
             MemBackend::Cpu(m) => m.restore(v),
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.restore(v),
+        }
+    }
+    pub fn remove_tensor(&mut self, addr: u128) -> bool {
+        match self {
+            MemBackend::Cpu(m) => m.remove_tensor(addr),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.remove_tensor(addr),
         }
     }
     pub fn current_version(&self) -> u64 {
@@ -358,11 +371,26 @@ pub struct Vm {
     /// push no FORK e pop versionado no ABORT (espelha rank1_layers).
     pub snn_layers: HashMap<u8, (u128, u128)>,
     snn_snapshots: Vec<(u64, HashMap<u8, (u128, u128)>)>,
+    /// Barreiras locais (BARRIER 0x1D, RFC-0018): id -> estado one-shot.
+    /// Removida no RELEASE e no timeout (sem reuso silencioso de geração).
+    pub barriers: HashMap<u32, BarrierState>,
+    /// Espera por barreira (RFC-0018): id -> ctxs bloqueados. Drenado no
+    /// RELEASE/timeout (só ctxs ainda existentes são reacordados).
+    pub barrier_waiters: HashMap<u32, Vec<u64>>,
     /// Locks cross-context (LOCK 0x75 / UNLOCK 0x76, RFC-0006): id -> holder.
     /// Try-lock não-bloqueante; sem filas de espera (EDF real é follow-up).
     pub locks: HashMap<u32, u64>,
     /// Anel de trace (TRACE_EVENT 0x6B): (event_id, data), teto TRACE_CAP.
     pub trace: VecDeque<(u64, u128)>,
+}
+
+/// Estado one-shot de uma barreira local (RFC-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarrierState {
+    pub expected: u16,
+    pub arrived: u32,
+    pub deadline_ns: u64, // u64::MAX = sem timeout
+    pub epoch: u32,
 }
 
 impl Vm {
@@ -412,6 +440,8 @@ impl Vm {
             rank1_snapshots: Vec::new(),
             snn_layers: HashMap::new(),
             snn_snapshots: Vec::new(),
+            barriers: HashMap::new(),
+            barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
             trace: VecDeque::new(),
         })
@@ -440,6 +470,8 @@ impl Vm {
             rank1_snapshots: Vec::new(),
             snn_layers: HashMap::new(),
             snn_snapshots: Vec::new(),
+            barriers: HashMap::new(),
+            barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
             trace: VecDeque::new(),
         }
@@ -465,6 +497,8 @@ impl Vm {
             rank1_snapshots: Vec::new(),
             snn_layers: HashMap::new(),
             snn_snapshots: Vec::new(),
+            barriers: HashMap::new(),
+            barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
             trace: VecDeque::new(),
         })
@@ -938,6 +972,30 @@ impl Vm {
                 self.exec_spike_step(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_CONV => {
+                self.exec_conv(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_REMOTE_SPAWN => {
+                self.exec_remote_spawn(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SIGNAL => {
+                self.exec_signal(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SEND_TENSOR => {
+                self.exec_send_tensor(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_BARRIER => {
+                self.exec_barrier(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SLICE => {
+                self.exec_slice(ctx_id, instr)?;
+                Ok(true)
+            }
             OP_FOREST => {
                 self.exec_forest(ctx_id, instr)?;
                 Ok(true)
@@ -1008,6 +1066,14 @@ impl Vm {
             // Se foi mapeado para PERSISTENTE (GGUF zero-copy), não inicializa — dados já estão no mmap
             let is_persist = crate::memory::region_of(addr) == crate::memory::Region::Persistent;
             if !is_persist {
+                // RFC-0019: FILL escalar (só F32; resto veta explícito).
+                if let Some(f) = instr.tensor_fill() {
+                    if final_dtype != DType::F32 {
+                        return Err(anyhow!("TENSOR FILL só em f32 (dtype {:?})", final_dtype));
+                    }
+                    let init_data: Vec<f32> = vec![f; elems];
+                    self.memory.write_f32_tensor(addr, &init_data)?;
+                } else {
                 match final_dtype {
                     DType::F32 => {
                         let init_data: Vec<f32> = (0..elems).map(|i| (i as f32 + 1.0) * 0.5).collect();
@@ -1027,6 +1093,7 @@ impl Vm {
                             // Quantizado: não inicializa, virá do GGUF se shape bater
                         }
                     }
+                }
                 }
             }
             addr
@@ -3056,12 +3123,12 @@ impl Vm {
             2 => Priority::Red,
             _ => return Err(anyhow!("PRIORITY_SET: valor {} inválido (0/1/2)", raw)),
         };
-        // Retira da fila antiga antes de trocar (evita dupla presença).
-        self.scheduler.dequeue_id(ctx_id);
+        // Troca simples de campo (como CTX_SWITCH): o loop de run
+        // re-enfileira uma vez via yield_current. (Enfileirar aqui
+        // duplicaria presença — corrigido na RFC-0018.)
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
             ctx.priority = prio;
         }
-        self.scheduler.enqueue(ctx_id);
         self.scheduler.maybe_preempt();
         self.stats.priority_set_execs += 1;
         log_debug("sched", &format!("ctx {} PRIORITY_SET {}", ctx_id, prio.as_str()));
@@ -3196,6 +3263,295 @@ impl Vm {
         self.memory.kv_cache_truncate(len);
         self.stats.kv_truncate_execs += 1;
         log_debug("kv", &format!("ctx {} KV_TRUNCATE len={} seq={}", ctx_id, len, self.memory.kv_cache_seq_len()));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0018: cluster F1 — semântica estritamente local (node_id == 0).
+    // node_id != 0 veta limpo (transporte é F2+). Sem sockets aqui.
+    // -----------------------------------------------------------------------
+
+    /// REMOTE_SPAWN rD, node, entry_pc, prio — node 0: cria contexto local
+    /// com regs zerados (spawn ≠ fork: sem herança), Rd = ctx_id.
+    fn exec_remote_spawn(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::context::Priority;
+        let (node, entry_pc, prio) = instr.remote_spawn_params();
+        if node != 0 {
+            return Err(anyhow!("REMOTE_SPAWN: nó {} remoto sem transporte (F2+; F1 é local)", node));
+        }
+        let prio = match prio {
+            0 => Priority::Green,
+            1 => Priority::Blue,
+            2 => Priority::Red,
+            _ => return Err(anyhow!("REMOTE_SPAWN: prio {} inválida (0/1/2)", prio)),
+        };
+        self.check_jump_target(entry_pc as u128)?;
+        let root = self.memory.current_version();
+        let new_id = self.scheduler.create_context(prio, entry_pc as u128, root);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, new_id as u128)?;
+            }
+        }
+        self.stats.remote_spawn_execs += 1;
+        log_debug("cluster", &format!("ctx {} REMOTE_SPAWN local -> ctx {} @ 0x{:x}", ctx_id, new_id, entry_pc));
+        Ok(())
+    }
+
+    /// SIGNAL rD, kind, node, ctx, seq — fora-de-banda local.
+    /// ABORT: termina + pops de engine (sem restore de heap — sem versão;
+    /// use ABORT p/ isso). HALT/KILL: termina. PING: ack 0. FORK_REQ: Err
+    /// explícito (use FORK; request remoto é F3). rdest = 0 no sucesso.
+    fn exec_signal(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{
+            SIGNAL_KIND_ABORT, SIGNAL_KIND_FORK_REQ, SIGNAL_KIND_HALT, SIGNAL_KIND_PING,
+        };
+        let kind = instr.rsrc1;
+        let (node, target, seq) = instr.signal_params();
+        if node != 0 {
+            return Err(anyhow!("SIGNAL: nó {} remoto sem transporte (F2+)", node));
+        }
+        if kind != SIGNAL_KIND_ABORT
+            && kind != SIGNAL_KIND_FORK_REQ
+            && kind != SIGNAL_KIND_HALT
+            && kind != SIGNAL_KIND_PING
+        {
+            return Err(anyhow!("SIGNAL: KIND {} inválido (0/1/2/3)", kind));
+        }
+        if kind == SIGNAL_KIND_FORK_REQ {
+            return Err(anyhow!("SIGNAL FORK_REQ local: use FORK (request remoto é F3)"));
+        }
+        if kind == SIGNAL_KIND_PING {
+            if target != 0 && self.scheduler.get(target).is_none() {
+                return Err(anyhow!("SIGNAL PING: ctx {} inexistente", target));
+            }
+            if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+                if instr.rdest != 0xFF {
+                    ctx.set_reg(instr.rdest, 0)?;
+                }
+            }
+            self.stats.signal_execs += 1;
+            log_debug("cluster", &format!("ctx {} SIGNAL PING -> {} ack (seq {})", ctx_id, target, seq));
+            return Ok(());
+        }
+        // ABORT / HALT: alvo obrigatório.
+        if target == 0 {
+            return Err(anyhow!("SIGNAL: KIND={} exige CTX alvo != 0", kind));
+        }
+        if self.scheduler.get(target).is_none() {
+            return Err(anyhow!("SIGNAL: alvo ctx {} inexistente", target));
+        }
+        self.scheduler.remove(target);
+        if kind == SIGNAL_KIND_ABORT {
+            // Pops de engine como exec_abort, sem restore de heap.
+            if let Some((_, snap)) = self.ssm_snapshots.pop() {
+                self.ssm_states = snap;
+            }
+            if let Some((_, snap)) = self.rank1_snapshots.pop() {
+                self.rank1_layers = snap;
+            }
+            if let Some((_, snap)) = self.snn_snapshots.pop() {
+                self.snn_layers = snap;
+            }
+        }
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, 0)?;
+            }
+        }
+        self.stats.signal_execs += 1;
+        log_debug("cluster", &format!("ctx {} SIGNAL kind={} -> {} seq={}", ctx_id, kind, target, seq));
+        Ok(())
+    }
+
+    /// SEND_TENSOR rS, rD|0xFF, node, off, len, mode — cópia local de bytes
+    /// [off, off+len) do tensor fonte. COPY: tensor novo (ou destino dado
+    /// com tamanho exato). MOVE: COPY + invalidação TOTAL da fonte
+    /// (heap+meta+esparso). len 0: Err (não no-op silencioso).
+    fn exec_send_tensor(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{SEND_MODE_COPY, SEND_MODE_MOVE};
+        let (src_addr, dst_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            let s = ctx.reg(instr.rdest)?;
+            let d = if instr.rsrc1 != 0xFF { ctx.reg(instr.rsrc1)? } else { 0xFF as u128 };
+            (s, d)
+        };
+        let (node, off, len, mode) = instr.send_tensor_params();
+        if node != 0 {
+            return Err(anyhow!("SEND_TENSOR: nó {} remoto sem transporte (F2+)", node));
+        }
+        if mode != SEND_MODE_COPY && mode != SEND_MODE_MOVE {
+            return Err(anyhow!("SEND_TENSOR: MODE {} inválido (0=COPY,1=MOVE)", mode));
+        }
+        if len == 0 {
+            return Err(anyhow!("SEND_TENSOR: LEN 0 (bulk vazio é bug do chamador)"));
+        }
+        let src_meta = self.memory.get_tensor_meta(src_addr).cloned()
+            .ok_or_else(|| anyhow!("SEND_TENSOR: fonte 0x{:x} não encontrada", src_addr))?;
+        if src_meta.is_sparse {
+            return Err(anyhow!("SEND_TENSOR: fonte esparsa (F2+: serialização CSR)"));
+        }
+        let total: usize = src_meta.shape.iter().product::<usize>() * 4;
+        let (off, len) = (off as usize, len as usize);
+        if off.saturating_add(len) > total {
+            return Err(anyhow!("SEND_TENSOR: janela [{}..{}] fora do tensor ({}B)", off, off + len, total));
+        }
+        let bytes = self.memory.read(src_addr, total)?[off..off + len].to_vec();
+        if instr.rsrc1 != 0xFF {
+            let dmeta = self.memory.get_tensor_meta(dst_addr).cloned()
+                .ok_or_else(|| anyhow!("SEND_TENSOR: destino 0x{:x} não encontrado", dst_addr))?;
+            if dmeta.is_sparse {
+                return Err(anyhow!("SEND_TENSOR: destino esparso não suportado"));
+            }
+            let dtotal: usize = dmeta.shape.iter().product::<usize>() * 4;
+            // Escrita espelhada no mesmo offset (montagem parcial honesta);
+            // destino menor que a janela => erro, nunca truncamento.
+            if off.saturating_add(len) > dtotal {
+                return Err(anyhow!("SEND_TENSOR: janela [{}..{}] fora do destino ({}B)", off, off + len, dtotal));
+            }
+            // Escreve o bulk deslocado: lê, emenda, escreve de volta
+            // (preserva o restante do destino).
+            let mut cur = self.memory.read(dst_addr, dtotal)?;
+            cur[off..off + len].copy_from_slice(&bytes);
+            self.memory.write(dst_addr, &cur)?;
+        } else {
+            // F1: sem driver não há para onde devolver tensor alocado (rdest
+            // carrega a FONTE pelo encoding congelado) — destino explícito
+            // exigido; a forma 0xFF volta com o transporte (F2+).
+            return Err(anyhow!("SEND_TENSOR: destino 0xFF exige transporte (F2+); passe tensor destino explícito"));
+        }
+        if mode == SEND_MODE_MOVE {
+            // Invalidação total: heap + meta + esparso (nada ressuscitável).
+            if !self.memory.remove_tensor(src_addr) {
+                return Err(anyhow!("SEND_TENSOR MOVE: fonte 0x{:x} já ausente", src_addr));
+            }
+            log_debug("cluster", &format!("ctx {} SEND_TENSOR MOVE 0x{:x} invalidado", ctx_id, src_addr));
+        }
+        self.stats.send_tensor_execs += 1;
+        log_debug("cluster", &format!("ctx {} SEND_TENSOR mode={} {}B", ctx_id, mode, len));
+        Ok(())
+    }
+
+    /// SLICE rD, rT — fatia flat [start, start+len) => tensor novo [1,len].
+    /// Bounds validados pré-alloc; len 0 e OOB são Err (nunca clamp).
+    /// Denso f32 apenas (RFC-0019).
+    fn exec_slice(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (start, len) = instr.slice_params();
+        let (start, len) = (start as usize, len as usize);
+        if len == 0 {
+            return Err(anyhow!("SLICE: LEN 0 (fatia vazia é bug do chamador)"));
+        }
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("SLICE: tensor 0x{:x} não encontrado", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("SLICE: esparso não suportado"));
+        }
+        let flat: usize = meta.shape.iter().product();
+        if start.saturating_add(len) > flat {
+            return Err(anyhow!("SLICE: janela [{}..{}] fora do tensor ({} elems)", start, start + len, flat));
+        }
+        let data = self.memory.read_f32_tensor(t_addr, flat)?;
+        let out_addr = self.memory.alloc_tensor(&[1, len], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &data[start..start + len])?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.slice_execs += 1;
+        log_debug("slice", &format!("ctx {} SLICE 0x{:x}[{}..{}] -> 0x{:x}", ctx_id, t_addr, start, start + len, out_addr));
+        Ok(())
+    }
+
+    /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
+    /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
+    /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
+    /// loop de run avança o PC e re-enfileira quem segue Running; mexer
+    /// aqui duplicaria presença na fila e pularia o avanço de PC.
+    fn barrier_wake(&mut self, id: u32) {
+        if let Some(waiters) = self.barrier_waiters.remove(&id) {
+            for w in waiters {
+                if let Some(ctx) = self.scheduler.get_mut(w) {
+                    ctx.state = crate::context::ContextState::Ready;
+                    self.scheduler.enqueue(w);
+                }
+            }
+        }
+    }
+
+    /// BARRIER id/expected/timeout/epoch — one-shot local. Chegada
+    /// junta-ou-cria; expected atingido => RELEASE (reacorda + apaga);
+    /// timeout (0=sem) verificado preguiçosamente na chegada (NACK: o
+    /// arrivante morre com Err, os demais são liberados); geração
+    /// divergente (expected/epoch) => Err sem tocar em nada.
+    fn exec_barrier(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (id, expected, timeout_ms, epoch) = instr.barrier_params();
+        if expected == 0 {
+            return Err(anyhow!("BARRIER: EXPECT 0 (barreira vazia é bug do chamador)"));
+        }
+        let now = crate::utils::now_ns();
+        let arrived_new = match self.barriers.get(&id).copied() {
+            None => {
+                if expected <= 1 {
+                    // EXPECT=1: libera na hora, sem bloquear nem registrar.
+                    self.stats.barrier_execs += 1;
+                    log_debug("cluster", &format!("ctx {} BARRIER id={} RELEASE-imediato (1/1)", ctx_id, id));
+                    return Ok(());
+                }
+                let deadline = if timeout_ms == 0 {
+                    u64::MAX
+                } else {
+                    now.saturating_add(timeout_ms as u64 * 1_000_000)
+                };
+                self.barriers.insert(id, BarrierState { expected, arrived: 1, deadline_ns: deadline, epoch });
+                1u32
+            }
+            Some(st) => {
+                if st.expected != expected || st.epoch != epoch {
+                    return Err(anyhow!(
+                        "BARRIER id={}: geração divergente (have expect={} epoch={}, want expect={} epoch={})",
+                        id, st.expected, st.epoch, expected, epoch
+                    ));
+                }
+                if now > st.deadline_ns {
+                    // Timeout: apaga, libera quem esperava; o arrivante
+                    // recebe NACK como Err (morre — documentado na RFC).
+                    self.barriers.remove(&id);
+                    self.barrier_wake(id);
+                    return Err(anyhow!("BARRIER id={}: timeout (NACK)", id));
+                }
+                let n = st.arrived + 1;
+                if n >= st.expected as u32 {
+                    self.barriers.remove(&id);
+                    self.barrier_wake(id);
+                    self.stats.barrier_execs += 1;
+                    log_debug("cluster", &format!("ctx {} BARRIER id={} RELEASE ({}/{})", ctx_id, id, n, expected));
+                    return Ok(());
+                }
+                if let Some(stm) = self.barriers.get_mut(&id) {
+                    stm.arrived = n;
+                }
+                n
+            }
+        };
+        // Ainda faltam participantes: registra espera (sem duplicar o mesmo
+        // ctx — re-step manual não deve dar fatia dobrada) e bloqueia (o
+        // scheduler pula Blocked; o loop NÃO re-enfileira: estado != Running).
+        {
+            let waiters = self.barrier_waiters.entry(id).or_default();
+            if !waiters.contains(&ctx_id) {
+                waiters.push(ctx_id);
+            }
+        }
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.state = crate::context::ContextState::Blocked;
+        }
+        self.stats.barrier_execs += 1;
+        log_debug("cluster", &format!("ctx {} BARRIER id={} WAIT ({}/{})", ctx_id, id, arrived_new, expected));
         Ok(())
     }
 
@@ -3527,6 +3883,190 @@ impl Vm {
         self.stats.spike_execs += 1;
         log_debug("spike", &format!("ctx {} SPIKE_STEP layer={} n={} spikes={} -> 0x{:x}", ctx_id, layer, n,
             spikes.iter().filter(|&&s| s == 1.0).count(), s_addr));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC-0017: CONV (0x1E). Deslizamento direto 1D/2D (sem im2col),
+    // groups/depthwise, ativação fundida. Stateless (Family 1).
+    // -----------------------------------------------------------------------
+
+    fn conv_activate(x: f32, act: u8) -> f32 {
+        use crate::opcodes::{CONV_ACT_RELU, CONV_ACT_SILU};
+        if act == CONV_ACT_SILU {
+            if x >= 0.0 { x / (1.0 + (-x).exp()) } else { let e = x.exp(); x * e / (1.0 + e) }
+        } else if act == CONV_ACT_RELU {
+            x.max(0.0)
+        } else {
+            x
+        }
+    }
+
+    /// CONV rD, rX, rW [, rB] — cross-correlação (kernel NÃO flipado).
+    /// Adaptação de rank: [H,W]=>[1,1,H,W]; [C,L]=>[1,C,L]; [N,C,…] direto
+    /// (só 1D/2D); kernel cheio [Cout,Cin,K…] ou reduzido [K]/[KH,KW]
+    /// (single). Geometria validada antes de alocar.
+    fn exec_conv(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::opcodes::{CONV_ACT_NONE, CONV_ACT_RELU, CONV_ACT_SILU};
+        let (x_addr, w_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let b_addr = if instr.rsrc3 != 0xFF {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            Some(ctx.reg(instr.rsrc3)?)
+        } else {
+            None
+        };
+        let (stride, pad, dilation, groups, act) = instr.conv_params();
+        if act != CONV_ACT_NONE && act != CONV_ACT_SILU && act != CONV_ACT_RELU {
+            return Err(anyhow!("CONV: ACT {} inválido (0/1/2)", act));
+        }
+        if stride == 0 || dilation == 0 {
+            return Err(anyhow!("CONV: STRIDE/DILATION devem ser >= 1"));
+        }
+        if groups == 0 {
+            return Err(anyhow!("CONV: GROUPS inválido"));
+        }
+        let xm = self.memory.get_tensor_meta(x_addr).cloned()
+            .ok_or_else(|| anyhow!("CONV: input 0x{:x} não encontrado", x_addr))?;
+        let wm = self.memory.get_tensor_meta(w_addr).cloned()
+            .ok_or_else(|| anyhow!("CONV: kernel 0x{:x} não encontrado", w_addr))?;
+        if xm.is_sparse || wm.is_sparse {
+            return Err(anyhow!("CONV: esparso não suportado"));
+        }
+        // Adaptação de rank do input.
+        let (batch, cin, spatial): (usize, usize, Vec<usize>) = match xm.shape.len() {
+            2 => (1, 1, vec![xm.shape[0], xm.shape[1]]),
+            3 => (xm.shape[0], xm.shape[1], xm.shape[2..].to_vec()),
+            4 => (xm.shape[0], xm.shape[1], xm.shape[2..].to_vec()),
+            r => return Err(anyhow!("CONV: input rank {} (só 1D/2D: [H,W]/[N,C,L]/[N,C,..])", r)),
+        };
+        let ndim = spatial.len();
+        // Adaptação de rank do kernel.
+        let (cout, kcin, kspatial): (usize, usize, Vec<usize>) = match wm.shape.len() {
+            1 if ndim == 1 => (1, 1, vec![wm.shape[0]]),
+            2 if ndim == 2 => (1, 1, vec![wm.shape[0], wm.shape[1]]),
+            r if r == ndim + 2 => (wm.shape[0], wm.shape[1], wm.shape[2..].to_vec()),
+            _ => return Err(anyhow!("CONV: kernel rank {:?} incompatível com input {}D", wm.shape, ndim)),
+        };
+        let g = groups as usize;
+        if g == 0 {
+            return Err(anyhow!("CONV: GROUPS inválido"));
+        }
+        if kcin != cin / g {
+            // Layout padrão de groups: kernel [Cout, Cin/G, K...].
+            // (G=1 => [Cout, Cin, K...] usual; depthwise => [C,1,K...].)
+            return Err(anyhow!("CONV: Cin kernel {} != Cin/Grupos {}/{} (kernel [Cout,Cin/G,K..])", kcin, cin, g));
+        }
+        if cin % g != 0 || cout % g != 0 {
+            return Err(anyhow!("CONV: GROUPS {} não divide Cin={} Cout={}", g, cin, cout));
+        }
+        // Geometria por eixo (tudo validado antes de alocar).
+        let s = stride as usize;
+        let p = pad as usize;
+        let d = dilation as usize;
+        let mut out_spatial = Vec::with_capacity(ndim);
+        for (a, (&ii, &kk)) in spatial.iter().zip(kspatial.iter()).enumerate() {
+            let eff = d * (kk - 1) + 1;
+            if ii + 2 * p < eff {
+                return Err(anyhow!("CONV: kernel maior que input no eixo {} (I={} K={} pad={} dil={})", a, ii, kk, p, d));
+            }
+            out_spatial.push((ii + 2 * p - eff) / s + 1);
+        }
+        // Bias: ausente ou flat len == Cout.
+        let bias: Vec<f32> = match b_addr {
+            None => vec![0.0f32; cout],
+            Some(ba) => {
+                let bm = self.memory.get_tensor_meta(ba).cloned()
+                    .ok_or_else(|| anyhow!("CONV: bias 0x{:x} não encontrado", ba))?;
+                if bm.is_sparse {
+                    return Err(anyhow!("CONV: bias esparso não suportado"));
+                }
+                let flat: usize = bm.shape.iter().product();
+                if flat != cout {
+                    return Err(anyhow!("CONV: bias com {} elems, esperado Cout={}", flat, cout));
+                }
+                self.memory.read_f32_tensor(ba, flat)?
+            }
+        };
+        let xflat = self.memory.read_f32_tensor(x_addr, batch * cin * spatial.iter().product::<usize>())?;
+        let wflat = self.memory.read_f32_tensor(w_addr, cout * kcin * kspatial.iter().product::<usize>())?;
+        let cin_g = cin / g;
+        let cout_g = cout / g;
+        let mut out_shape = vec![batch, cout];
+        out_shape.extend_from_slice(&out_spatial);
+        let out_len: usize = out_shape.iter().product();
+        let mut out = vec![0.0f32; out_len];
+        if ndim == 1 {
+            let (li, lk, lo) = (spatial[0], kspatial[0], out_spatial[0]);
+            for n in 0..batch {
+                for co in 0..cout {
+                    let gz = co / cout_g;
+                    for o in 0..lo {
+                        let mut acc = bias[co];
+                        for ci in 0..cin_g {
+                            let c = gz * cin_g + ci;
+                            for k in 0..lk {
+                                let ii = o as isize * s as isize - p as isize + k as isize * d as isize;
+                                if ii < 0 || ii >= li as isize {
+                                    continue;
+                                }
+                                let xv = xflat[(n * cin + c) * li + ii as usize];
+                                let wv = wflat[(co * cin_g + ci) * lk + k];
+                                acc += xv * wv;
+                            }
+                        }
+                        out[((n * cout + co) * lo) + o] = Self::conv_activate(acc, act);
+                    }
+                }
+            }
+        } else {
+            let (hi, wi) = (spatial[0], spatial[1]);
+            let (hk, wk) = (kspatial[0], kspatial[1]);
+            let (ho, wo) = (out_spatial[0], out_spatial[1]);
+            for n in 0..batch {
+                for co in 0..cout {
+                    let gz = co / cout_g;
+                    for oh in 0..ho {
+                        for ow in 0..wo {
+                            let mut acc = bias[co];
+                            for ci in 0..cin_g {
+                                let c = gz * cin_g + ci;
+                                for kh in 0..hk {
+                                    let ih = oh as isize * s as isize - p as isize + kh as isize * d as isize;
+                                    if ih < 0 || ih >= hi as isize {
+                                        continue;
+                                    }
+                                    for kw in 0..wk {
+                                        let iw = ow as isize * s as isize - p as isize + kw as isize * d as isize;
+                                        if iw < 0 || iw >= wi as isize {
+                                            continue;
+                                        }
+                                        let xv = xflat[((n * cin + c) * hi + ih as usize) * wi + iw as usize];
+                                        let wv = wflat[((co * cin_g + ci) * hk + kh) * wk + kw];
+                                        acc += xv * wv;
+                                    }
+                                }
+                            }
+                            out[(((n * cout + co) * ho) + oh) * wo + ow] = Self::conv_activate(acc, act);
+                        }
+                    }
+                }
+            }
+        }
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err(anyhow!("CONV: resultado não-finito"));
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.conv_execs += 1;
+        log_debug("conv", &format!("ctx {} CONV {}D N={} Cin={} Cout={} G={} act={} -> 0x{:x}", ctx_id, ndim, batch, cin, cout, g, act, out_addr));
         Ok(())
     }
 
@@ -5212,7 +5752,352 @@ mod tests {
         assert_ne!(vm.snn_layers.get(&1).copied(), before.get(&1).copied());
         vm.scheduler.get_mut(cid).unwrap().set_reg(4, v1 as u128).unwrap();
         vm.step_instruction(cid, &instr_abort(5, 4)).unwrap();
+        vm.step_instruction(cid, &instr_abort(5, 4)).unwrap();
         assert_eq!(vm.snn_layers, before);
         assert_eq!(vm.stats.spike_execs, 2);
+    }
+
+    // ---- RFC-0017: CONV goldens -------------------------------------
+
+    #[tokio::test]
+    async fn test_conv_1d_basic() {
+        use crate::opcodes::{instr_conv, CONV_ACT_NONE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // x=[1,1,5]=[1,2,3,4,5], k=[1,1,3]=[1,0,-1] (edge), stride 1.
+        // out[0]=1*1+2*0+3*(-1)=-2; out[1]=2-4=-2; out[2]=3-5=-2.
+        let x = rfc0004_f32(&mut vm, &[1, 1, 5], &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let k = rfc0004_f32(&mut vm, &[1, 1, 3], &[1.0, 0.0, -1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, k)]);
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 1, CONV_ACT_NONE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        let meta = vm.memory.get_tensor_meta(out).cloned().unwrap();
+        assert_eq!(meta.shape, vec![1, 1, 3]);
+        assert_eq!(vm.memory.read_f32_tensor(out, 3).unwrap(), vec![-2.0, -2.0, -2.0]);
+        assert_eq!(vm.stats.conv_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_conv_2d_golden_stride_pad() {
+        use crate::opcodes::{instr_conv, CONV_ACT_NONE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // x=[1,1,3,3]=1..9, k=[1,1,2,2]=[[1,0],[0,1]] (identidade diagonal).
+        // stride 1, sem pad => [1,1,2,2]:
+        // [0,0]=1*1+2*0+4*0+5*1=6; [0,1]=2+6=8; [1,0]=4+8=12; [1,1]=5+9=14.
+        let x = rfc0004_f32(&mut vm, &[1, 1, 3, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let k = rfc0004_f32(&mut vm, &[1, 1, 2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, k)]);
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 1, CONV_ACT_NONE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 4).unwrap(), vec![6.0, 8.0, 12.0, 14.0]);
+        // stride 2, pad 1, bias 10: O=floor((3+2-2)/2)+1=2.
+        // Padded 5x5 (borda 0); janela (oh,ow) cobre (2oh-1..2oh, 2ow-1..2ow)
+        // com kernel [[1,0],[0,1]]: (0,0)->x[0,0]=1; (0,1)->x[0,2]=3;
+        // (1,0)->x[2,0]=7; (1,1)->x[1,1]+x[2,2]=5+9=14. +10 cada.
+        let b = rfc0004_f32(&mut vm, &[1], &[10.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, b).unwrap();
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 2, 2, 1, 1, 1, CONV_ACT_NONE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 4).unwrap(), vec![11.0, 13.0, 17.0, 24.0]);
+    }
+
+    #[tokio::test]
+    async fn test_conv_depthwise_fused_dilation() {
+        use crate::opcodes::{instr_conv, CONV_ACT_NONE, CONV_ACT_RELU, CONV_ACT_SILU};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // Depthwise: Cin=Cout=2, G=2, kernel [2,1,3] (por canal).
+        // canal0: x=[1,2,3,4,5], k=[1,0,-1] => [-2,-2,-2]; canal1: x=[5,4,3,2,1] => [2,2,2].
+        let x = rfc0004_f32(&mut vm, &[1, 2, 5], &[1.0, 2.0, 3.0, 4.0, 5.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
+        let k = rfc0004_f32(&mut vm, &[2, 1, 3], &[1.0, 0.0, -1.0, 1.0, 0.0, -1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, k)]);
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 2, CONV_ACT_NONE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        let meta = vm.memory.get_tensor_meta(out).cloned().unwrap();
+        assert_eq!(meta.shape, vec![1, 2, 3]);
+        assert_eq!(vm.memory.read_f32_tensor(out, 6).unwrap(), vec![-2.0, -2.0, -2.0, 2.0, 2.0, 2.0]);
+        // Fused ReLU zera negativos; tamanho mantido.
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 2, CONV_ACT_RELU)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 6).unwrap(), vec![0.0, 0.0, 0.0, 2.0, 2.0, 2.0]);
+        // Dilation 2 com o mesmo kernel [2,1,3]: eff=1+2*2=5, L=5 => O=1.
+        // canal0: x[0]*1+x[2]*0+x[4]*-1 = 1-5 = -4; canal1: 5-1 = 4.
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 2, 2, CONV_ACT_NONE)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 2).unwrap(), vec![-4.0, 4.0]);
+        // SILU fundido preserva shape e finitude.
+        vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 2, CONV_ACT_SILU)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        let v = vm.memory.read_f32_tensor(out, 6).unwrap();
+        assert!(v.iter().all(|z| z.is_finite()));
+        assert_eq!(vm.stats.conv_execs, 4);
+    }
+
+    #[tokio::test]
+    async fn test_conv_errors() {
+        use crate::opcodes::{instr_conv, CONV_ACT_NONE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let x = rfc0004_f32(&mut vm, &[1, 2, 4], &[1.0; 8]);
+        let k = rfc0004_f32(&mut vm, &[2, 2, 2], &[1.0; 8]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, k)]);
+        // Cin kernel (2) != Cin/Grupos (2/2=1): layout exige [Cout,Cin/G].
+        // (GROUPS=2 com kernel [2,2,2]: kcin=2 vs cin/g=1.)
+        let ok2 = instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 2, CONV_ACT_NONE);
+        assert!(vm.step_instruction(cid, &ok2).is_err());
+        // Kernel maior que o input.
+        let big = rfc0004_f32(&mut vm, &[1, 1, 9], &[1.0; 9]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, big).unwrap();
+        assert!(vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 1, CONV_ACT_NONE)).is_err());
+        // Groups que não dividem.
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, k).unwrap();
+        assert!(vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 3, CONV_ACT_NONE)).is_err());
+        // ACT inválido e stride 0.
+        let mut bad = instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 1, CONV_ACT_NONE);
+        bad.payload[7] = 9;
+        assert!(vm.step_instruction(cid, &bad).is_err());
+        let mut bads = instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 1, CONV_ACT_NONE);
+        bads.payload[0] = 0;
+        bads.payload[1] = 0;
+        assert!(vm.step_instruction(cid, &bads).is_err());
+        // Bias com tamanho errado.
+        let bb = rfc0004_f32(&mut vm, &[3], &[0.0; 3]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, bb).unwrap();
+        assert!(vm.step_instruction(cid, &instr_conv(4, 0, 1, 2, 1, 0, 1, 1, CONV_ACT_NONE)).is_err());
+        // Rank 3D de volume (não suportado no MVP): kernel 4D com
+        // input 1D (rank 3 == ndim+2 exigiria rank 3 no kernel).
+        let v3 = rfc0004_f32(&mut vm, &[2, 2, 2], &[1.0; 8]);
+        let k3 = rfc0004_f32(&mut vm, &[2, 2, 2], &[1.0; 8]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, v3).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, k3).unwrap();
+        // [2,2,2] como input 1D-3ch [N=1,C=2,L=2] é válido! usa kernel 4D p/ falhar:
+        let k4 = rfc0004_f32(&mut vm, &[1, 1, 1, 9], &[1.0; 9]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, k4).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, k4).unwrap();
+        assert!(vm.step_instruction(cid, &instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 1, CONV_ACT_NONE)).is_err());
+    }
+
+    // ---- RFC-0018: cluster F1 ---------------------------------------
+
+    #[tokio::test]
+    async fn test_remote_spawn_and_signal_local() {
+        use crate::opcodes::{
+            instr_remote_spawn, instr_signal, SIGNAL_KIND_ABORT,
+            SIGNAL_KIND_FORK_REQ, SIGNAL_KIND_HALT, SIGNAL_KIND_PING,
+        };
+        use crate::context::Priority;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // Programa com label: SPAWN entra no HALT (filho termina sozinho).
+        let prog = crate::opcodes::assemble("MAIN:\nHALT\n").unwrap();
+        vm.load_program(prog);
+        let base = vm.program_base;
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // SPAWN local (prio RED=2): filho nasce no HALT, regs zerados.
+        vm.step_instruction(cid, &instr_remote_spawn(0, 0, base as u64, 2)).unwrap();
+        let child = vm.scheduler.get(cid).unwrap().reg(0).unwrap() as u64;
+        assert_ne!(child, cid);
+        let cctx = vm.scheduler.get(child).unwrap();
+        assert_eq!((cctx.pc, cctx.priority), (base, Priority::Red));
+        assert_eq!(cctx.reg(0).unwrap(), 0, "spawn não herda regs (≠ fork)");
+        // PING em ctx existente: ack 0.
+        vm.step_instruction(cid, &instr_signal(1, SIGNAL_KIND_PING, 0, child, 7)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(1).unwrap(), 0);
+        // PING em ctx inexistente: erro.
+        assert!(vm.step_instruction(cid, &instr_signal(1, SIGNAL_KIND_PING, 0, 4242, 7)).is_err());
+        // FORK_REQ local: erro explícito (use FORK).
+        assert!(vm.step_instruction(cid, &instr_signal(1, SIGNAL_KIND_FORK_REQ, 0, child, 7)).is_err());
+        // KIND inválido e nó remoto: erro.
+        let mut badk = instr_signal(1, SIGNAL_KIND_PING, 0, child, 7);
+        badk.rsrc1 = 9;
+        assert!(vm.step_instruction(cid, &badk).is_err());
+        assert!(vm.step_instruction(cid, &instr_signal(1, SIGNAL_KIND_PING, 1, child, 7)).is_err());
+        assert!(vm.step_instruction(cid, &instr_remote_spawn(0, 3, base as u64, 0)).is_err());
+        // ABORT via SIGNAL mata o filho.
+        vm.step_instruction(cid, &instr_signal(1, SIGNAL_KIND_ABORT, 0, child, 7)).unwrap();
+        assert!(vm.scheduler.get(child).is_none());
+        // HALT mata sem pops: empilha ssm, HALT, conta intacta.
+        let cid2 = rfc0004_ctx_with(&mut vm, &[]);
+        vm.ssm_states.push(crate::ssm::MambaState::new(2, 1, 4));
+        vm.step_instruction(cid2, &instr_remote_spawn(0, 0, base as u64, 0)).unwrap();
+        let child2 = vm.scheduler.get(cid2).unwrap().reg(0).unwrap() as u64;
+        let snaps_before = vm.ssm_snapshots.len();
+        vm.step_instruction(cid2, &instr_signal(1, SIGNAL_KIND_HALT, 0, child2, 7)).unwrap();
+        assert!(vm.scheduler.get(child2).is_none());
+        assert_eq!(vm.ssm_snapshots.len(), snaps_before, "HALT não toca nas pilhas");
+        assert_eq!(vm.stats.remote_spawn_execs, 2);
+        assert_eq!(vm.stats.signal_execs, 3);
+    }
+
+    #[tokio::test]
+    async fn test_send_tensor_copy_move() {
+        use crate::opcodes::{instr_send_tensor, SEND_MODE_COPY, SEND_MODE_MOVE};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // Fonte [4] f32 = 16B: [1,2,3,4]; destino [4] zeros.
+        let s = rfc0004_f32(&mut vm, &[4], &[1.0, 2.0, 3.0, 4.0]);
+        let d = rfc0004_f32(&mut vm, &[4], &[0.0; 4]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(5, s), (6, d)]);
+        // COPY integral.
+        vm.step_instruction(cid, &instr_send_tensor(5, 6, 0, 0, 16, SEND_MODE_COPY)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(d, 4).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        // COPY parcial [4..12) = bytes de [2.0, 3.0] sobre destino NÃO
+        // zerado (prova preservação do restante): [9,9,9,9] -> [9,2,3,9].
+        let d2 = rfc0004_f32(&mut vm, &[4], &[9.0; 4]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, d2).unwrap();
+        vm.step_instruction(cid, &instr_send_tensor(5, 6, 0, 4, 8, SEND_MODE_COPY)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(d2, 4).unwrap(), vec![9.0, 2.0, 3.0, 9.0]);
+        // MOVE invalida a fonte de verdade (heap + meta).
+        vm.step_instruction(cid, &instr_send_tensor(5, 6, 0, 0, 16, SEND_MODE_MOVE)).unwrap();
+        assert!(vm.memory.get_tensor_meta(s).is_none(), "MOVE remove a meta");
+        assert!(vm.memory.read(s, 16).is_err(), "MOVE remove o heap");
+        assert_eq!(vm.memory.read_f32_tensor(d2, 4).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        // Erros: LEN 0, janela OOB, destino incompatível, dst 0xFF (F1),
+        // modo inválido, nó remoto, fonte ausente.
+        let s2 = rfc0004_f32(&mut vm, &[2], &[9.0, 9.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, s2).unwrap();
+        assert!(vm.step_instruction(cid, &instr_send_tensor(5, 6, 0, 0, 0, SEND_MODE_COPY)).is_err());
+        assert!(vm.step_instruction(cid, &instr_send_tensor(5, 6, 0, 4, 8, SEND_MODE_COPY)).is_err());
+        let small = rfc0004_f32(&mut vm, &[1], &[0.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, small).unwrap();
+        assert!(vm.step_instruction(cid, &instr_send_tensor(5, 6, 0, 0, 8, SEND_MODE_COPY)).is_err());
+        assert!(vm.step_instruction(cid, &instr_send_tensor(5, 0xFF, 0, 0, 8, SEND_MODE_COPY)).is_err());
+        let mut badm = instr_send_tensor(5, 6, 0, 0, 8, SEND_MODE_COPY);
+        badm.payload[16] = 7;
+        assert!(vm.step_instruction(cid, &badm).is_err());
+        assert!(vm.step_instruction(cid, &instr_send_tensor(5, 6, 2, 0, 8, SEND_MODE_COPY)).is_err());
+        assert_eq!(vm.stats.send_tensor_execs, 3);
+    }
+
+    #[tokio::test]
+    async fn test_barrier_two_party_release() {
+        use crate::opcodes::instr_barrier;
+        use crate::context::ContextState;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let a = rfc0004_ctx_with(&mut vm, &[]);
+        let b = rfc0004_ctx_with(&mut vm, &[]);
+        // A chega primeiro: bloqueia.
+        vm.step_instruction(a, &instr_barrier(7, 2, 0, 1)).unwrap();
+        assert!(matches!(vm.scheduler.get(a).unwrap().state, ContextState::Blocked));
+        assert!(vm.barriers.contains_key(&7));
+        // B chega: RELEASE; A reacorda; entrada some.
+        vm.step_instruction(b, &instr_barrier(7, 2, 0, 1)).unwrap();
+        assert!(!vm.barriers.contains_key(&7));
+        assert!(matches!(vm.scheduler.get(a).unwrap().state, ContextState::Ready));
+        // EXPECT=1: libera na hora, nunca bloqueia (estado segue Ready —
+        // step direto não passa por pick_next, que poria Running).
+        vm.step_instruction(a, &instr_barrier(8, 1, 0, 1)).unwrap();
+        assert!(matches!(vm.scheduler.get(a).unwrap().state, ContextState::Ready));
+        assert!(!vm.barriers.contains_key(&8));
+        // Geração divergente e EXPECT=0: erro sem tocar em nada.
+        vm.step_instruction(a, &instr_barrier(9, 2, 0, 1)).unwrap();
+        assert!(vm.step_instruction(b, &instr_barrier(9, 3, 0, 1)).is_err());
+        assert!(vm.step_instruction(b, &instr_barrier(9, 2, 0, 2)).is_err());
+        assert!(vm.step_instruction(a, &instr_barrier(10, 0, 0, 1)).is_err());
+        // 4 execuções contabilizadas (A7, B7-release, A8-imediato, A9-wait);
+        // os 3 erros não contabilizam.
+        assert_eq!(vm.stats.barrier_execs, 4);
+    }
+
+    #[tokio::test]
+    async fn test_barrier_timeout_nack() {
+        use crate::opcodes::instr_barrier;
+        use crate::context::ContextState;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let a = rfc0004_ctx_with(&mut vm, &[]);
+        let b = rfc0004_ctx_with(&mut vm, &[]);
+        // A espera em id=11 (sem timeout). Entrada expirada forjada p/ id=12
+        // com A como waiter: B chega atrasado => NACK (morre), A liberado.
+        vm.step_instruction(a, &instr_barrier(11, 2, 0, 1)).unwrap();
+        vm.barriers.insert(12, crate::vm::BarrierState { expected: 2, arrived: 1, deadline_ns: 0, epoch: 1 });
+        vm.barrier_waiters.insert(12, vec![a]);
+        assert!(vm.step_instruction(b, &instr_barrier(12, 2, 0, 1)).is_err());
+        assert!(!vm.barriers.contains_key(&12));
+        assert!(matches!(vm.scheduler.get(a).unwrap().state, ContextState::Ready));
+        assert!(vm.scheduler.get(b).is_none() || !matches!(vm.scheduler.get(b).unwrap().state, ContextState::Running));
+    }
+
+    #[tokio::test]
+    async fn test_priority_set_single_presence() {
+        // Regressão RFC-0018: PRIORITY_SET enfileirava aqui + o loop de run
+        // re-enfileirava de novo (presença dupla => fatia dobrada).
+        // Simula o ciclo do run: pick (pop) -> step -> avanço+Ready -> yield.
+        use crate::opcodes::{instr_priority_set};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, 2u128)]);
+        let picked = vm.scheduler.pick_next().unwrap();
+        assert_eq!(picked, cid);
+        vm.step_instruction(cid, &instr_priority_set(0)).unwrap();
+        assert!(matches!(vm.scheduler.get(cid).unwrap().priority, crate::context::Priority::Red));
+        // Cauda do loop: advance + yield (cópia fiel de Vm::run).
+        if let Some(ctx) = vm.scheduler.get_mut(cid) {
+            if ctx.state == crate::context::ContextState::Running {
+                ctx.advance_pc();
+                ctx.state = crate::context::ContextState::Ready;
+            }
+        }
+        vm.scheduler.yield_current();
+        let (r, bl, g) = vm.scheduler.queue_lengths();
+        assert_eq!((r, bl, g), (1, 0, 0), "exatamente uma presença (RED)");
+        // E o programa completo termina com contadores exatos.
+        let prog = crate::opcodes::assemble("LOADI r0, 2\nPRIORITY_SET r0\nNOP\nHALT").unwrap();
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        vm2.load_program(prog);
+        let stats = vm2.run().unwrap();
+        assert_eq!((stats.priority_set_execs, stats.steps), (1, 4));
+    }
+
+    // ---- RFC-0019: FILL + SLICE ---------------------------------------
+
+    #[tokio::test]
+    async fn test_tensor_fill_zeros_vs_ramp() {
+        use crate::opcodes::instr_tensor;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // Default: ramp (legado intacto).
+        vm.step_instruction(cid, &instr_tensor(0, 0xFF, 0xFF, 2, 2, 0)).unwrap();
+        let a = vm.scheduler.get(cid).unwrap().reg(0).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a, 4).unwrap(), vec![0.5, 1.0, 1.5, 2.0]);
+        // FILL=0: zeros exatos.
+        let mut z = instr_tensor(1, 0xFF, 0xFF, 2, 2, 0);
+        z.set_tensor_fill(0.0);
+        vm.step_instruction(cid, &z).unwrap();
+        let b = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(b, 4).unwrap(), vec![0.0; 4]);
+        // FILL=2.5 via assembler.
+        let prog = crate::opcodes::assemble("TENSOR r2 2 2 f32 FILL=2.5").unwrap();
+        vm.step_instruction(cid, &prog[0]).unwrap();
+        let c = vm.scheduler.get(cid).unwrap().reg(2).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(c, 4).unwrap(), vec![2.5; 4]);
+    }
+
+    #[tokio::test]
+    async fn test_slice_exact_and_errors() {
+        use crate::opcodes::{instr_distance, instr_slice, DIST_METRIC_DOT};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // Simula packed do DISTANCE: [d0,d1,d2,i0,i1,i2] => fatia [3..6).
+        let p = rfc0004_f32(&mut vm, &[6], &[9.0, 8.0, 7.0, 0.0, 2.0, 1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, p)]);
+        vm.step_instruction(cid, &instr_slice(1, 0, 3, 3)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+        let meta = vm.memory.get_tensor_meta(out).cloned().unwrap();
+        assert_eq!(meta.shape, vec![1, 3]);
+        assert_eq!(vm.memory.read_f32_tensor(out, 3).unwrap(), vec![0.0, 2.0, 1.0]);
+        // Metade das dists.
+        vm.step_instruction(cid, &instr_slice(1, 0, 0, 3)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(1).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 3).unwrap(), vec![9.0, 8.0, 7.0]);
+        // Erros: OOB, além do fim, LEN 0.
+        assert!(vm.step_instruction(cid, &instr_slice(1, 0, 4, 3)).is_err());
+        assert!(vm.step_instruction(cid, &instr_slice(1, 0, 0, 7)).is_err());
+        assert!(vm.step_instruction(cid, &instr_slice(1, 0, 2, 0)).is_err());
+        // Integração: DISTANCE TOPK=2 real => SLICE Yeni índices => GATHER.
+        let q = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 0.0]);
+        let bank = rfc0004_f32(&mut vm, &[3, 2], &[1.0, 0.0, 0.0, 1.0, -1.0, 0.0]);
+        let tab = rfc0004_f32(&mut vm, &[3, 1], &[10.0, 20.0, 30.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(0, q).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(1, bank).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, tab).unwrap();
+        vm.step_instruction(cid, &instr_distance(3, 0, 1, DIST_METRIC_DOT, 2)).unwrap();
+        // DOT: [-1, 0, 1] => top-2: [-1(idx0), 0(idx1)] packed [1,4].
+        vm.step_instruction(cid, &instr_slice(4, 3, 2, 2)).unwrap();
+        vm.step_instruction(cid, &crate::opcodes::instr_gather(5, 2, 4, 0xFF, 0, crate::opcodes::GATHER_MODE_GATHER)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(5).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 2).unwrap(), vec![10.0, 20.0]);
     }
 }

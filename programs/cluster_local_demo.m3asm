@@ -1,0 +1,21 @@
+; cluster_local_demo.m3asm — cluster F1 local, sem rede (RFC-0018)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/cluster_local_demo.m3asm --max-steps 40
+; Semântica (fumaça de fiação; numéricos nos testes):
+;   TENSOR r0/r1 [1,4] (ramp) — payload do SEND.
+;   REMOTE_SPAWN r2 NODE=0 ENTRY=WORKER GREEN (filho halta sozinho).
+;   SEND_TENSOR r0, r1 NODE=0 OFF=0 LEN=16 (COPY integral).
+;   SIGNAL r3 KIND=PING NODE=0 CTX=1 (ack 0; ctx 1 = inicial).
+;   BARRIER id=1 EXPECT=1 (liberação imediata).
+;   HALT. Filho em WORKER: HALT.
+
+MAIN:
+    TENSOR r0 1 4 f32
+    TENSOR r1 1 4 f32
+    REMOTE_SPAWN r2 NODE=0 ENTRY=WORKER GREEN
+    SEND_TENSOR r0, r1 NODE=0 OFF=0 LEN=16
+    SIGNAL r3 KIND=PING NODE=0 CTX=1
+    BARRIER id=1 EXPECT=1 TIMEOUT=100
+    HALT
+WORKER:
+    HALT

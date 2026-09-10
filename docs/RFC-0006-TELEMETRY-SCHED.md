@@ -53,9 +53,9 @@ All 32B. Scalars via regs (u128); tensors canonical f32-LE.
                  Any value accepted; default u64::MAX (best-effort).
 0x72 GET_DEADLINE rdest <- ctx.deadline.
 0x73 PRIORITY_SET rsrc1 = reg holding 0/1/2 (GREEN/BLUE/RED), else Err.
-                 Thorough move: dequeue old queue, set, enqueue new,
-                 maybe_preempt. (CTX_SWITCH keeps its loose behavior;
-                 out of scope to change here.)
+                 Field swap only — the run loop re-enqueues exactly once
+                 via yield_current (an explicit enqueue here would double
+                 presence; fixed in RFC-0018 audit). maybe_preempt after.
 0x74 PRIORITY_GET rdest <- priority as u64 (0/1/2).
 0x75 LOCK rsrc1 = reg holding lock_id u32. TRY-lock (non-blocking):
                  free-or-self => acquire; held-by-other => Err Locked.

@@ -178,6 +178,10 @@ impl WgpuMemoryManager {
         self.cpu_fallback.restore(version)
     }
 
+    pub fn remove_tensor(&mut self, addr: u128) -> bool {
+        self.cpu_fallback.remove_tensor(addr)
+    }
+
     pub fn current_version(&self) -> u64 {
         self.cpu_fallback.current_version()
     }

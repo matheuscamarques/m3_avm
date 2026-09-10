@@ -1,0 +1,21 @@
+; attn_topk_demo.m3asm — atenção podada em nível de programa, perna empírica de T4 (RFC-0019)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/attn_topk_demo.m3asm --max-steps 30
+; Semântica (poda ANTES do softmax, sem densificar N×N):
+;   r0 = Q [1,4], r1 = K [8,4], r2 = V [8,4] (ramp: distâncias distintas).
+;   DISTANCE r3, r0, r1 METRIC=DOT TOPK=3 -> packed [dists(3)|idx(3)].
+;   SLICE r4, r3 START=3 LEN=3 -> SÓ os índices (o passo que faltava).
+;   GATHER r5, r1, r4 AXIS=0 -> K podado [3,4].
+;   GATHER r6, r2, r4 AXIS=0 -> V podado [3,4].
+;   ATTN r7, r0, r5, r6 sobre o subconjunto -> STREAM -> HALT.
+
+TENSOR r0 1 4 f32
+TENSOR r1 8 4 f32
+TENSOR r2 8 4 f32
+DISTANCE r3, r0, r1 METRIC=DOT TOPK=3
+SLICE r4, r3 START=3 LEN=3
+GATHER r5, r1, r4 AXIS=0 MODE=GATHER
+GATHER r6, r2, r4 AXIS=0 MODE=GATHER
+ATTN r7, r0, r5, r6
+STREAM r7, OUTPUT BLOCKING
+HALT

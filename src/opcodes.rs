@@ -58,6 +58,19 @@ pub const OP_CODEC_DEC: u8 = 0x16; // 16xu16 -> PCM 1920xf32
 pub const OP_AUDIO_ALIGN: u8 = 0x17; // t_user/t_ai/delta/frame_id p/ barge-in
 pub const OP_CTX_SWITCH: u8 = 0x18; // troca pipeline + fence + prioridade
 pub const OP_ROPE: u8 = 0x19; // Rotary Position Embedding nativo
+// Cluster F1 local (RFC-0018): sem transporte; node!=0 veta explícito.
+pub const OP_REMOTE_SPAWN: u8 = 0x1A; // cria contexto (local: entry_pc)
+pub const OP_SIGNAL: u8 = 0x1B; // controle: ABORT/FORK_REQ/HALT/PING
+pub const OP_SEND_TENSOR: u8 = 0x1C; // COPY (+MOVE com invalidação real)
+pub const OP_BARRIER: u8 = 0x1D; // barreira one-shot com timeout
+// Kinds — SIGNAL (rsrc1 como valor imediato 0..3).
+pub const SIGNAL_KIND_ABORT: u8 = 0;
+pub const SIGNAL_KIND_FORK_REQ: u8 = 1;
+pub const SIGNAL_KIND_HALT: u8 = 2;
+pub const SIGNAL_KIND_PING: u8 = 3;
+// Modos — SEND_TENSOR (payload[16]): 0=COPY, 1=MOVE.
+pub const SEND_MODE_COPY: u8 = 0;
+pub const SEND_MODE_MOVE: u8 = 1;
 // Universal onda 1/2 — G1/H1 (RFC-0004): GATHER + DISTANCE + RANK1_UPDATE.
 // (0x1E CONV, 0x20-0x22, 0x25 seguem reservados; ver ESPEC-V2 §3.3.)
 pub const OP_GATHER: u8 = 0x1F; // gather/scatter por índice (MoE, GNN, e-bag)
@@ -97,12 +110,21 @@ pub const OP_DENOISE_STEP: u8 = 0x21; // x_t -> x_{t-1} (DDPM/DDIM)
 pub const OP_ODE_STEP: u8 = 0x25; // x(t+dt) via Euler/RK2/RK4
 // W4 (RFC-0015): LIF integrate-and-fire (SNN, 3º motor stateful).
 pub const OP_SPIKE_STEP: u8 = 0x20; // spikes binários + V(t) CoW
+// Onda 1, último buraco (RFC-0017): convolução deslizante 1D/2D.
+pub const OP_CONV: u8 = 0x1E; // N-dim por shape; aqui 1D/2D + groups
+// Fused act — CONV (payload[7]): 0=none, 1=silu, 2=relu.
+pub const CONV_ACT_NONE: u8 = 0;
+pub const CONV_ACT_SILU: u8 = 1;
+pub const CONV_ACT_RELU: u8 = 2;
 // Métodos — ODE_STEP (payload[4]): 0=Euler, 1=RK2, 2=RK4.
 pub const ODE_METHOD_EULER: u8 = 0;
 pub const ODE_METHOD_RK2: u8 = 1;
 pub const ODE_METHOD_RK4: u8 = 2;
 // W4 pull-forward (RFC-0012): ensemble de árvores vetorizado.
 pub const OP_FOREST: u8 = 0x22; // XGBoost/RF: walk sobre tabela plana
+// RFC-0019: FILL escalar em TENSOR + SLICE flat (0x2E).
+pub const TENSOR_FLAG_FILL: u8 = 0b01; // payload[22..26] = fill f32 LE
+pub const OP_SLICE: u8 = 0x2E; // fatia flat [start,start+len) => [1,len]
 // Modos — FOREST (payload[4]): 0 = valores por árvore, 1 = média.
 pub const FOREST_MODE_VOTE: u8 = 0;
 pub const FOREST_MODE_MEAN: u8 = 1;
@@ -398,6 +420,10 @@ impl Instruction {
             OP_AUDIO_ALIGN => "AUDIO_ALIGN",
             OP_CTX_SWITCH => "CTX_SWITCH",
             OP_ROPE => "ROPE",
+            OP_REMOTE_SPAWN => "REMOTE_SPAWN",
+            OP_SIGNAL => "SIGNAL",
+            OP_SEND_TENSOR => "SEND_TENSOR",
+            OP_BARRIER => "BARRIER",
             OP_GATHER => "GATHER",
             OP_DISTANCE => "DISTANCE",
             OP_RANK1_UPDATE => "RANK1_UPDATE",
@@ -425,9 +451,11 @@ impl Instruction {
             OP_LOADI => "LOADI",
             OP_MOV => "MOV",
             OP_KV_TRUNCATE => "KV_TRUNCATE",
+            OP_SLICE => "SLICE",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
+            OP_CONV => "CONV",
             OP_FOREST => "FOREST",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
@@ -709,6 +737,120 @@ pub fn ctx_switch_pipe(instr: &Instruction) -> u8 {
 pub fn instr_rope(rdest: u8, r_src: u8, pos: u32, head_dim: usize, n_heads: usize, theta: f32) -> Instruction {
     let mut instr = Instruction::new(OP_ROPE, 0, rdest, r_src, 0xFF, 0xFF);
     instr.set_rope_params(pos, head_dim, n_heads, theta);
+    instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0018: cluster F1 (0x1A–0x1D). Payloads nos 26B, exatos do plano
+// congelado (node u32 + ids u64). node_id != 0 veta no exec (F2+).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// REMOTE_SPAWN: payload[0..4]=node u32, [4..12]=entry_pc u64,
+    /// [12]=prio (0=GREEN,1=BLUE,2=RED).
+    pub fn remote_spawn_params(&self) -> (u32, u64, u8) {
+        let mut bn = [0u8; 4];
+        bn.copy_from_slice(&self.payload[0..4]);
+        let mut be = [0u8; 8];
+        be.copy_from_slice(&self.payload[4..12]);
+        (u32::from_le_bytes(bn), u64::from_le_bytes(be), self.payload[12])
+    }
+
+    pub fn set_remote_spawn_params(&mut self, node: u32, entry_pc: u64, prio: u8) {
+        self.payload[0..4].copy_from_slice(&node.to_le_bytes());
+        self.payload[4..12].copy_from_slice(&entry_pc.to_le_bytes());
+        self.payload[12] = prio;
+    }
+
+    /// SIGNAL: payload[0..4]=node u32, [4..12]=ctx_id u64, [12..20]=seq u64.
+    /// kind via rsrc1 como IMEDIATO 0..3 (não registrador: evita indireção
+    /// no caminho crítico de preempção).
+    pub fn signal_params(&self) -> (u32, u64, u64) {
+        let mut bn = [0u8; 4];
+        bn.copy_from_slice(&self.payload[0..4]);
+        let mut bc = [0u8; 8];
+        bc.copy_from_slice(&self.payload[4..12]);
+        let mut bs = [0u8; 8];
+        bs.copy_from_slice(&self.payload[12..20]);
+        (u32::from_le_bytes(bn), u64::from_le_bytes(bc), u64::from_le_bytes(bs))
+    }
+
+    pub fn set_signal_params(&mut self, node: u32, ctx_id: u64, seq: u64) {
+        self.payload[0..4].copy_from_slice(&node.to_le_bytes());
+        self.payload[4..12].copy_from_slice(&ctx_id.to_le_bytes());
+        self.payload[12..20].copy_from_slice(&seq.to_le_bytes());
+    }
+
+    /// SEND_TENSOR: payload[0..4]=node u32, [4..12]=byte_offset u64,
+    /// [12..16]=byte_len u32, [16]=mode (0=COPY,1=MOVE).
+    pub fn send_tensor_params(&self) -> (u32, u64, u32, u8) {
+        let mut bn = [0u8; 4];
+        bn.copy_from_slice(&self.payload[0..4]);
+        let mut bo = [0u8; 8];
+        bo.copy_from_slice(&self.payload[4..12]);
+        let mut bl = [0u8; 4];
+        bl.copy_from_slice(&self.payload[12..16]);
+        (
+            u32::from_le_bytes(bn),
+            u64::from_le_bytes(bo),
+            u32::from_le_bytes(bl),
+            self.payload[16],
+        )
+    }
+
+    pub fn set_send_tensor_params(&mut self, node: u32, offset: u64, len: u32, mode: u8) {
+        self.payload[0..4].copy_from_slice(&node.to_le_bytes());
+        self.payload[4..12].copy_from_slice(&offset.to_le_bytes());
+        self.payload[12..16].copy_from_slice(&len.to_le_bytes());
+        self.payload[16] = mode;
+    }
+
+    /// BARRIER: payload[0..4]=barrier_id u32, [4..6]=expected u16,
+    /// [6..8]=timeout_ms u16, [8..12]=epoch u32.
+    pub fn barrier_params(&self) -> (u32, u16, u16, u32) {
+        let mut bi = [0u8; 4];
+        bi.copy_from_slice(&self.payload[0..4]);
+        let ex = u16::from_le_bytes([self.payload[4], self.payload[5]]);
+        let to = u16::from_le_bytes([self.payload[6], self.payload[7]]);
+        let mut be = [0u8; 4];
+        be.copy_from_slice(&self.payload[8..12]);
+        (u32::from_le_bytes(bi), ex, to, u32::from_le_bytes(be))
+    }
+
+    pub fn set_barrier_params(&mut self, id: u32, expected: u16, timeout_ms: u16, epoch: u32) {
+        self.payload[0..4].copy_from_slice(&id.to_le_bytes());
+        self.payload[4..6].copy_from_slice(&expected.to_le_bytes());
+        self.payload[6..8].copy_from_slice(&timeout_ms.to_le_bytes());
+        self.payload[8..12].copy_from_slice(&epoch.to_le_bytes());
+    }
+}
+
+/// REMOTE_SPAWN rD, node, entry_pc, prio — rdest recebe ctx_id remoto.
+/// (Assembler: NODE=n ENTRY=label|pc PRI=...; node!=0 monta, exec veta.)
+pub fn instr_remote_spawn(rdest: u8, node: u32, entry_pc: u64, prio: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_REMOTE_SPAWN, 0, rdest, 0xFF, 0xFF, 0xFF);
+    instr.set_remote_spawn_params(node, entry_pc, prio);
+    instr
+}
+
+/// SIGNAL rD, kind(0..3 imm), node, ctx_id, seq — rdest = status/ack.
+pub fn instr_signal(rdest: u8, kind: u8, node: u32, ctx_id: u64, seq: u64) -> Instruction {
+    let mut instr = Instruction::new(OP_SIGNAL, 0, rdest, kind, 0xFF, 0xFF);
+    instr.set_signal_params(node, ctx_id, seq);
+    instr
+}
+
+/// SEND_TENSOR rSrc, rDst|0xFF, node, offset, len, mode.
+pub fn instr_send_tensor(r_src: u8, r_dst: u8, node: u32, offset: u64, len: u32, mode: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_SEND_TENSOR, 0, r_src, r_dst, 0xFF, 0xFF);
+    instr.set_send_tensor_params(node, offset, len, mode);
+    instr
+}
+
+/// BARRIER id, expected, timeout_ms, epoch.
+pub fn instr_barrier(id: u32, expected: u16, timeout_ms: u16, epoch: u32) -> Instruction {
+    let mut instr = Instruction::new(OP_BARRIER, 0, 0xFF, 0xFF, 0xFF, 0xFF);
+    instr.set_barrier_params(id, expected, timeout_ms, epoch);
     instr
 }
 
@@ -1025,6 +1167,50 @@ pub fn instr_kv_truncate(r_len: u8, stream: u16) -> Instruction {
 }
 
 // ---------------------------------------------------------------------------
+// RFC-0019: TENSOR FILL + SLICE (0x2E). Fill escalar em payload[22..26]
+// (bytes zero em binários antigos = sem fill); slice flat [start,len).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// FILL: (presente, valor). Presença = flags & TENSOR_FLAG_FILL.
+    pub fn tensor_fill(&self) -> Option<f32> {
+        if self.opcode == OP_TENSOR && (self.flags & TENSOR_FLAG_FILL) != 0 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&self.payload[22..26]);
+            Some(f32::from_le_bytes(b))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_tensor_fill(&mut self, v: f32) {
+        self.flags |= TENSOR_FLAG_FILL;
+        self.payload[22..26].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// SLICE: payload[0..4]=start u32, [4..8]=len u32.
+    pub fn slice_params(&self) -> (u32, u32) {
+        let mut bs = [0u8; 4];
+        bs.copy_from_slice(&self.payload[0..4]);
+        let mut bl = [0u8; 4];
+        bl.copy_from_slice(&self.payload[4..8]);
+        (u32::from_le_bytes(bs), u32::from_le_bytes(bl))
+    }
+
+    pub fn set_slice_params(&mut self, start: u32, len: u32) {
+        self.payload[0..4].copy_from_slice(&start.to_le_bytes());
+        self.payload[4..8].copy_from_slice(&len.to_le_bytes());
+    }
+}
+
+/// SLICE rD, rT START=n LEN=n — fatia flat => tensor [1,len].
+pub fn instr_slice(rdest: u8, r_tensor: u8, start: u32, len: u32) -> Instruction {
+    let mut instr = Instruction::new(OP_SLICE, 0, rdest, r_tensor, 0xFF, 0xFF);
+    instr.set_slice_params(start, len);
+    instr
+}
+
+// ---------------------------------------------------------------------------
 // RFC-0013: DENOISE_STEP (0x21). payload[0..4]=alpha_bar_t f32,
 // [4..8]=beta_t f32, [8..12]=sigma_t f32, [12..16]=timestep u32.
 // ---------------------------------------------------------------------------
@@ -1130,6 +1316,40 @@ pub fn instr_spike_step(
 ) -> Instruction {
     let mut instr = Instruction::new(OP_SPIKE_STEP, 0, rdest, r_v, r_i, r_pack);
     instr.set_spike_params(thresh, decay, reset, layer_id, refr);
+    instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0017: CONV (0x1E). payload[0..2]=stride u16, [2..4]=pad u16,
+// [4..6]=dilation u16, [6]=groups u8 (0=1), [7]=fused_act u8.
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    pub fn conv_params(&self) -> (u16, u16, u16, u8, u8) {
+        let s = u16::from_le_bytes([self.payload[0], self.payload[1]]);
+        let p = u16::from_le_bytes([self.payload[2], self.payload[3]]);
+        let d = u16::from_le_bytes([self.payload[4], self.payload[5]]);
+        let g = self.payload[6];
+        (s, p, d, if g == 0 { 1 } else { g }, self.payload[7])
+    }
+
+    pub fn set_conv_params(&mut self, stride: u16, pad: u16, dilation: u16, groups: u8, act: u8) {
+        self.payload[0..2].copy_from_slice(&stride.to_le_bytes());
+        self.payload[2..4].copy_from_slice(&pad.to_le_bytes());
+        self.payload[4..6].copy_from_slice(&dilation.to_le_bytes());
+        self.payload[6] = groups;
+        self.payload[7] = act;
+    }
+}
+
+/// CONV rD, rX, rW [, rB] [STRIDE=n] [PAD=n] [DILATION=n] [GROUPS=n]
+/// [ACT=NONE|SILU|RELU]. rB ausente => 0xFF (sem bias).
+pub fn instr_conv(
+    rdest: u8, r_x: u8, r_w: u8, r_b: u8,
+    stride: u16, pad: u16, dilation: u16, groups: u8, act: u8,
+) -> Instruction {
+    let mut instr = Instruction::new(OP_CONV, 0, rdest, r_x, r_w, r_b);
+    instr.set_conv_params(stride, pad, dilation, groups, act);
     instr
 }
 
@@ -1307,7 +1527,12 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 let maybe_rows = parts[2].replace('x', " ").trim().to_string();
                 // Checa se é literal numérico
                 if maybe_rows.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) || parts[2].contains('x') {
-                    // Literal
+                    // Literal. Rastreia tokens consumidos (shape/dtype) para
+                    // o restante (SPARSE/DENSITY/FILL) não colidir com eles.
+                    let mut consumed = vec![false; parts.len()];
+                    consumed[0] = true;
+                    consumed[1] = true;
+                    consumed[2] = true;
                     let (rows, cols) = if parts[2].contains('x') {
                         let mut split = parts[2].split('x');
                         let r = split.next().unwrap().parse::<u64>().map_err(|_| anyhow!("rows inválido"))?;
@@ -1316,24 +1541,45 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     } else if parts.len() >= 4 && parts[3].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                         let r = parts[2].parse::<u64>().map_err(|_| anyhow!("rows inválido"))?;
                         let c = parts[3].parse::<u64>().map_err(|_| anyhow!("cols inválido"))?;
+                        consumed[3] = true;
                         (r, c)
                     } else {
                         (2, 2)
                     };
-                    let dtype_str = if parts.len() >= 5 {
-                        parts[4]
-                    } else if parts.len() == 4 && !parts[3].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true) {
-                        parts[3]
-                    } else {
-                        "f32"
-                    };
+                    // dtype: primeiro não-consumido sem '=' que parseie.
+                    let mut dtype_str = "f32";
+                    for (i, p) in parts.iter().enumerate().skip(2) {
+                        if consumed[i] || p.contains('=') {
+                            continue;
+                        }
+                        if parse_dtype(p).is_ok() {
+                            dtype_str = p;
+                            consumed[i] = true;
+                            break;
+                        }
+                    }
                     let dtype = parse_dtype(dtype_str)?;
-                    // Detecta SPARSE/DENSITY nos tokens restantes (após dtype)
-                    let remaining = if parts.len() > 5 { &parts[5..] } else { &[] as &[&str] };
-                    let (is_sparse, dens) = detect_sparse(remaining);
-                    reject_unknown("TENSOR", remaining, &["SPARSE", "DENSITY="])?;
+                    // Restante: SPARSE/DENSITY/FILL (posições livres).
+                    let remaining: Vec<&str> = parts.iter().enumerate()
+                        .skip(2)
+                        .filter(|(i, _)| !consumed[*i])
+                        .map(|(_, p)| *p)
+                        .collect();
+                    let (is_sparse, dens) = detect_sparse(&remaining);
+                    reject_unknown("TENSOR", &remaining, &["SPARSE", "DENSITY=", "FILL="])?;
                     let mut instr = instr_tensor(rdest, 0xFF, 0xFF, rows, cols, dtype);
                     if is_sparse { instr.set_sparse(true, dens); }
+                    // RFC-0019: FILL escalar (payload[22..26] + flag).
+                    for p in &remaining {
+                        let up = p.to_ascii_uppercase();
+                        if let Some(v) = up.strip_prefix("FILL=") {
+                            let f = v.parse::<f32>().map_err(|_| anyhow!("TENSOR FILL inválido '{}'", p))?;
+                            if is_sparse {
+                                return Err(anyhow!("TENSOR: FILL + SPARSE contraditórios"));
+                            }
+                            instr.set_tensor_fill(f);
+                        }
+                    }
                     return Ok(instr);
                 }
             }
@@ -1367,9 +1613,19 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             let remaining = if parts.len() > 6 { &parts[6..] } else if parts.len() > 5 && parts[5].to_ascii_uppercase() == "SPARSE" { &parts[5..] } else { &[] as &[&str] };
             let (is_sparse, dens) = detect_sparse(remaining);
-            reject_unknown("TENSOR", remaining, &["SPARSE", "DENSITY="])?;
+            reject_unknown("TENSOR", remaining, &["SPARSE", "DENSITY=", "FILL="])?;
             let mut instr = instr_tensor(rdest, rsrc1, rsrc2, rows, cols, dtype);
             if is_sparse { instr.set_sparse(true, dens); }
+            for p in remaining {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("FILL=") {
+                    let f = v.parse::<f32>().map_err(|_| anyhow!("TENSOR FILL inválido '{}'", p))?;
+                    if is_sparse {
+                        return Err(anyhow!("TENSOR: FILL + SPARSE contraditórios"));
+                    }
+                    instr.set_tensor_fill(f);
+                }
+            }
             Ok(instr)
         }
         "ATTN" => {
@@ -2232,6 +2488,161 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_kv_truncate(parse_reg(parts[1])?, stream))
         }
+        "SLICE" => {
+            // SLICE rD, rT START=n LEN=n
+            if parts.len() < 3 {
+                return Err(anyhow!("SLICE precisa de rdest, rTensor — ex: SLICE r4, r0 START=3 LEN=3"));
+            }
+            let (mut start, mut len, mut has_start, mut has_len) = (0u32, 0u32, false, false);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("START=") {
+                    start = v.parse::<u32>().map_err(|_| anyhow!("SLICE START inválido '{}'", p))?;
+                    has_start = true;
+                } else if let Some(v) = up.strip_prefix("LEN=") {
+                    len = v.parse::<u32>().map_err(|_| anyhow!("SLICE LEN inválido '{}'", p))?;
+                    has_len = true;
+                } else {
+                    return Err(anyhow!("SLICE token desconhecido '{}' (use START=/LEN=)", p));
+                }
+            }
+            if !has_start || !has_len {
+                return Err(anyhow!("SLICE precisa de START= e LEN= — ex: SLICE r4, r0 START=3 LEN=3"));
+            }
+            Ok(instr_slice(parse_reg(parts[1])?, parse_reg(parts[2])?, start, len))
+        }
+        "REMOTE_SPAWN" => {
+            // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
+            // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
+            if parts.len() < 2 {
+                return Err(anyhow!("REMOTE_SPAWN precisa de rdest — ex: REMOTE_SPAWN r3 NODE=0 ENTRY=MAIN GREEN"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let (mut node, mut entry, mut prio) = (0u32, 0u64, 0u8);
+            let mut has_entry = false;
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("NODE=") {
+                    node = v.parse::<u32>().map_err(|_| anyhow!("REMOTE_SPAWN NODE '{}' inválido (use id numérico; nomes são F3)", p))?;
+                } else if let Some(v) = up.strip_prefix("ENTRY=") {
+                    if let Some(&pc) = labels.get(v) {
+                        entry = pc as u64;
+                    } else if let Ok(n) = v.parse::<u64>() {
+                        entry = n;
+                    } else {
+                        return Err(anyhow!("REMOTE_SPAWN ENTRY '{}' inválido (use label ou pc)", p));
+                    }
+                    has_entry = true;
+                } else if let Some(v) = up.strip_prefix("PRI=") {
+                    prio = match v {
+                        "GREEN" | "0" => 0,
+                        "BLUE" | "1" => 1,
+                        "RED" | "2" => 2,
+                        _ => return Err(anyhow!("REMOTE_SPAWN PRI inválida '{}'", p)),
+                    };
+                } else if matches!(up.as_str(), "GREEN" | "BLUE" | "RED" | "0" | "1" | "2") {
+                    prio = match up.as_str() {
+                        "BLUE" | "1" => 1,
+                        "RED" | "2" => 2,
+                        _ => 0,
+                    };
+                } else {
+                    return Err(anyhow!("REMOTE_SPAWN token desconhecido '{}' (use NODE=/ENTRY=/PRI=)", p));
+                }
+            }
+            if !has_entry {
+                return Err(anyhow!("REMOTE_SPAWN precisa de ENTRY="));
+            }
+            Ok(instr_remote_spawn(rdest, node, entry, prio))
+        }
+        "SIGNAL" => {
+            // SIGNAL rD KIND=ABORT|FORK_REQ|HALT|PING|0..3 NODE=n CTX=n SEQ=n
+            if parts.len() < 2 {
+                return Err(anyhow!("SIGNAL precisa de rdest — ex: SIGNAL r2 KIND=PING NODE=0 CTX=1"));
+            }
+            let rdest = parse_reg(parts[1])?;
+            let (mut kind, mut node, mut ctx, mut seq) = (SIGNAL_KIND_PING, 0u32, 0u64, 0u64);
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("KIND=") {
+                    kind = match v {
+                        "ABORT" | "0" => SIGNAL_KIND_ABORT,
+                        "FORK_REQ" | "1" => SIGNAL_KIND_FORK_REQ,
+                        "HALT" | "KILL" | "2" => SIGNAL_KIND_HALT,
+                        "PING" | "3" => SIGNAL_KIND_PING,
+                        _ => return Err(anyhow!("SIGNAL KIND inválido '{}'", p)),
+                    };
+                } else if let Some(v) = up.strip_prefix("NODE=") {
+                    node = v.parse::<u32>().map_err(|_| anyhow!("SIGNAL NODE '{}' inválido (use id numérico)", p))?;
+                } else if let Some(v) = up.strip_prefix("CTX=") {
+                    ctx = v.parse::<u64>().map_err(|_| anyhow!("SIGNAL CTX '{}' inválido (use id numérico)", p))?;
+                } else if let Some(v) = up.strip_prefix("SEQ=") {
+                    seq = v.parse::<u64>().map_err(|_| anyhow!("SIGNAL SEQ inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("SIGNAL token desconhecido '{}' (use KIND=/NODE=/CTX=/SEQ=)", p));
+                }
+            }
+            Ok(instr_signal(rdest, kind, node, ctx, seq))
+        }
+        "SEND_TENSOR" => {
+            // SEND_TENSOR rS [, rD] [NODE=n] [OFF=n] [LEN=n] [COPY|MOVE]
+            if parts.len() < 2 {
+                return Err(anyhow!("SEND_TENSOR precisa de rSrc — ex: SEND_TENSOR r5 NODE=0 LEN=64"));
+            }
+            let rsrc = parse_reg(parts[1])?;
+            let (mut rdst, mut node, mut off, mut len, mut mode) = (0xFF, 0u32, 0u64, 0u32, SEND_MODE_COPY);
+            let mut rpos = 2;
+            if parts.len() > rpos {
+                if let Ok(r) = parse_reg(parts[rpos]) {
+                    rdst = r;
+                    rpos += 1;
+                }
+            }
+            for p in &parts[rpos..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("NODE=") {
+                    node = v.parse::<u32>().map_err(|_| anyhow!("SEND_TENSOR NODE '{}' inválido", p))?;
+                } else if let Some(v) = up.strip_prefix("OFF=") {
+                    off = v.parse::<u64>().map_err(|_| anyhow!("SEND_TENSOR OFF inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("LEN=") {
+                    len = v.parse::<u32>().map_err(|_| anyhow!("SEND_TENSOR LEN inválido '{}'", p))?;
+                } else if up == "MOVE" {
+                    mode = SEND_MODE_MOVE;
+                } else if up == "COPY" {
+                    mode = SEND_MODE_COPY;
+                } else {
+                    return Err(anyhow!("SEND_TENSOR token desconhecido '{}' (use rDst/NODE=/OFF=/LEN=/COPY/MOVE)", p));
+                }
+            }
+            Ok(instr_send_tensor(rsrc, rdst, node, off, len, mode))
+        }
+        "BARRIER" => {
+            // BARRIER id= EXPECT= TIMEOUT= [EPOCH=]
+            let (mut id, mut exp, mut to, mut epoch, mut has_id, mut has_exp) = (0u32, 0u16, 0u16, 0u32, false, false);
+            if parts.len() < 2 {
+                return Err(anyhow!("BARRIER precisa de id= e EXPECT= — ex: BARRIER id=7 EXPECT=2 TIMEOUT=500"));
+            }
+            for p in parts[1..].iter() {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("ID=") {
+                    id = v.parse::<u32>().map_err(|_| anyhow!("BARRIER ID inválido '{}'", p))?;
+                    has_id = true;
+                } else if let Some(v) = up.strip_prefix("EXPECT=") {
+                    exp = v.parse::<u16>().map_err(|_| anyhow!("BARRIER EXPECT inválido '{}'", p))?;
+                    has_exp = true;
+                } else if let Some(v) = up.strip_prefix("TIMEOUT=") {
+                    to = v.parse::<u16>().map_err(|_| anyhow!("BARRIER TIMEOUT inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("EPOCH=") {
+                    epoch = v.parse::<u32>().map_err(|_| anyhow!("BARRIER EPOCH inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("BARRIER token desconhecido '{}' (use id=/EXPECT=/TIMEOUT=/EPOCH=)", p));
+                }
+            }
+            if !has_id || !has_exp {
+                return Err(anyhow!("BARRIER precisa de id= e EXPECT= — ex: BARRIER id=7 EXPECT=2 TIMEOUT=500"));
+            }
+            Ok(instr_barrier(id, exp, to, epoch))
+        }
         "DENOISE_STEP" => {
             // DENOISE_STEP rD, rX, rE [, rS] [ALPHA=a] [BETA=b] [SIGMA=s] [T=t]
             if parts.len() < 4 {
@@ -2371,6 +2782,60 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 reset,
                 layer,
                 refr,
+            ))
+        }
+        "CONV" => {
+            // CONV rD, rX, rW [, rB] [STRIDE=n] [PAD=n] [DILATION=n]
+            // [GROUPS=n] [ACT=NONE|SILU|RELU]
+            if parts.len() < 4 {
+                return Err(anyhow!("CONV precisa de rdest, rX, rW — ex: CONV r4, r0, r1 STRIDE=1 PAD=1"));
+            }
+            let (mut stride, mut pad, mut dilation, mut groups, mut act) =
+                (1u16, 0u16, 1u16, 1u8, CONV_ACT_NONE);
+            let mut rpos = 4;
+            // 4º reg opcional (bias); KV nunca é reg válido aqui.
+            let mut rbias = 0xFF;
+            if parts.len() > rpos {
+                if let Ok(r) = parse_reg(parts[rpos]) {
+                    rbias = r;
+                    rpos += 1;
+                }
+            }
+            for p in &parts[rpos..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("STRIDE=") {
+                    if let Ok(n) = v.parse::<u16>() { stride = n; }
+                    else { return Err(anyhow!("CONV STRIDE inválido '{}'", p)); }
+                } else if let Some(v) = up.strip_prefix("PAD=") {
+                    if let Ok(n) = v.parse::<u16>() { pad = n; }
+                    else { return Err(anyhow!("CONV PAD inválido '{}'", p)); }
+                } else if let Some(v) = up.strip_prefix("DILATION=") {
+                    if let Ok(n) = v.parse::<u16>() { dilation = n; }
+                    else { return Err(anyhow!("CONV DILATION inválido '{}'", p)); }
+                } else if let Some(v) = up.strip_prefix("GROUPS=") {
+                    if let Ok(n) = v.parse::<u8>() { groups = n; }
+                    else { return Err(anyhow!("CONV GROUPS inválido '{}'", p)); }
+                } else if let Some(v) = up.strip_prefix("ACT=") {
+                    act = match v {
+                        "NONE" => CONV_ACT_NONE,
+                        "SILU" => CONV_ACT_SILU,
+                        "RELU" => CONV_ACT_RELU,
+                        _ => return Err(anyhow!("CONV ACT inválido '{}' (use NONE/SILU/RELU)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("CONV token desconhecido '{}' (use STRIDE=/PAD=/DILATION=/GROUPS=/ACT=)", p));
+                }
+            }
+            Ok(instr_conv(
+                parse_reg(parts[1])?,
+                parse_reg(parts[2])?,
+                parse_reg(parts[3])?,
+                rbias,
+                stride,
+                pad,
+                dilation,
+                groups,
+                act,
             ))
         }
         "FOREST" => {
@@ -3085,6 +3550,120 @@ mod tests {
         assert!(assemble("SPIKE_STEP r3, r1").is_err());
         assert!(assemble("SPIKE_STEP r3, r1, r2 THRESH=abc").is_err());
         assert!(assemble("SPIKE_STEP r3, r1, r2 FOO=1").is_err());
+    }
+
+    // ---- RFC-0017: CONV -------------------------------------------------
+
+    #[test]
+    fn test_rfc0017_ctor_roundtrip() {
+        let c = instr_conv(4, 0, 1, 0xFF, 1, 2, 3, 4, CONV_ACT_SILU);
+        assert_eq!(c.opcode, OP_CONV);
+        assert_eq!(c.conv_params(), (1, 2, 3, 4, CONV_ACT_SILU));
+        let d = Instruction::decode(&c.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "CONV");
+        // groups=0 normaliza p/ 1 na leitura.
+        let mut z = instr_conv(4, 0, 1, 0xFF, 1, 0, 1, 0, CONV_ACT_NONE);
+        let _ = &mut z;
+        let mut raw = Instruction::new(OP_CONV, 0, 4, 0, 1, 0xFF);
+        raw.payload[6] = 0;
+        assert_eq!(raw.conv_params().3, 1);
+    }
+
+    #[test]
+    fn test_rfc0017_assemble() {
+        let prog = assemble("CONV r4, r0, r1 STRIDE=2 PAD=1 DILATION=1 GROUPS=1 ACT=SILU").unwrap();
+        assert_eq!(prog[0].conv_params(), (2, 1, 1, 1, CONV_ACT_SILU));
+        let prog = assemble("CONV r4, r0, r1, r2 ACT=RELU").unwrap();
+        assert_eq!(prog[0].rsrc3, 2);
+        assert_eq!(prog[0].conv_params().4, CONV_ACT_RELU);
+        let prog = assemble("CONV r4, r0, r1").unwrap();
+        assert_eq!(prog[0].conv_params(), (1, 0, 1, 1, CONV_ACT_NONE));
+        assert!(assemble("CONV r4, r0").is_err());
+        assert!(assemble("CONV r4, r0, r1 ACT=TANH").is_err());
+        assert!(assemble("CONV r4, r0, r1 FOO=1").is_err());
+        assert!(assemble("CONV r4, r0, r1 STRIDE=x").is_err());
+    }
+
+    // ---- RFC-0018: cluster F1 -----------------------------------------
+
+    #[test]
+    fn test_rfc0018_ctor_roundtrip() {
+        let s = instr_remote_spawn(3, 0, 0x1000, 2);
+        assert_eq!(s.opcode, OP_REMOTE_SPAWN);
+        assert_eq!(s.remote_spawn_params(), (0, 0x1000, 2));
+        assert_eq!(Instruction::decode(&s.encode()).unwrap().mnemonic(), "REMOTE_SPAWN");
+        let g = instr_signal(2, SIGNAL_KIND_ABORT, 0, 7, 99);
+        assert_eq!(g.rsrc1, SIGNAL_KIND_ABORT);
+        assert_eq!(g.signal_params(), (0, 7, 99));
+        assert_eq!(Instruction::decode(&g.encode()).unwrap().mnemonic(), "SIGNAL");
+        let t = instr_send_tensor(5, 6, 0, 8, 64, SEND_MODE_MOVE);
+        assert_eq!(t.send_tensor_params(), (0, 8, 64, SEND_MODE_MOVE));
+        assert_eq!(Instruction::decode(&t.encode()).unwrap().mnemonic(), "SEND_TENSOR");
+        let b = instr_barrier(7, 2, 500, 1);
+        assert_eq!(b.barrier_params(), (7, 2, 500, 1));
+        assert_eq!(Instruction::decode(&b.encode()).unwrap().mnemonic(), "BARRIER");
+    }
+
+    #[test]
+    fn test_rfc0018_assemble() {
+        assert!(assemble("REMOTE_SPAWN r3 NODE=0 ENTRY=NOPE GREEN").is_err());
+        assert!(assemble("REMOTE_SPAWN r3 NODE=abc ENTRY=1 GREEN").is_err());
+        assert!(assemble("REMOTE_SPAWN r3 NODE=0 GREEN").is_err());
+        assert!(assemble("REMOTE_SPAWN r3 NODE=0 ENTRY=1 FOO=1").is_err());
+        let prog = assemble("MAIN:\nREMOTE_SPAWN r3 NODE=0 ENTRY=MAIN GREEN\nHALT").unwrap();
+        assert_eq!(prog[0].remote_spawn_params().1, 0x1000);
+        let prog = assemble("SIGNAL r2 KIND=ABORT NODE=0 CTX=5 SEQ=9").unwrap();
+        assert_eq!(prog[0].rsrc1, SIGNAL_KIND_ABORT);
+        assert_eq!(prog[0].signal_params(), (0, 5, 9));
+        let prog = assemble("SIGNAL r2 KIND=HALT NODE=0 CTX=5").unwrap();
+        assert_eq!(prog[0].rsrc1, SIGNAL_KIND_HALT);
+        assert!(assemble("SIGNAL r2 KIND=XX NODE=0 CTX=5").is_err());
+        assert!(assemble("SIGNAL r2 KIND=ABORT NODE=x CTX=5").is_err());
+        let prog = assemble("SEND_TENSOR r5, r6 NODE=0 OFF=8 LEN=64 MOVE").unwrap();
+        assert_eq!(prog[0].send_tensor_params(), (0, 8, 64, SEND_MODE_MOVE));
+        let prog = assemble("SEND_TENSOR r5 NODE=0 LEN=16").unwrap();
+        assert_eq!(prog[0].rsrc1, 0xFF);
+        assert!(assemble("SEND_TENSOR r5 NODE=0 LEN=1 FOO=1").is_err());
+        let prog = assemble("BARRIER id=7 EXPECT=2 TIMEOUT=500 EPOCH=1").unwrap();
+        assert_eq!(prog[0].barrier_params(), (7, 2, 500, 1));
+        assert!(assemble("BARRIER id=7").is_err());
+        assert!(assemble("BARRIER").is_err());
+    }
+
+    // ---- RFC-0019: FILL + SLICE ---------------------------------------
+
+    #[test]
+    fn test_rfc0019_tensor_fill() {
+        let mut t = instr_tensor(0, 0xFF, 0xFF, 2, 2, 0);
+        assert_eq!(t.tensor_fill(), None);
+        t.set_tensor_fill(0.0);
+        assert_eq!(t.tensor_fill(), Some(0.0));
+        assert!((t.flags & TENSOR_FLAG_FILL) != 0);
+        let d = Instruction::decode(&t.encode()).unwrap();
+        assert_eq!(d.tensor_fill(), Some(0.0));
+        let prog = assemble("TENSOR r0 2 2 f32 FILL=0").unwrap();
+        assert_eq!(prog[0].tensor_fill(), Some(0.0));
+        let prog = assemble("TENSOR r0 2 2 f32").unwrap();
+        assert_eq!(prog[0].tensor_fill(), None);
+        assert!(assemble("TENSOR r0 2 2 f32 FILL=abc").is_err());
+        assert!(assemble("TENSOR r0 2 2 f32 SPARSE DENSITY=0.1 FILL=0").is_err());
+        assert!(assemble("TENSOR r0 2 2 f32 FOO=1").is_err());
+    }
+
+    #[test]
+    fn test_rfc0019_slice_roundtrip() {
+        let s = instr_slice(4, 0, 3, 3);
+        assert_eq!(s.opcode, OP_SLICE);
+        assert_eq!(s.slice_params(), (3, 3));
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "SLICE");
+        assert_eq!(d.slice_params(), (3, 3));
+        let prog = assemble("SLICE r4, r0 START=3 LEN=3").unwrap();
+        assert_eq!(prog[0].slice_params(), (3, 3));
+        assert!(assemble("SLICE r4, r0 START=3").is_err());
+        assert!(assemble("SLICE r4, r0 LEN=3").is_err());
+        assert!(assemble("SLICE r4").is_err());
+        assert!(assemble("SLICE r4, r0 START=3 LEN=3 FOO=1").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

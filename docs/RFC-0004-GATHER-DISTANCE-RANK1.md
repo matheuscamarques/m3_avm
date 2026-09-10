@@ -133,14 +133,13 @@ Follow-up (NOT this RFC): sparse-table GATHER, `ATTN_SPARSE 0x3B`,
 stale-register hazard (context registers are not part of any rollback;
 only memory + layer-handle maps are — pre-existing FORK/ABORT design).
 
-### Adendo de auditoria (RFC-0012, posterior)
+### Adendo de auditoria, parte 2 (RFC-0019: RESOLVIDO)
 
-O demo `attn_topk_demo.m3asm` foi REMOVIDO: com `TENSOR` inicializando em
-ramp `(i+1)*0.5`, o packed `[dists|idx]` do `DISTANCE` alimenta o `GATHER`
-com distâncias (ex.: DOT negativas) como índices — OOB determinístico —
-e não existe `SLICE 0x2E` para fatiar só os índices. O programa morria em
-silêncio com exit 0. A perna empírica do T4 vive nos goldens
-(`test_distance_four_metrics_and_topk`); o demo volta com `SLICE`.
+`attn_topk_demo.m3asm` RESSUSCITADO via `SLICE 0x2E`: o packed
+`[dists|idx]` agora é fatiado (`SLICE START=3 LEN=3`) antes do `GATHER`,
+e o caminho DISTANCE→SLICE→GATHER→ATTN executa de verdade
+(distance=1, slice=1, gather×2, attn=1, 0 warns). A perna empírica do
+T4 está viva.
 
 ## Changelog
 

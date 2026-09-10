@@ -10,7 +10,7 @@
 [![Author](https://img.shields.io/badge/Author-matheuscamarques-181717?style=flat&logo=github&logoColor=white)](https://github.com/matheuscamarques)
 [![Email](https://img.shields.io/badge/Email-matheuscamarques%40gmail.com-D14836?style=flat&logo=gmail&logoColor=white)](mailto:matheuscamarques@gmail.com)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![ISA](https://img.shields.io/badge/ISA-28%20Opcodes-blueviolet)](docs/ESPEC.md)
+[![ISA](https://img.shields.io/badge/ISA-64%20Opcodes-blueviolet)](docs/ESPEC.md)
 [![Sparse](https://img.shields.io/badge/Support-Sparse%20%26%20Dense-brightgreen)]()
 [![License](https://img.shields.io/badge/License-AGPL_v3.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow)]()
@@ -19,7 +19,7 @@
 
 The M³-AVM is a software emulator in Rust (`src/lib.rs:1`, `src/vm.rs:1`) exploring primitives for interactive AI: preemption and sparse memory. It implements:
 
-1. A fixed 28-opcode ISA (`0x01–0x19` + `GATHER 0x1F, DISTANCE 0x23, RANK1_UPDATE 0x24`): `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) + `MATVEC, MUL, SILU` (GEMV blocks) + `SSM_SCAN, SSM_RESET` (Mamba) + `CODEC_ENC, CODEC_DEC, AUDIO_ALIGN` (Mimi full-duplex) + `CTX_SWITCH, ROPE` (hybrid control) + `GATHER, DISTANCE, RANK1_UPDATE` (indexing, retrieval, matrix memory — RFC-0004) (`src/opcodes.rs:26`, `INSTR_SIZE=32` `src/opcodes.rs:23`, spec `docs/ESPEC.md`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`).
+1. A fixed 64-opcode ISA v1.5 (`0x00–0x25`, `0x2E`, `0x38`, `0x60–0x66`, `0x6A–0x79`, `0xFF`): `TENSOR, ATTN, STREAM, FORK, ABORT, SENSE` + `NORM, FFN` (transformer) + `EMBED, ADD, SAMPLE` (thinking loop) + `COMPARE, JUMP, IF_EQUAL, IF_INTERRUPT` (control flow) + `MATVEC, MUL, SILU` (GEMV blocks) + `SSM_SCAN, SSM_RESET` (Mamba) + `CODEC_ENC, CODEC_DEC, AUDIO_ALIGN` (Mimi full-duplex) + `CTX_SWITCH, ROPE` (hybrid control) + `REMOTE_SPAWN, SIGNAL, SEND_TENSOR, BARRIER` (local cluster — RFC-0018) + `CONV, GATHER, SPIKE_STEP, DENOISE_STEP, FOREST, DISTANCE, RANK1_UPDATE, ODE_STEP` (universal waves — RFC-0004/0012–0015/0017) + `KV_TRUNCATE` + `SLICE` (RFC-0019) + `RNG_*, HASH, CHECKSUM, HMAC` (determinism — RFC-0005) + telemetry/scheduler block (RFC-0006) + `LOADI, MOV` (RFC-0007) (`INSTR_SIZE=32`, spec `docs/ESPEC.md`, RFCs `docs/RFC-*.md`). The assembler is 2-pass with labels (`LOOP:`, `JUMP LOOP`, `FORK Rd, LABEL`) and strict unknown-token rejection (RFC-0008).
 2. A scheduler with strict priority `Red > Blue > Green` (`src/context.rs:15`, `src/context.rs:167`) and an optional event-driven reactor (`src/reactor.rs:1`, `src/bus.rs:20`) using `tokio::sync::watch`/`broadcast`.
 3. Dense tensors via `ndarray` + `faer` SIMD and sparse CSR via `nalgebra-sparse 0.10` + `sprs 0.11` (`Cargo.toml:22`, `src/sparse.rs:1`), plus quantized dequant `Q4_0/Q4_K/Q6_K/Q8_0` `src/quant.rs:1` and fused `matvec_q4k` `AVX2` `src/matvec_quant.rs:1`.
 4. Real inference from GGUF (`src/inference.rs:1`, `src/gguf.rs:1`) with `mmap` zero-copy in `PERSISTENTE 0x20` (`src/memory.rs:15`), `KV_CACHE 0x30` per-layer (`src/memory.rs:27`) and `AsmEmitter` (`src/asm_emitter.rs:1`) that lowers a model to `.m3asm` desenrolado.

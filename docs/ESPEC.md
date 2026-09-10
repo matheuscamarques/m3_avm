@@ -4,7 +4,7 @@
 Status:   Informational Draft (research prototype, not a standard)
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Version:  ISA v1.4 (opcodes 0x00-0x19 + 0x1F,0x23,0x24 + 0xFF implemented)
+Version:  ISA v1.5 (64 opcodes: 0x00-0x25 + 0x2E,0x38,0x60-0x66,0x6A-0x79 + 0xFF implemented; cumulative since v1.4)
 License:  AGPL-3.0-or-later (see LICENSE; Section 15)
 Replaces: all documents under docs/arq/ (archived, non-normative)
 ```
@@ -213,12 +213,12 @@ Semantics: `SSM_SCAN` computes `h = h.exp(dt.A)+x.B.dt; y = h.C+D.x`
 mirroring KV truncation. `--emit-asm` emits `ROPE` after Q/K `MATVEC`
 and `SSM_SCAN`+`CTX_SWITCH MAMBA` when `arch` contains `mamba`.
 
-### 5.4 Cluster (`0x1A-0x1D`) — RSVD (encoding frozen, Section 12)
+### 5.4 Cluster (`0x1A-0x1D`) — IMPL-local (RFC-0018, Section 12)
 
 `0x1A REMOTE_SPAWN`, `0x1B SIGNAL`, `0x1C SEND_TENSOR`, `0x1D BARRIER`.
-Payload layouts are frozen to the 26-byte budget; the emulator MUST
-reject these opcodes with an explicit error until the wire format
-(envelope, addressing, auth) is specified.
+Payload layouts frozen to the 26-byte budget; `node_id == 0` executes
+inline (spawn/kill/ping/copy+move/barrier), nonzero node fails loudly
+— wire format, routing table and driver remain F2+.
 
 ### 5.5 Universal AI, wave 1 (`0x1E-0x21`) — PARTIAL (Section 13)
 
@@ -236,7 +236,8 @@ No operation (scheduler/IP bench target).
 
 ### 5.8 Free range
 
-`0x26-0xFE` are free. Allocation REQUIRES a proposal following the
+`0x26-0xFE` are free, except `0x2E SLICE` and `0x38 KV_TRUNCATE`
+(IMPL, RFC-0019/RFC-0010). Allocation REQUIRES a proposal following the
 stateful-opcode rule (Section 19).
 
 ## 6. Memory Model
@@ -584,8 +585,11 @@ outruns the Status column above.
 | `0x21 DENOISE_STEP` (fused diffusion) | IMPL | RFC-0013; manual vector, seeded replay + no-draw, param gate; demo `denoise_demo` (exec verified) |
 | `0x25 ODE_STEP` (fused Euler/RK) | IMPL | RFC-0014; Euler manual, RK4 vs fine-Euler, contraction, param gate; demo `ode_demo` (exec verified) |
 | `0x20 SPIKE_STEP` (LIF integrate-and-fire) | IMPL | RFC-0015; 4-step refractory golden, pack precedence, rollback; demo `snn_demo` (exec verified) |
+| `TENSOR FILL` + `0x2E SLICE` (literal data paths) | IMPL | RFC-0019; fill-vs-ramp, packed split, integration chain; demos `forest_demo` + `attn_topk_demo` ressuscitados (exec verificada) |
+| `0x1E CONV` (sliding 1D/2D + groups) | IMPL | RFC-0017; edge/diagonal/depthwise/dilation goldens, error paths; demo `conv_demo` (exec verified) |
 | Version-tagged engine stacks + host pruning | IMPL | RFC-0011; nested gating, no-op abort, double-abort stability, `prune_oldest` |
 | `0x22 FOREST` (vectorized tree walk) | IMPL | RFC-0012; 2-tree golden, OOB/NaN/depth-bound, strict ramp-trap (demos `.m3asm` inviáveis sem TENSOR-INIT — ver RFC) |
+| `0x1A-0x1D` cluster local (spawn/signal/send/barrier) | IMPL | RFC-0018; local-only, transport vetado; `remove_tensor`; demo `cluster_local_demo` (contadores exatos) |
 | `0x13-0x19` wiring + tests | IMPL | `src/vm.rs` exec fns, `src/ssm.rs`, `src/mimi.rs`, `src/moshi.rs`, demos |
 | Local barge-in (`SENSE`+`IF_INTERRUPT`, `ABORT`) | IMPL (local) | `src/vm.rs`, `src/rollback.rs`, `src/bus.rs` |
 | `0x1A-0x1D` transport | ROADMAP | No network transport in tree |
@@ -594,7 +598,7 @@ outruns the Status column above.
 | Benches for `0x13-0x19` | IMPL | `benches/hybrid_ops_bench.rs` (7 ops + 80 ms window, §17) |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
-`cargo test --lib`: 239 green + 2 RFC-0016 arbiters at last report (ISA, sparse, bus,
+`cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,
 reactor, inference, asm_emitter, TUI, VM). One pre-existing failure
 unrelated to this spec: `moshi::test_gguf_qkv_split_shapes` (norm-gamma
 assertion on the local PersonaPlex GGUF; fails identically on the pristine
@@ -654,9 +658,10 @@ ation assumes non-Byzantine peers.
 
 ## 19. Evolution and Versioning
 
-- `ISA v1.4` = `0x00-0x19` + `0x1F,0x23,0x24` + `0xFF` implemented (RFC-0004).
-  Minor bump per new opcode family (`v1.5` = next family, e.g. cluster
-  `0x1A-0x1D` or wave-1 remainder); existing encodings are immutable.
+- `ISA v1.5` = everything in §5 marked IMPL (cumulative since v1.4:
+  RFC-0004 through RFC-0018; intermediate minors were not cut).
+  Minor bump per new opcode family from here on; existing encodings
+  are immutable.
 - Draft v2.0 proposal (reconciled, non-normative): `docs/ESPEC-V2.md`
   (DRAFT — do not code against it; reservations in Sections 12-13 of
   this document remain the only binding future encodings).

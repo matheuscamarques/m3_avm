@@ -7,7 +7,7 @@
 
 ## 0. Contexto confirmado (lido no repo)
 
-* ISA ocupa `0x00 HALT, 0x01..0x19` (25 opcodes) + `0xFF NOP` — `src/opcodes.rs:28-57`. Faixa de rede `0x1A..0x1D` reservada (`docs/PLANO_AVM_CLUSTER.md` §2). **`0x1E–0x21` livres, `0x22–0xFE` seguem livres.**
+* ISA ocupa `0x00 HALT, 0x01..0x19` (26 opcodes) + `0x1E–0x25` (8 universal: CONV/GATHER/SPIKE/DENOISE/FOREST/DISTANCE/RANK1/ODE_STEP) + `0x38 KV_TRUNCATE` + `0x60–0x79` (16 RNG/hash) + `0xFF NOP` — `src/opcodes.rs:28-57`. Faixa de rede `0x1A..0x1D` reservada (`docs/PLANO_AVM_CLUSTER.md` §2). **`0x1E–0x21` livres, `0x22–0xFE` seguem livres.**
 * Convenção vigente: `SSM_SCAN` com flags `CONV/GATE` é **rejeitado com erro explícito** — conv via `MATVEC`, gate via `SILU+MUL` (`src/vm.rs:1869`, `docs/ISA_OPCODES_0x13_0x19.md:16`). Este plano mantém a filosofia: nativo só onde lowering é inadequado.
 * Formato fixo 32B: `opcode 1B + flags 1B + rdest/rsrc1-3 + payload 26B` — `src/opcodes.rs:2-10`.
 * Estado recorrente já tem casa: `KV_CACHE 0x30` (Transformers), `Vm::ssm_states` (Mamba, com `FORK` empilha/`ABORT` desempilha snapshot). SNNs/MoE/difusão reusam o mesmo padrão CoW (ver §3).
