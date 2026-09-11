@@ -260,6 +260,13 @@ impl MemBackend {
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.write(addr, data),
         }
     }
+    /// Alocação GLOBAL bruta (V-1b dia 3: preload `.data`).
+    pub fn alloc_global(&mut self, size: usize) -> anyhow::Result<u128> {
+        match self {
+            MemBackend::Cpu(m) => m.alloc_global(size),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.alloc_global(size),
+        }
+    }
     /// Alocação com byte_len explícito (layouts em bloco, RFC-0025).
     /// GPU veta explícito (sem meta em blocos lá).
     pub fn alloc_tensor_bytes(&mut self, shape: &[usize], dtype: crate::memory::DType, byte_len: usize) -> anyhow::Result<u128> {
@@ -694,6 +701,34 @@ impl Vm {
     /// `ProgramInstr::W32`; todos os chamadores existentes inalterados).
     pub fn load_program(&mut self, prog: Vec<Instruction>) {
         self.load_mixed(prog.into_iter().map(ProgramInstr::W32).collect());
+    }
+
+    /// V-1b dia 3: carrega programa montado com `.data` (Opção A).
+    /// Preload como PRIMEIRA alocação GLOBAL (base determinística
+    /// `DATA_LOAD_BASE`); qualquer desvio => erro alto, nunca silencioso
+    /// (ex.: VM não-fresca ou segundo preload — endereços `@` foram
+    /// congelados no assemble para a base).
+    pub fn load_assembled(&mut self, prog: &crate::opcodes::AssembledProgram) -> anyhow::Result<()> {
+        use crate::opcodes::{data_layout_addrs, data_layout_total, DATA_LOAD_BASE};
+        if !prog.data.blobs.is_empty() {
+            let total = data_layout_total(&prog.data);
+            let base = self.memory.alloc_global(total)?;
+            if base != DATA_LOAD_BASE {
+                return Err(anyhow::anyhow!(
+                    "load_assembled: base GLOBAL 0x{:x} != DATA_LOAD_BASE 0x{:x} (preload exige VM fresca, antes de qualquer alloc)",
+                    base,
+                    DATA_LOAD_BASE
+                ));
+            }
+            for (name, addr) in data_layout_addrs(&prog.data) {
+                let blob = prog.data.find(&name).ok_or_else(|| {
+                    anyhow::anyhow!("load_assembled: blob '{}' sumiu do layout", name)
+                })?;
+                self.memory.write(addr, &blob.bytes)?;
+            }
+        }
+        self.load_program(prog.instrs.clone());
+        Ok(())
     }
 
     /// Carrega programa de largura mista + reconstrói a tabela de offsets
@@ -8887,6 +8922,36 @@ mod tests {
         assert_eq!(ctx.reg(4).unwrap(), 1);
         let tab = ctx.reg(3).unwrap();
         assert_eq!(vm.memory.read_f32_tensor(tab, 4).unwrap(), vec![0.5; 4]);
+    }
+
+    #[tokio::test]
+    async fn test_planoV1b_data_loader() {
+        use crate::opcodes::assemble_with_data;
+        // V-1b dia 3 (Opção A): `@nome` resolve em assemble para o layout
+        // fixo; `load_assembled` posiciona os bytes; leitura confirma.
+        let src = include_str!("../programs/data_addr_demo.m3asm");
+        let prog = assemble_with_data(src).unwrap();
+        assert_eq!(prog.data.blobs.len(), 4);
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_assembled(&prog).unwrap();
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 0x1000);
+        assert_eq!(ctx.reg(1).unwrap(), 0x1008);
+        assert_eq!(ctx.reg(2).unwrap(), 0x1010);
+        assert_eq!(ctx.reg(3).unwrap(), 0x1018);
+        assert_eq!(vm.memory.read(0x1000, 4).unwrap(), 1920u32.to_le_bytes().to_vec());
+        assert_eq!(vm.memory.read(0x1008, 4).unwrap(), 0.5f32.to_le_bytes().to_vec());
+        assert_eq!(vm.memory.read(0x1010, 2).unwrap(), b"hi".to_vec());
+        assert_eq!(vm.memory.read_f32_tensor(0x1018, 4).unwrap(), vec![1.0, 0.0, 0.0, 1.0]);
+        // Guarda honesta: segundo preload (ou VM não-fresca) erra alto —
+        // endereços `@` foram congelados para a base.
+        assert!(vm.load_assembled(&prog).is_err());
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let setup = crate::opcodes::assemble("TENSOR r0 2 2 f32\nHALT").unwrap();
+        vm2.load_program(setup);
+        vm2.run().unwrap();
+        assert!(vm2.load_assembled(&prog).is_err());
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

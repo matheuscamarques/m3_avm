@@ -26,6 +26,12 @@ pub const REGION_TEMPORAL: u8 = 0x10;
 pub const REGION_PERSISTENT: u8 = 0x20;
 pub const REGION_KV_CACHE: u8 = 0x30;
 
+/// Offset inicial do heap GLOBAL (primeiros 4 KiB reservados para NULL +
+/// cabeçalhos). Constante compartilhada com o layout `.data` do assembler
+/// (V-1b dia 3): preload de dados como PRIMEIRA alocação cai exatamente
+/// aqui — o loader verifica, não assume.
+pub const GLOBAL_HEAP_START: u128 = 0x1000;
+
 /// Tamanho lógico da região TEMPORAL: 1 GiB (spec).
 pub const TEMPORAL_LOGICAL_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB
 
@@ -296,7 +302,7 @@ impl MemoryManager {
         Ok(Self {
             global_heap: HashMap::new(),
             tensor_meta: HashMap::new(),
-            next_global_offset: 0x1000,
+            next_global_offset: GLOBAL_HEAP_START,
             sparse_heap: HashMap::new(),
             temporal_buffer: vec![0u8; TEMPORAL_PHYSICAL_SIZE],
             temporal_head: 0,
@@ -339,7 +345,7 @@ impl MemoryManager {
         Ok(Self {
             global_heap: HashMap::new(),
             tensor_meta: HashMap::new(),
-            next_global_offset: 0x1000, // reserva primeiros 4 KiB para NULL + cabeçalhos
+            next_global_offset: GLOBAL_HEAP_START, // reserva primeiros 4 KiB para NULL + cabeçalhos
             sparse_heap: HashMap::new(),
             temporal_buffer: vec![0u8; TEMPORAL_PHYSICAL_SIZE],
             temporal_head: 0,

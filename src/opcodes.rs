@@ -22,6 +22,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use thiserror::Error;
+use crate::memory::GLOBAL_HEAP_START;
 
 pub const INSTR_SIZE: usize = 32;
 
@@ -2753,8 +2754,23 @@ fn assemble_full(text: &str, program_base: u128) -> Result<AssembledProgram> {
                 line
             ));
         }
+        // Dia 3: namespace `nome` compartilhado `.equ`×`.data` —
+        // colisão = erro (evita confusão valor-vs-endereço; endereço
+        // explícito é `@nome`).
+        if syms.is_const(&blob.name) {
+            return Err(anyhow!(
+                "linha {}: blob '{}' colide com constante `.equ` (use outro nome; endereço é `@{}`) — '{}'",
+                lineno,
+                blob.name,
+                blob.name,
+                line
+            ));
+        }
         data.declare(blob).map_err(|e| anyhow!("linha {}: {}", lineno, e))?;
     }
+    // Dia 3: layout fixo + bind de `@nome` (antes do Passo 2, que resolve
+    // os LOADI de endereço).
+    syms.bind_addrs(&data_layout_addrs(&data));
 
     // Passo 2: Montagem com resolução de rótulos (+ símbolos do Passo 1)
     let mut out = Vec::with_capacity(instr_lines.len());
@@ -2793,6 +2809,9 @@ struct SymbolTable {
     map: HashMap<String, u8>,
     used: [bool; 16],
     consts: HashMap<String, u128>,
+    /// Endereços `.data` (dia 3): nome (minúsculas) -> endereço load-time.
+    /// Preenchido após o passo 1b (layout precisa de todos os blobs).
+    addrs: HashMap<String, u128>,
 }
 
 impl SymbolTable {
@@ -2852,6 +2871,22 @@ impl SymbolTable {
     fn is_const(&self, name: &str) -> bool {
         let key = name.trim().trim_end_matches(',').to_ascii_uppercase();
         self.consts.contains_key(&key)
+    }
+
+    /// Vincula endereços `.data` (dia 3, após o passo 1b).
+    fn bind_addrs(&mut self, addrs: &[(String, u128)]) {
+        for (name, addr) in addrs {
+            self.addrs.insert(name.clone(), *addr);
+        }
+    }
+
+    /// Resolve `@nome` (dia 3): SÓ blobs `.data`. `@` de `.equ`/nome
+    /// inexistente => erro alto (namespace de endereço separado).
+    fn resolve_addr(&self, name: &str) -> Result<u128> {
+        let key = name.trim().trim_end_matches(',').to_ascii_lowercase();
+        self.addrs.get(&key).copied().ok_or_else(|| {
+            anyhow!("endereço '@{}' não declarado (só blobs `.data` têm endereço; `.equ` usa referência sem `@`)", name)
+        })
     }
 }
 
@@ -3172,6 +3207,58 @@ fn parse_nested_f32(name: &str, after_ty: &str, syms: &SymbolTable) -> Result<Da
         return Err(anyhow!("blob '{}': esperados {} valores, obtidos {}", name, expected, got));
     }
     Ok(DataBlob { name: name.to_string(), dtype: DataDtype::F32, shape, bytes })
+}
+
+// ---------------------------------------------------------------------------
+// V-1b (dia 3): layout load-time — substituição em assemble-time (Opção A).
+// Base fixa = GLOBAL_HEAP_START (o preload como PRIMEIRA alocação cai
+// exatamente ali; o loader verifica, nunca assume). Sem ASLR, sem
+// relocation, sem lookup em runtime: `@nome` vira o endereço literal.
+// Correção registrada: região GLOBAL é 0x00 (top byte), logo endereço =
+// offset puro (NÃO `(region<<60)|offset`).
+// ---------------------------------------------------------------------------
+
+/// Base de carga da seção `.data` (= início do heap GLOBAL fresco).
+pub const DATA_LOAD_BASE: u128 = GLOBAL_HEAP_START;
+
+/// Padding entre blobs (regra congelada dia 3; cache-line, futuro SIMD).
+pub const DATA_BLOB_PAD: usize = 8;
+
+/// Alinhamento por tipo (regra congelada dia 3): escalares/blobs f32 =
+/// 4 (hardware natural); `.str` = 1 (sem requisito).
+pub fn data_dtype_align(dtype: DataDtype) -> usize {
+    match dtype {
+        DataDtype::U32 | DataDtype::I32 | DataDtype::F32 => 4,
+        DataDtype::Str => 1,
+    }
+}
+
+fn align_up(off: usize, align: usize) -> usize {
+    (off + align - 1) & !(align - 1)
+}
+
+/// Layout determinístico compartilhado assembler↔loader: `(nome, addr)`
+/// na ordem de declaração. `start=align(off,tipo)`; próximo blob em
+/// `align8(start+len)`; total inclui o pad final (base+total 8-alinhado).
+pub fn data_layout_addrs(data: &DataSection) -> Vec<(String, u128)> {
+    let mut out = Vec::with_capacity(data.blobs.len());
+    let mut off = 0usize;
+    for b in &data.blobs {
+        let start = align_up(off, data_dtype_align(b.dtype));
+        out.push((b.name.clone(), DATA_LOAD_BASE + start as u128));
+        off = align_up(start + b.bytes.len(), DATA_BLOB_PAD);
+    }
+    out
+}
+
+/// Tamanho total do layout (para `alloc_global` do loader).
+pub fn data_layout_total(data: &DataSection) -> usize {
+    let mut off = 0usize;
+    for b in &data.blobs {
+        let start = align_up(off, data_dtype_align(b.dtype));
+        off = align_up(start + b.bytes.len(), DATA_BLOB_PAD);
+    }
+    off
 }
 
 fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable) -> Result<Instruction> {
@@ -4144,13 +4231,21 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                 return Err(anyhow!("LOADI precisa de rdest, imediato — ex: LOADI r0, 80000000"));
             }
             let rdest = parse_reg(parts[1], syms)?;
-            let imm = parse_imm_u128(parts[2], syms).map_err(|_| {
-                if parts[2].trim().starts_with("0x") || parts[2].trim().starts_with("0X") {
-                    anyhow!("LOADI imediato hex inválido '{}'", parts[2])
-                } else {
-                    anyhow!("LOADI imediato '{}' inválido (u128: decimal, 0x-hex ou .equ)", parts[2])
-                }
-            })?;
+            // Dia 3: `@nome` = endereço `.data` (substituição em
+            // assemble-time; LOADI u128 comporta qualquer endereço).
+            // Erro próprio (não cai na mensagem de imediato).
+            let imm = match parts[2].trim().trim_end_matches(',').strip_prefix('@') {
+                Some(nm) => syms
+                    .resolve_addr(nm)
+                    .map_err(|e| anyhow!("LOADI {}", e))?,
+                None => parse_imm_u128(parts[2], syms).map_err(|_| {
+                    if parts[2].trim().starts_with("0x") || parts[2].trim().starts_with("0X") {
+                        anyhow!("LOADI imediato hex inválido '{}'", parts[2])
+                    } else {
+                        anyhow!("LOADI imediato '{}' inválido (u128: decimal, 0x-hex ou .equ)", parts[2])
+                    }
+                })?,
+            };
             if parts.len() > 3 {
                 reject_unknown("LOADI", &parts[3..], &[])?;
             }
@@ -6995,5 +7090,56 @@ mod tests {
         assert_eq!(full.data.blobs.len(), 2);
         assert_eq!(full.data.blobs[0].shape.len(), 0);
         assert_eq!(full.data.blobs[1].shape, vec![2]);
+    }
+
+    // ---- V-1b dia 3: `@nome` (Opção A, assemble-time) ------------------
+
+    #[test]
+    fn test_v1b_data_addr() {
+        use super::{assemble_with_data, data_layout_addrs, data_layout_total, DATA_LOAD_BASE};
+        // Layout fixo: base 0x1000, align 4/1, pad 8 entre blobs.
+        let full = assemble_with_data(
+            ".data\nframe_len: .u32 1920\nthreshold: .f32 0.5\ntag: .str \"hi\"\ntab: .f32 [2, 2] [1.0, 0.0, 0.0, 1.0]\n.text\nHALT",
+        )
+        .unwrap();
+        let addrs = data_layout_addrs(&full.data);
+        assert_eq!(
+            addrs,
+            vec![
+                ("frame_len".to_string(), DATA_LOAD_BASE),
+                ("threshold".to_string(), DATA_LOAD_BASE + 8),
+                ("tag".to_string(), DATA_LOAD_BASE + 16),
+                ("tab".to_string(), DATA_LOAD_BASE + 24),
+            ]
+        );
+        assert_eq!(DATA_LOAD_BASE, 0x1000);
+        assert_eq!(data_layout_total(&full.data), 40);
+        assert!(data_layout_total(&super::DataSection::default()) == 0);
+        // `@nome` num único LOADI = mesmo bytes do literal do endereço.
+        let a = assemble_with_data(".data\nframe_len: .u32 1920\n.text\nLOADI r0, @frame_len").unwrap();
+        let b = assemble("LOADI r0, 4096").unwrap();
+        assert_eq!(a.instrs[0].encode(), b[0].encode());
+        // Case-insensitive; `.equ` no caminho (forward-reference ok).
+        let full = assemble_with_data(".equ N 3\n.data\nv: .f32 [N] [1.0, 2.0, 3.0]\n.text\nLOADI r0, @V").unwrap();
+        assert_eq!(full.instrs.len(), 1);
+        // Erros altos: `@` de `.equ` (só `.data` tem endereço), `@`
+        // inexistente, `@` nu, `@` fora de LOADI, colisão blob×`.equ`.
+        assert!(assemble_with_data(".equ N 5\n.text\nLOADI r0, @N").is_err());
+        assert!(assemble_with_data(".text\nLOADI r0, @nope").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 1\n.text\nLOADI r0, @").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 1\n.text\nCOMPARE r0, @x").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 1\n.text\nADD_IMM r0, r1 IMM=@x").is_err());
+        let err = assemble_with_data(".equ FOO 1\n.data\nfoo: .u32 2\n.text\nHALT")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("colide"), "colisão blob×const deve errar: {}", err);
+        // `@` case-insensitive como todo o assembler (`@FOO` = `@foo`).
+        let a = assemble_with_data(".data\nfoo: .u32 2\n.text\nLOADI r0, @FOO").unwrap();
+        let b = assemble_with_data(".data\nfoo: .u32 2\n.text\nLOADI r0, @foo").unwrap();
+        assert_eq!(a.instrs[0].encode(), b.instrs[0].encode());
+        let err = assemble_with_data(".data\nfoo: .u32 2\n.text\nLOADI r0, @bar")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("@bar"), "erro deve nomear @: {}", err);
     }
 }

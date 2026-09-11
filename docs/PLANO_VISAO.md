@@ -88,7 +88,7 @@ Fora de escopo permanente: programa `.m3asm` completo da família antes de G2 ·
 | Fase | Status | Evidência de saída |
 |:---|:---|:---|
 | V-0 quick wins | ✅ feito (RFC-0035) | 2 demos + testes; `src/` intocado |
-| V-1 assembler | 🟡 parcial (RFC-0036 `.reg`, RFC-0037 V-1a `.equ`/`.text`) | `.reg`+consts montáveis; corpus verde; `.data`/`.str`/init multivalor = V-1b (decisão: sidecar, sem opcode) |
+| V-1 assembler | ✅ feito (RFC-0036 `.reg`, RFC-0037 V-1a `.equ`/`.text` + V-1b dias 1–3: `.data`/sidecar/`@`/loader) | consts + blobs + `@` montáveis; corpus verde; container `.m3bc` com dados = follow-up (bit 49 congelado) |
 | V-2 retrieval | ⬜ pendente | busca real + bump minor |
 | V-3 system+loop | ⬜ pendente | conversa sintética fim-a-fim medida |
 | V-4 pesos reais | ⬜ pendente | fumaça Mamba fecha OPEN |

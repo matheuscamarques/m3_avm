@@ -44,6 +44,13 @@ pub const M3BC_HEADER_LEN: usize = 34;
 pub const M3BC_VERSION: (u16, u16, u16) = (1, 5, 0);
 /// Bits REQUIRED suportados: nenhum além do baseline (que não usa bit).
 pub const M3BC_SUPPORTED_REQUIRED: u64 = 0;
+/// Bit OPTIONAL 49: seção `.data` no container (V-1b dia 3).
+/// NÚMERO CONGELADO, semântica pendente: o container ainda não carrega
+/// payload de dados (CLI `assemble` rejeita `.data`; só o path API
+/// `assemble_with_data` + `load_assembled` existe). Ligar este bit sem
+/// o layout de container seria mentira documentada — wiring quando o
+/// layout existir. Teste abaixo trava o valor.
+pub const M3BC_OPTIONAL_HAS_DATA_SECTION: u64 = 1 << 49;
 
 /// Formato detectado por sniffing (R10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +490,13 @@ mod tests {
         assert!(matches!(prog.frames[2], Frame::I32(_)));
         // instructions_32 deve falhar nomeando o frame largo (honesto).
         assert!(prog.instructions_32().is_err());
+    }
+
+    #[test]
+    fn has_data_section_bit_frozen() {
+        // Número congelado (RFC-0037 0037-04); wiring só com o layout.
+        assert_eq!(M3BC_OPTIONAL_HAS_DATA_SECTION, 1 << 49);
+        assert_eq!(M3BC_OPTIONAL_HAS_DATA_SECTION & M3BC_SUPPORTED_REQUIRED, 0);
     }
 
     #[test]

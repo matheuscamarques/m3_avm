@@ -3,7 +3,7 @@
 ```text
 Status      : IMPLEMENTED
 Category    : Standards Track
-Updates     : assembler §(assemble Passo 1/1b, parse_imm_*, 8 use-sites, DataSection); PLANO_VISAO V-1 (passos 2–3)
+Updates     : assembler §(assemble Passo 1/1b, parse_imm_*, 8 use-sites, DataSection, layout, `@`); loader §(load_assembled); PLANO_VISAO V-1 (passos 2–4)
 Obsoletes   : None
 Feature Bit : none (assembler-only)
 Bump        : none (no encoding touched — Trilha P precedent)
@@ -101,6 +101,28 @@ binding) — both are a separate decision (V-1b), not smuggled in here.
   floats finitos; `[[...]]` estilo-JSON recusado; nada após o bloco de
   valores (sem mistura flat/nested). `DataBlob.shape: Vec<u32>`
   (vazio = escalar dia 1).
+- `.data` dia 3 (Opção A, assemble-time): `@nome` vira o endereço GLOBAL
+  literal num único `LOADI` u128 (0x78 comporta qualquer endereço —
+  verificado: sem `LOADI64`, sem dança de dois imediatos, sem bailout).
+  `@` SÓ em `LOADI` (fora dela, erro legado); `@` SÓ resolve blob
+  `.data` (`@` de `.equ`/inexistente/nú => erro alto); namespace `nome`
+  compartilhado `.equ`×`.data` (colisão = erro — evita confusão
+  valor-vs-endereço).
+- Layout congelado (função única assembler↔loader): base
+  `DATA_LOAD_BASE = GLOBAL_HEAP_START = 0x1000`; `start=align(off,tipo)`
+  (escalares/blobs f32 = 4, `.str` = 1); próximo blob em
+  `align8(start+len)` (pad 8 entre blobs; total inclui pad final); LE
+  sempre. Correção registrada: GLOBAL é `0x00` (top byte) — endereço =
+  offset puro, NÃO `(region<<60)|offset`.
+- `Vm::load_assembled(&AssembledProgram)`: preload como PRIMEIRA
+  alocação GLOBAL (`alloc_global(total)`); base retornada precisa ser
+  `DATA_LOAD_BASE` senão erro alto (VM não-fresca ou 2º preload —
+  endereços `@` foram congelados no assemble). GLOBAL não é read-only
+  (CoW); sem enforcement novo (YAGNI).
+- Bit `M3BC_OPTIONAL_HAS_DATA_SECTION = 1<<49`: NÚMERO CONGELADO,
+  wiring pendente — o container ainda não carrega payload de dados
+  (CLI `assemble` rejeita `.data`), então ligar o bit hoje seria
+  mentira documentada. Trava de valor em teste; wiring com o layout.
 - `assemble()` com blobs → Err nomeando `assemble_with_data` (nada
   descartado em silêncio); `assemble_with_data()` retorna
   `AssembledProgram { instrs, data }`. `instrs` valem para
@@ -158,12 +180,20 @@ Working tree (no PR link; single-commit scope):
   `opcodes::test_v1b_data_nested` (bytes LE bit-exatos, whitespace/hex/
   `.equ` em dims, 20 casos incl. mismatch `esperados N, obtidos M`,
   zero, rank-3, vírgulas, `[[...]]`, `prod > u32::MAX`).
+- Dia 3: `data_layout_addrs`/`data_layout_total` + `SymbolTable.addrs`
+  + `@` no `LOADI` + `MemBackend::alloc_global` + `Vm::load_assembled`
+  + `M3BC_OPTIONAL_HAS_DATA_SECTION`; conformance
+  `opcodes::test_v1b_data_addr` (layout exato, byte-igualdade vs
+  literal, 10 erros incl. `@` de `.equ`, colisão blob×const) +
+  `vm::test_planoV1b_data_loader` (regs + bytes lidos de volta +
+  guarda de 2º preload/VM suja) + demo `programs/data_addr_demo.m3asm`.
+- Suite dia 3: `cargo test --lib` 362 passed (sole failure: pre-existing
+  moshi); corpus 40/40.
 
-Follow-up (NOT this RFC — V-1b dia 3, decisão registrada: sidecar).
-Dia 3: loader preload em GLOBAL + binding + feature bit (container).
-Sem opcode novo, sem bump (`.data` é load-time, não runtime). `STORE`
-segue possível um dia, mas só com dossiê R12 (Trilha P) e 2º caso de
-uso concreto; V-1b não precisa dele.
+Follow-up (fora desta RFC): layout `.data` no container `.m3bc` (aí o
+bit 49 liga de verdade) e, depois de V-1b, `src/mimi.rs` antes de V-2
+(RAG é bump de ISA; Mimi é implementação sobre `0x15`/`0x16` já
+existentes).
 
 ## Changelog
 
@@ -173,6 +203,7 @@ uso concreto; V-1b não precisa dele.
 | 0037-01 | 2026-09-11 | IMPLEMENTED: gate green; corpus 40/40; no bump |
 | 0037-02 | 2026-09-11 | V-1b dia 1: `.data` escalar/`.str` + `assemble_with_data` (sem loader); `[...]`→dia 2 |
 | 0037-03 | 2026-09-11 | V-1b dia 2: multi-valor nested `.f32 [shape] [vals]` (só explícito, ranks 1–2) |
+| 0037-04 | 2026-09-11 | V-1b dia 3: `@nome` (Opção A) + layout congelado + `load_assembled`; bit 49 congelado, wiring pendente |
 
 ---
 *Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

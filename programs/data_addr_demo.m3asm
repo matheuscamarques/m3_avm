@@ -1,0 +1,17 @@
+; programs/data_addr_demo.m3asm — V-1b dia 3 (Opção A: substituição em assemble-time).
+; `@nome` vira endereço GLOBAL literal num único LOADI u128 (0x78, RFC-0007);
+; o loader (`load_assembled`) posiciona os bytes no layout fixo
+; (base 0x1000, align 4/1, pad 8 — ver RFC-0037). Sem ASLR, sem relocation.
+; Layout: frame_len@0x1000, threshold@0x1008, tag@0x1010, tab@0x1018.
+; Regs: r0=@frame_len, r1=@threshold, r2=@tag, r3=@tab.
+.data
+frame_len: .u32 1920
+threshold: .f32 0.5
+tag:       .str "hi"
+tab:       .f32 [2, 2] [1.0, 0.0, 0.0, 1.0]
+.text
+LOADI r0, @frame_len
+LOADI r1, @threshold
+LOADI r2, @tag
+LOADI r3, @tab
+HALT
