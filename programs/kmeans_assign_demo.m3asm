@@ -1,0 +1,11 @@
+; programs/kmeans_assign_demo.m3asm — RFC-0030 Trilha P: atribuição Lloyd k=2 desenrolada (ver RFC).
+; Verificado em test_rfc0030_lowering_runs.
+TENSOR r0 4 2 f32
+TENSOR r1 2 2 f32
+SLICE r2, r0 START=0 LEN=2
+DISTANCE r3, r2, r1 METRIC=EUCLID TOPK=1
+SLICE r4, r3 START=1 LEN=1
+SLICE r5, r0 START=2 LEN=2
+DISTANCE r6, r5, r1 METRIC=EUCLID TOPK=1
+SLICE r7, r6 START=1 LEN=1
+HALT

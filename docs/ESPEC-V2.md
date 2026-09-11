@@ -291,8 +291,8 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x51` | `RAG_INDEX_DEL` | 32 | DRAFT | S | RAG_INDEX delete |
 | `0x52` | `RAG_SEARCH` | 32 | DRAFT | S | RAG_INDEX; flat/IVF/HNSW/PQ + top-k |
 | `0x53` | `EMBED_LOOKUP` | 32 | DRAFT | S | WEIGHTS; embedding bag |
-| `0x54` | `HASH_BUCKET` | 32 | HELD | S | Lowering-first (R12) |
-| `0x55` | `QUANTIZE_VEC` | 32 | HELD | S | Lowering-first (R12) |
+| `0x54` | `HASH_BUCKET` | 32 | HELD | S | R12 judged RFC-0030: lowering adequate, no opcode |
+| `0x55` | `QUANTIZE_VEC` | 32 | HELD | S | R12 judged RFC-0030: lowering adequate, no opcode |
 | `0x56` | `PQ_ENCODE` | 32 | DRAFT | S | RAG_INDEX; product quantizer |
 | `0x57` | `PQ_DECODE` | 32 | DRAFT | S | RAG_INDEX; inverse |
 
@@ -300,14 +300,14 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x58` | `KMEANS_STEP` | 32 | HELD | S | Lloyd step; needs lowering proof (R12) |
-| `0x59` | `LINEAR_REG` | 32 | HELD | S | y=wTx+b (MATVEC covers; R12) |
-| `0x5A` | `LOGISTIC_REG` | 32 | HELD | S | +sigmoid (R12) |
-| `0x5B` | `NAIVE_BAYES` | 32 | HELD | S | Gaussian/multinomial (R12) |
-| `0x5C` | `SVM_PREDICT` | 32 | HELD | S | Kernels (R12) |
-| `0x5D` | `PCA_STEP` | 32 | HELD | S | Power iteration (R12) |
-| `0x5E` | `STANDARDIZE` | 32 | HELD | S | Z-score/min-max (R12) |
-| `0x5F` | `NEAREST_CENTROID` | 32 | HELD | S | Argmin distance (R12) |
+| `0x58` | `KMEANS_STEP` | 32 | HELD | S | R12 judged RFC-0030: DISTANCE-TOPK lowering, no opcode |
+| `0x59` | `LINEAR_REG` | 32 | HELD | S | R12 judged RFC-0030: MATVEC+ADD alias, no opcode |
+| `0x5A` | `LOGISTIC_REG` | 32 | HELD | S | R12 judged RFC-0030: +SIGMOID alias, no opcode |
+| `0x5B` | `NAIVE_BAYES` | 32 | HELD | S | R12 judged RFC-0030: log-domain lowering, no opcode |
+| `0x5C` | `SVM_PREDICT` | 32 | HELD | S | R12 judged RFC-0030: MATVEC/DISTANCE lowering, no opcode |
+| `0x5D` | `PCA_STEP` | 32 | HELD | S | R12 judged RFC-0030: power+Newton lowering, no opcode |
+| `0x5E` | `STANDARDIZE` | 32 | HELD | S | R12 judged RFC-0030: moments+Newton lowering, no opcode |
+| `0x5F` | `NEAREST_CENTROID` | 32 | HELD | S | R12 judged RFC-0030: IS DISTANCE TOPK=1, no opcode |
 
 ### 3.10 Determinism, conversion, telemetry, scheduler (`0x60-0x77`) — DRAFT, 32B
 
@@ -425,11 +425,11 @@ Encodings frozen per [R] R3; unimplemented. Full layout in [R] Section
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0xB7-0xBF` | — | — | RESERVED | — | Federated-future placeholder (R3, R12) |
-| `0xC0-0xCF` | — | — | RESERVED | — | Confidential/TEE (R12) |
-| `0xD0-0xDF` | — | — | RESERVED | — | Photonic/neuromorphic (R12) |
-| `0xE0-0xEF` | — | — | RESERVED | — | Quantum simulator (R12) |
-| `0xF0-0xFE` | — | — | RESERVED | — | Extended system (R12) |
+| `0xB7-0xBF` | — | — | RESERVED | — | Federated-future (R3, R12 judged RFC-0030: needs transport+protocol) |
+| `0xC0-0xCF` | — | — | RESERVED | — | Confidential/TEE (R12 judged RFC-0030: needs threat model) |
+| `0xD0-0xDF` | — | — | RESERVED | — | Photonic/neuromorphic (R12 judged RFC-0030: needs backend) |
+| `0xE0-0xEF` | — | — | RESERVED | — | Quantum simulator (R12 judged RFC-0030: needs backend) |
+| `0xF0-0xFE` | — | — | RESERVED | — | Extended system (R12 judged RFC-0030: case-by-case) |
 
 ### 3.17 Terminal (`0xFF`) — IMPL, always 32B
 

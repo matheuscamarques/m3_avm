@@ -7661,6 +7661,33 @@ mod tests {
         assert_eq!((stats.kv_compress_execs, stats.attn_sparse_execs, stats.flash_attn_execs), (1, 1, 1));
     }
 
+    // ---- RFC-0030: Trilha P (lowerings executáveis) --------------------
+
+    #[tokio::test]
+    async fn test_rfc0030_lowering_runs() {
+        use crate::opcodes::assemble;
+        // Newton p/ 1/sqrt(2) sem DIV: x1 = 0.5*(3-2*0.25)/2 = 0.625 exato.
+        let src = include_str!("../programs/newton_rsqrt_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let a10 = ctx.reg(10).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a10, 1).unwrap(), vec![0.625]);
+        // Lloyd k=2 desenrolado: q0==c0 -> idx 0; q1==c1 -> idx 1.
+        let src = include_str!("../programs/kmeans_assign_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm2.load_program(prog);
+        vm2.run().unwrap();
+        let ctx2 = vm2.scheduler.get(1).unwrap().clone();
+        let a4 = ctx2.reg(4).unwrap();
+        assert_eq!(vm2.memory.read_f32_tensor(a4, 1).unwrap(), vec![0.0]);
+        let a7 = ctx2.reg(7).unwrap();
+        assert_eq!(vm2.memory.read_f32_tensor(a7, 1).unwrap(), vec![1.0]);
+    }
+
     // ---- RFC-0005: determinismo -------------------------------------
 
     fn rfc0005_reg_u64(vm: &Vm, cid: u64, r: u8) -> u64 {

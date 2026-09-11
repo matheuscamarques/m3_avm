@@ -1,0 +1,14 @@
+; programs/newton_rsqrt_demo.m3asm — RFC-0030 Trilha P: Newton p/ 1/sqrt sem DIV (ver RFC).
+; Verificado em test_rfc0030_lowering_runs.
+TENSOR r0 1 1 f32 FILL=2.0
+TENSOR r1 1 1 f32 FILL=0.5
+TENSOR r2 1 1 f32 FILL=3.0
+TENSOR r3 1 1 f32 FILL=0.5
+TENSOR r4 1 1 f32 FILL=-1.0
+MUL r5, r0, r1
+MUL r6, r5, r1
+MUL r7, r6, r4
+ADD r8, r2, r7
+MUL r9, r1, r8
+MUL r10, r9, r3
+HALT
