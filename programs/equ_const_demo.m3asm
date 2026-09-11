@@ -1,0 +1,24 @@
+; programs/equ_const_demo.m3asm — RFC-0037 (V-1a, PLANO_VISAO).
+; Constantes `.equ` em posições de imediato (LOADI/COMPARE/ADD_IMM/
+; SUB_IMM + dims TENSOR) + marcador `.text`. Semântica idêntica aos
+; literais (codificação igual, ver test_rfc0037_equ_text); este arquivo
+; prova o caminho de execução (test_planoV1_equ_consts).
+; Regs: r0=base, r1=acc, r2=diff, r3=tab, r4=flag.
+.text
+.equ BASE 10
+.equ STEP 0x20
+.equ EXPECTED 32
+.equ NROWS 2
+.equ NCOLS 2
+LOADI r0, BASE
+ADD_IMM r1, r0 IMM=STEP
+SUB_IMM r2, r1 IMM=BASE
+COMPARE r2, EXPECTED PRED=EQ
+IF_EQUAL DONE_OK
+LOADI r4, 0
+JUMP DONE
+DONE_OK:
+LOADI r4, 1
+DONE:
+TENSOR r3 NROWS NCOLS f32 FILL=0.5
+HALT

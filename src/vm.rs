@@ -8870,6 +8870,25 @@ mod tests {
         assert!(pickf >= 0.0 && pickf < 1.0, "pick={}", pickf);
     }
 
+    #[tokio::test]
+    async fn test_planoV1_equ_consts() {
+        use crate::opcodes::assemble;
+        // RFC-0037 (V-1a): `.equ`/`.text` executam com semântica idêntica
+        // aos literais. r0=10, r1=42, r2=32, r4=1 (branch tomado), r3=[2,2] FILL=0.5.
+        let src = include_str!("../programs/equ_const_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 10);
+        assert_eq!(ctx.reg(1).unwrap(), 42);
+        assert_eq!(ctx.reg(2).unwrap(), 32);
+        assert_eq!(ctx.reg(4).unwrap(), 1);
+        let tab = ctx.reg(3).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(tab, 4).unwrap(), vec![0.5; 4]);
+    }
+
     // ---- RFC-0005: determinismo -------------------------------------
 
     fn rfc0005_reg_u64(vm: &Vm, cid: u64, r: u8) -> u64 {

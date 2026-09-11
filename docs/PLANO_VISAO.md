@@ -42,7 +42,7 @@ License:  AGPL-3.0-or-later (see LICENSE)
 | # | Gap | Tamanho | Destrava |
 |:---|:---|:---|:---|
 | G1 | Demos executáveis de comportamento (pausa + filler sintético) | **Nenhum código novo** — só `.m3asm` + testes | `PAUSA` MVP, `FILLER` Marco 0, `EXPERIENCIA` (interrupção, pergunta profunda) |
-| G2 | Assembler track: `.data/.equ/.str/.text`, literais, init multivalor (+ `STORE` só se passar no filtro R12) | 1–2 turnos (só assembler + testes; zero opcode salvo R12) | Tabelas (FOREST/XGB/filler) e todos os programas da família — **hoje NENHUM programa de visão monta** |
+| G2 | Assembler track: `.data/.equ/.str/.text`, literais, init multivalor (+ `STORE` só se passar no filtro R12) — V-1a (`.equ`/`.text`, RFC-0037) feito; V-1b (`.data`/`.str`/init) pendente | 1–2 turnos (só assembler + testes; zero opcode salvo R12) | Tabelas (FOREST/XGB/filler) e todos os programas da família — **hoje NENHUM programa de visão monta** |
 | G3 | Fase 6 Retrieval (`0x50–0x53`, `0x56–0x57`; `0x54–0x55` já julgados sem-opcode) | 1–2 turnos (padrão RFC: doc+goldens+demo+bench+bump) | Tutor RAG, antecipação da pausa, `RAG_SEARCH` dos programas |
 | G4 | System ops (`LOAD_MODEL`, `SPAWN_CONTEXT`, `MODEL_SWITCH`…, zona `0xA0+`) | 1–2 turnos | Programas multi-modelo que carregam/posicionam de verdade |
 | G5 | Fumaça de pesos reais (Mamba GGUF smoke = OPEN; mapeamento GGUF existe) | Turno de integração + pesos externos | Sair do sintético sem comprar rig (TinyLlama/DeepSeek locais) |
@@ -88,7 +88,7 @@ Fora de escopo permanente: programa `.m3asm` completo da família antes de G2 ·
 | Fase | Status | Evidência de saída |
 |:---|:---|:---|
 | V-0 quick wins | ✅ feito (RFC-0035) | 2 demos + testes; `src/` intocado |
-| V-1 assembler | ⬜ pendente | tabelas montáveis; corpus verde |
+| V-1 assembler | 🟡 parcial (RFC-0036 `.reg`, RFC-0037 V-1a `.equ`/`.text`) | `.reg`+consts montáveis; corpus verde; `.data`/`.str`/init multivalor = V-1b (decisão: sidecar, sem opcode) |
 | V-2 retrieval | ⬜ pendente | busca real + bump minor |
 | V-3 system+loop | ⬜ pendente | conversa sintética fim-a-fim medida |
 | V-4 pesos reais | ⬜ pendente | fumaça Mamba fecha OPEN |

@@ -2600,6 +2600,80 @@ pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruct
             }
         }
 
+        // Diretivas V-1a (RFC-0037): `.equ NAME valor` (constante inteira
+        // p/ imediatos) e `.text` (marcador de seção, no-op — convenção
+        // para a V-1b). `.data`/`.str` erram explícito apontando a V-1b
+        // (antes caíam em "opcode desconhecido"; continuam errando).
+        {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if !words.is_empty() {
+                if words[0].eq_ignore_ascii_case(".equ") {
+                    if words.len() != 3 {
+                        return Err(anyhow!(
+                            "linha {}: `.equ` precisa de nome e valor — ex: `.equ RAG_TOPK 5` — '{}'",
+                            lineno + 1,
+                            line
+                        ));
+                    }
+                    let name = words[1].trim_end_matches(',').to_ascii_uppercase();
+                    let ok_ident = !name.is_empty()
+                        && name.bytes().next().map_or(false, |b| b.is_ascii_alphabetic() || b == b'_')
+                        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                    if !ok_ident {
+                        return Err(anyhow!("linha {}: nome de constante inválido '{}'", lineno + 1, words[1]));
+                    }
+                    if ["F32", "F16", "BF16", "I8", "U8", "SPARSE", "EOS_TOKEN"].contains(&name.as_str()) {
+                        return Err(anyhow!(
+                            "linha {}: nome '{}' reservado (dtype/keyword) — '{}'",
+                            lineno + 1,
+                            words[1],
+                            line
+                        ));
+                    }
+                    if name.len() > 1 && name.starts_with('R') && name[1..].bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(anyhow!(
+                            "linha {}: nome '{}' colide com registrador — '{}'",
+                            lineno + 1,
+                            words[1],
+                            line
+                        ));
+                    }
+                    let vs = words[2].trim_end_matches(',');
+                    let val = if let Some(hex) = vs.strip_prefix("0x").or_else(|| vs.strip_prefix("0X")) {
+                        u128::from_str_radix(hex, 16).map_err(|_| {
+                            anyhow!("linha {}: valor `.equ` hex inválido '{}'", lineno + 1, words[2])
+                        })?
+                    } else if vs.starts_with('-') || vs.starts_with('+') {
+                        return Err(anyhow!(
+                            "linha {}: valor `.equ` '{}' inválido (u128 sem sinal)",
+                            lineno + 1,
+                            words[2]
+                        ));
+                    } else {
+                        vs.parse::<u128>().map_err(|_| {
+                            anyhow!("linha {}: valor `.equ` '{}' inválido (u128 decimal ou 0x-hex)", lineno + 1, words[2])
+                        })?
+                    };
+                    syms.declare_const(&name, val).map_err(|e| anyhow!("linha {}: {}", lineno + 1, e))?;
+                    continue;
+                }
+                if words[0].eq_ignore_ascii_case(".text") {
+                    if words.len() != 1 {
+                        return Err(anyhow!("linha {}: `.text` não recebe operandos — '{}'", lineno + 1, line));
+                    }
+                    continue;
+                }
+                if words[0].eq_ignore_ascii_case(".data") || words[0].eq_ignore_ascii_case(".str") {
+                    return Err(anyhow!(
+                        "linha {}: `{}` reservado (V-1b: sidecar de dados, sem opcode novo) — '{}'",
+                        lineno + 1,
+                        words[0],
+                        line
+                    ));
+                }
+            }
+        }
+
         // Verifica se há rótulo no início da linha (ex: "MAIN_LOOP:" ou "MAIN_LOOP: SENSE ...")
         if let Some(colon_idx) = line.find(':') {
             let label_cand = line[..colon_idx].trim();
@@ -2636,17 +2710,22 @@ fn strip_comment(s: &str) -> &str {
     &s[..end]
 }
 
-/// Tabela de símbolos do assembler (RFC-0036, passo V-1 do PLANO_VISAO).
-/// Apelidos simbólicos (`rTranscript`) vinculados EXPLICITAMENTE via
-/// diretiva `.reg` a um dos 16 GPRs normativos (R5: sem R255, sem
-/// faixas, sem container). Uso sem declaração continua erro — a
-/// auto-alocação foi deliberadamente rejeitada para preservar o gate
-/// do RFC-0008 (typo em posição de registrador deve falhar, ex.
-/// `SANITY_CHECK r4, r0, FOO`). Determinístico; tabela nova por chamada.
+/// Tabela de símbolos do assembler (RFC-0036, passo V-1 do PLANO_VISAO;
+/// constantes RFC-0037). Apelidos simbólicos (`rTranscript`) vinculados
+/// EXPLICITAMENTE via diretiva `.reg` a um dos 16 GPRs normativos (R5:
+/// sem R255, sem faixas, sem container). Uso sem declaração continua
+/// erro — a auto-alocação foi deliberadamente rejeitada para preservar
+/// o gate do RFC-0008 (typo em posição de registrador deve falhar, ex.
+/// `SANITY_CHECK r4, r0, FOO`). Constantes `.equ` (inteiras u128,
+/// namespace separado, chave em maiúsculas) valem em posições de
+/// imediato (LOADI/COMPARE/ADD_IMM/SUB_IMM/dims TENSOR/TREES/DEPTH/
+/// START/LEN/CODE); fora delas, literais como antes. Determinístico;
+/// tabela nova por chamada.
 #[derive(Debug, Default)]
 struct SymbolTable {
     map: HashMap<String, u8>,
     used: [bool; 16],
+    consts: HashMap<String, u128>,
 }
 
 impl SymbolTable {
@@ -2682,6 +2761,31 @@ impl SymbolTable {
             )
         })
     }
+
+    /// Vincula `name` (já em maiúsculas) ao imediato `val` (RFC-0037).
+    /// Nome repetido: erro. Não emite instrução.
+    fn declare_const(&mut self, name: &str, val: u128) -> Result<()> {
+        if self.consts.contains_key(name) {
+            return Err(anyhow!("constante '{}' redeclarada (uma definição por arquivo)", name));
+        }
+        self.consts.insert(name.to_string(), val);
+        Ok(())
+    }
+
+    /// Resolve constante `.equ` (lookup case-insensitive). Desconhecida
+    /// => erro que sugere `.reg`/`.equ` conforme o caso de uso.
+    fn resolve_const(&self, name: &str) -> Result<u128> {
+        let key = name.trim().trim_end_matches(',').to_ascii_uppercase();
+        self.consts.get(&key).copied().ok_or_else(|| {
+            anyhow!("constante '{}' não declarada (declare com `.equ {} <valor>`, ou use literal)", name, name)
+        })
+    }
+
+    /// Sonda sem errar (detecção de forma: dims TENSOR).
+    fn is_const(&self, name: &str) -> bool {
+        let key = name.trim().trim_end_matches(',').to_ascii_uppercase();
+        self.consts.contains_key(&key)
+    }
 }
 
 fn parse_reg(tok: &str, syms: &SymbolTable) -> Result<u8> {
@@ -2706,6 +2810,44 @@ fn parse_reg(tok: &str, syms: &SymbolTable) -> Result<u8> {
         return syms.resolve(t);
     }
     Err(anyhow!("registrador inválido '{}'", tok))
+}
+
+/// Imediato u128 (RFC-0037): literal decimal/0x-hex (sem sinal) ou
+/// constante `.equ`. Literal primeiro (legado intacto); desconhecido
+/// => erro que sugere `.equ`. Sítios com mensagem própria (LOADI,
+/// COMPARE, ADD_IMM, ...) a preservam — este helper é o núcleo.
+fn parse_imm_u128(tok: &str, syms: &SymbolTable) -> Result<u128> {
+    let t = tok.trim().trim_end_matches(',');
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return u128::from_str_radix(hex, 16).map_err(|_| anyhow!("imediato hex inválido '{}'", tok));
+    }
+    if t.starts_with('-') || t.starts_with('+') {
+        return Err(anyhow!("imediato '{}' inválido (u128: decimal ou 0x-hex, sem sinal)", tok));
+    }
+    if let Ok(n) = t.parse::<u128>() {
+        return Ok(n);
+    }
+    syms.resolve_const(t)
+}
+
+/// Variante decimal-ou-const (sem hex): preserva o domínio exato dos
+/// sítios que hoje só aceitam decimal (COMPARE/ADD_IMM/SUB_IMM e os
+/// KVs numéricos abaixo) — `.equ` soma-se, nada se afrouxa.
+fn parse_imm_dec_or_const(tok: &str, syms: &SymbolTable) -> Result<u128> {
+    let t = tok.trim().trim_end_matches(',');
+    if let Ok(n) = t.parse::<u128>() {
+        return Ok(n);
+    }
+    syms.resolve_const(t)
+}
+
+/// Dimensão TENSOR (u64): literal decimal ou `.equ` (com checagem u64).
+fn parse_dim_u64(tok: &str, syms: &SymbolTable) -> Result<u64> {
+    if let Ok(n) = tok.trim().trim_end_matches(',').parse::<u64>() {
+        return Ok(n);
+    }
+    let c = syms.resolve_const(tok)?;
+    u64::try_from(c).map_err(|_| anyhow!("dimensão '{}' fora da faixa u64", tok))
 }
 
 fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable) -> Result<Instruction> {
@@ -2743,10 +2885,10 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                 (is_sparse, dens)
             };
             if parts.len() >= 4 {
-                // Se parts[2] é número ou contém 'x'
+                // Se parts[2] é número, `LxC`, ou constante `.equ` (RFC-0037)
                 let maybe_rows = parts[2].replace('x', " ").trim().to_string();
                 // Checa se é literal numérico
-                if maybe_rows.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) || parts[2].contains('x') {
+                if maybe_rows.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) || parts[2].contains('x') || syms.is_const(parts[2]) {
                     // Literal. Rastreia tokens consumidos (shape/dtype) para
                     // o restante (SPARSE/DENSITY/FILL) não colidir com eles.
                     let mut consumed = vec![false; parts.len()];
@@ -2758,11 +2900,17 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                         let r = split.next().unwrap().parse::<u64>().map_err(|_| anyhow!("rows inválido"))?;
                         let c = split.next().unwrap().parse::<u64>().map_err(|_| anyhow!("cols inválido"))?;
                         (r, c)
-                    } else if parts.len() >= 4 && parts[3].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                        let r = parts[2].parse::<u64>().map_err(|_| anyhow!("rows inválido"))?;
-                        let c = parts[3].parse::<u64>().map_err(|_| anyhow!("cols inválido"))?;
+                    } else if parts.len() >= 4 && (parts[3].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) || syms.is_const(parts[3])) {
+                        // rows/cols: literal decimal ou `.equ` (RFC-0037).
+                        let r = parse_dim_u64(parts[2], syms)
+                            .map_err(|_| anyhow!("rows inválido"))?;
+                        let c = parse_dim_u64(parts[3], syms)
+                            .map_err(|_| anyhow!("cols inválido"))?;
                         consumed[3] = true;
                         (r, c)
+                    } else if syms.is_const(parts[2]) {
+                        // rows é `.equ` mas cols ausente/não-numérico.
+                        return Err(anyhow!("TENSOR precisa de rows, cols — ex: TENSOR r0 2 2 f32"));
                     } else {
                         (2, 2)
                     };
@@ -3089,7 +3237,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                 instr_compare(rsrc1, 0xFF, EOS_TOKEN_DEFAULT)
             } else if let Ok(r2) = parse_reg(parts[2], syms) {
                 instr_compare(rsrc1, r2, 0)
-            } else if let Ok(n) = parts[2].parse::<u128>() {
+            } else if let Ok(n) = parse_imm_dec_or_const(parts[2], syms) {
                 instr_compare(rsrc1, 0xFF, n)
             } else {
                 return Err(anyhow!("COMPARE segundo operando inválido '{}'", parts[2]));
@@ -3581,7 +3729,11 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             for p in &parts[2..] {
                 let up = p.to_ascii_uppercase();
                 if let Some(v) = up.strip_prefix("CODE=") {
+                    // Literal u16 ou `.equ` (RFC-0037; faixa checada).
                     if let Ok(n) = v.parse::<u16>() { code = n; }
+                    else if let Ok(n) = syms.resolve_const(v) {
+                        code = u16::try_from(n).map_err(|_| anyhow!("ASSERT CODE inválido '{}'", p))?;
+                    }
                     else { return Err(anyhow!("ASSERT CODE inválido '{}'", p)); }
                 } else {
                     return Err(anyhow!("ASSERT token desconhecido '{}' (use CODE=)", p));
@@ -3662,21 +3814,19 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             Ok(instr_fence())
         }
         "LOADI" => {
-            // LOADI rD, imm — decimal ou 0x-hex; negativos rejeitados (u128).
+            // LOADI rD, imm — decimal, 0x-hex ou `.equ` (RFC-0037);
+            // negativos rejeitados (u128).
             if parts.len() < 3 {
                 return Err(anyhow!("LOADI precisa de rdest, imediato — ex: LOADI r0, 80000000"));
             }
             let rdest = parse_reg(parts[1], syms)?;
-            let s = parts[2].trim();
-            let imm = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                u128::from_str_radix(hex, 16)
-                    .map_err(|_| anyhow!("LOADI imediato hex inválido '{}'", parts[2]))?
-            } else if s.starts_with('-') || s.starts_with('+') {
-                return Err(anyhow!("LOADI imediato '{}' inválido (u128: decimal ou 0x-hex, sem sinal)", parts[2]));
-            } else {
-                s.parse::<u128>()
-                    .map_err(|_| anyhow!("LOADI imediato '{}' inválido (u128: decimal ou 0x-hex)", parts[2]))?
-            };
+            let imm = parse_imm_u128(parts[2], syms).map_err(|_| {
+                if parts[2].trim().starts_with("0x") || parts[2].trim().starts_with("0X") {
+                    anyhow!("LOADI imediato hex inválido '{}'", parts[2])
+                } else {
+                    anyhow!("LOADI imediato '{}' inválido (u128: decimal, 0x-hex ou .equ)", parts[2])
+                }
+            })?;
             if parts.len() > 3 {
                 reject_unknown("LOADI", &parts[3..], &[])?;
             }
@@ -3717,10 +3867,19 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             for p in &parts[3..] {
                 let up = p.to_ascii_uppercase();
                 if let Some(v) = up.strip_prefix("START=") {
-                    start = v.parse::<u32>().map_err(|_| anyhow!("SLICE START inválido '{}'", p))?;
+                    // Literal u32 ou `.equ` (RFC-0037; faixa checada).
+                    if let Ok(n) = v.parse::<u32>() { start = n; }
+                    else if let Ok(n) = syms.resolve_const(v) {
+                        start = u32::try_from(n).map_err(|_| anyhow!("SLICE START inválido '{}'", p))?;
+                    }
+                    else { return Err(anyhow!("SLICE START inválido '{}'", p)); }
                     has_start = true;
                 } else if let Some(v) = up.strip_prefix("LEN=") {
-                    len = v.parse::<u32>().map_err(|_| anyhow!("SLICE LEN inválido '{}'", p))?;
+                    if let Ok(n) = v.parse::<u32>() { len = n; }
+                    else if let Ok(n) = syms.resolve_const(v) {
+                        len = u32::try_from(n).map_err(|_| anyhow!("SLICE LEN inválido '{}'", p))?;
+                    }
+                    else { return Err(anyhow!("SLICE LEN inválido '{}'", p)); }
                     has_len = true;
                 } else {
                     return Err(anyhow!("SLICE token desconhecido '{}' (use START=/LEN=)", p));
@@ -3960,7 +4119,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             Ok(instr_dequant(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "ADD_IMM" => {
-            // ADD_IMM rD, rS, IMM=n (u128 decimal; "-5" erra — use SUB_IMM)
+            // ADD_IMM rD, rS, IMM=n (u128 decimal ou `.equ`; "-5" erra — use SUB_IMM)
             if parts.len() < 3 {
                 return Err(anyhow!("ADD_IMM precisa de rdest, rSrc e IMM= — ex: ADD_IMM r1, r0 IMM=23"));
             }
@@ -3968,7 +4127,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             for p in &parts[3..] {
                 let up = p.to_ascii_uppercase();
                 if let Some(v) = up.strip_prefix("IMM=") {
-                    imm = Some(v.parse::<u128>().map_err(|_| anyhow!("ADD_IMM IMM inválido '{}' (u128 decimal; negativo use SUB_IMM)", p))?);
+                    imm = Some(parse_imm_dec_or_const(v, syms).map_err(|_| anyhow!("ADD_IMM IMM inválido '{}' (u128 decimal ou .equ; negativo use SUB_IMM)", p))?);
                 } else {
                     return Err(anyhow!("ADD_IMM token desconhecido '{}' (use IMM=)", p));
                 }
@@ -3979,7 +4138,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             }
         }
         "SUB_IMM" => {
-            // SUB_IMM rD, rS, IMM=n (wrapping; único SUB do ISA)
+            // SUB_IMM rD, rS, IMM=n (u128 decimal ou `.equ`; wrapping; único SUB do ISA)
             if parts.len() < 3 {
                 return Err(anyhow!("SUB_IMM precisa de rdest, rSrc e IMM= — ex: SUB_IMM r2, r1 IMM=23"));
             }
@@ -3987,7 +4146,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             for p in &parts[3..] {
                 let up = p.to_ascii_uppercase();
                 if let Some(v) = up.strip_prefix("IMM=") {
-                    imm = Some(v.parse::<u128>().map_err(|_| anyhow!("SUB_IMM IMM inválido '{}' (u128 decimal)", p))?);
+                    imm = Some(parse_imm_dec_or_const(v, syms).map_err(|_| anyhow!("SUB_IMM IMM inválido '{}' (u128 decimal ou .equ)", p))?);
                 } else {
                     return Err(anyhow!("SUB_IMM token desconhecido '{}' (use IMM=)", p));
                 }
@@ -4838,10 +4997,17 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
             for p in &parts[5..] {
                 let up = p.to_ascii_uppercase();
                 if let Some(v) = up.strip_prefix("TREES=") {
+                    // Literal u16 ou `.equ` (RFC-0037; faixa checada abaixo).
                     if let Ok(n) = v.parse::<u16>() { n_trees = n; }
+                    else if let Ok(n) = syms.resolve_const(v) {
+                        n_trees = u16::try_from(n).map_err(|_| anyhow!("FOREST TREES inválido '{}'", p))?;
+                    }
                     else { return Err(anyhow!("FOREST TREES inválido '{}'", p)); }
                 } else if let Some(v) = up.strip_prefix("DEPTH=") {
                     if let Ok(n) = v.parse::<u16>() { depth = n; }
+                    else if let Ok(n) = syms.resolve_const(v) {
+                        depth = u16::try_from(n).map_err(|_| anyhow!("FOREST DEPTH inválido '{}'", p))?;
+                    }
                     else { return Err(anyhow!("FOREST DEPTH inválido '{}'", p)); }
                 } else if let Some(v) = up.strip_prefix("MODE=") {
                     mode = match v {
@@ -6321,5 +6487,77 @@ mod tests {
         // Diretiva não emite instrução: só o ADD aparece.
         let prog = assemble(".reg rFoo r5\nADD rFoo, r0, r1").unwrap();
         assert_eq!(prog.len(), 1);
+    }
+
+    // ---- RFC-0037: constantes `.equ` + `.text` (V-1a) -------------------
+
+    #[test]
+    fn test_rfc0037_equ_text() {
+        // `.equ` vincula; uso em imediatos resolve (LOADI/ADD_IMM/SUB_IMM/
+        // COMPARE/TENSOR-dims/TREES/DEPTH/START/LEN/CODE).
+        let prog = assemble(".equ BASE 10\nLOADI r0, BASE").unwrap();
+        assert_eq!(prog.len(), 1);
+        assert_eq!(prog[0].mnemonic(), "LOADI");
+        // Hex e case-insensitividade.
+        let a = assemble(".equ STEP 0x20\nADD_IMM r1, r0 IMM=STEP").unwrap();
+        let b = assemble(".equ step 32\nADD_IMM r1, r0 IMM=step").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // `.text` é no-op: zero instruções emitidas, resto monta.
+        let prog = assemble(".text\n.equ N 7\nLOADI r2, N\nHALT").unwrap();
+        assert_eq!(prog.len(), 2);
+        // `.equ` + `.reg` convivem (namespaces posicionais).
+        let prog = assemble(".reg rFoo r5\n.equ N 7\nADD rFoo, r0, r1\nLOADI r2, N").unwrap();
+        assert_eq!((prog[0].rdest, prog.len()), (5, 2));
+        // TENSOR dims via const; mesma codificação que literal.
+        let a = assemble(".equ NR 2\n.equ NC 4\nTENSOR r1 NR NC f32").unwrap();
+        let b = assemble("TENSOR r1 2 4 f32").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // FOREST TREES/DEPTH e SLICE/ASSERT via const.
+        let a = assemble(".equ T 8\n.equ D 6\nFOREST r4, r0, r1, r2 TREES=T DEPTH=D").unwrap();
+        let b = assemble("FOREST r4, r0, r1, r2 TREES=8 DEPTH=6").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        let a = assemble(".equ S 3\n.equ L 3\nSLICE r4, r0 START=S LEN=L").unwrap();
+        let b = assemble("SLICE r4, r0 START=3 LEN=3").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        let a = assemble(".equ C 42\nASSERT r1 CODE=C").unwrap();
+        let b = assemble("ASSERT r1 CODE=42").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // COMPARE imediato via const.
+        let a = assemble(".equ LIM 32\nCOMPARE r2, LIM PRED=EQ").unwrap();
+        let b = assemble("COMPARE r2, 32 PRED=EQ").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // SUB_IMM via const.
+        let a = assemble(".equ BASE 10\nSUB_IMM r2, r1 IMM=BASE").unwrap();
+        let b = assemble("SUB_IMM r2, r1 IMM=10").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // Determinismo entre chamadas.
+        let a = assemble(".equ N 7\nLOADI r0, N").unwrap();
+        let b = assemble(".equ N 7\nLOADI r0, N").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // Erros altos (nada silencioso): sem declaração, redeclaração,
+        // valor ruim, aridade ruim, nome ruim/reservado/colisão com reg.
+        assert!(assemble("LOADI r0, NOPE").is_err());
+        assert!(assemble("ADD_IMM r1, r0 IMM=NOPE").is_err());
+        assert!(assemble("COMPARE r1, NOPE").is_err());
+        assert!(assemble("TENSOR r1 NOPE 4 f32").is_err());
+        assert!(assemble(".equ N 1\n.equ N 2\nLOADI r0, N").is_err());
+        assert!(assemble(".equ N abc\nLOADI r0, N").is_err());
+        assert!(assemble(".equ N -5\nLOADI r0, N").is_err());
+        assert!(assemble(".equ N\nLOADI r0, N").is_err());
+        assert!(assemble(".equ N 1 2\nLOADI r0, N").is_err());
+        assert!(assemble(".equ 1N 5\nLOADI r0, 1N").is_err());
+        assert!(assemble(".equ F32 5\nLOADI r0, F32").is_err());
+        assert!(assemble(".equ R1 5\nLOADI r0, R1").is_err());
+        assert!(assemble(".equ BIG 99999999999999999999999\nTENSOR r1 BIG 4 f32").is_err());
+        assert!(assemble(".equ BIG 70000\nASSERT r1 CODE=BIG").is_err());
+        assert!(assemble(".text extra\nHALT").is_err());
+        // `.data`/`.str`: erro explícito V-1b (antes: opcode desconhecido;
+        // continuam errando — nada afrouxado).
+        let err = assemble(".data\nHALT").unwrap_err().to_string();
+        assert!(err.contains("V-1b"), "erro deve apontar V-1b: {}", err);
+        let err = assemble(".str\nHALT").unwrap_err().to_string();
+        assert!(err.contains("V-1b"), "erro deve apontar V-1b: {}", err);
+        // Faixa preservada: TREES=0 via const continua erro.
+        assert!(assemble(".equ Z 0\nFOREST r4, r0, r1, r2 TREES=Z").is_err());
     }
 }

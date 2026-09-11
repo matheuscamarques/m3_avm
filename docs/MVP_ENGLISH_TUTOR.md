@@ -271,7 +271,8 @@ reason_loop:
 
     ; --- Classificar complexidade ---
     EMBED rQueryEmb, rTranscript, rBge                      ; 🔴 modo DIM= (opcode ✅ 0x09)
-    FOREST rClassify, rFeatures, rXgb                       ; ✅ 0x22 (rFeatures indefinido no escopo!)
+    CONCAT rFeatures, rQueryEmb, rTranscript                ; ✅ 0x2F (constrói rFeatures; forma real: rD,rA,rB [+AXIS=])
+    FOREST rClassify, rFeatures, rXgb                       ; ✅ 0x22
     SLICE rComplexity, rClassify, 1, 2                      ; ✅ 0x2E (posicional)
 
     ; --- RAG retrieval ---
@@ -326,8 +327,10 @@ emit_correction:
 
 > Nota de lógica (não só sintaxe): `IF_EQUAL TEACH_MODE, correct_english`
 > compara registradores, não símbolos — o modo professor seria um
-> `LOADI` + `COMPARE` + branch, quando `.data` existir. E `FOREST`
-> lê `rFeatures`, que o programa nunca constrói (`CONCAT` 🟡 Exists).
+> `LOADI` + `COMPARE` + branch, quando `.data` existir. `FOREST`
+> agora recebe `rFeatures` construído pelo `CONCAT` acima (dataflow
+> fechado na listagem; `CONCAT` ✅ 0x2F IMPL — resto do bloco segue
+> alvo V-1/V-2: `.data`, `CALL` com args, `RAG_SEARCH` 🟡).
 > A auditoria acima marca forma; o fluxo de dados precisa do mesmo
 > rigor antes de qualquer fatia promover para `programs/`.
 
