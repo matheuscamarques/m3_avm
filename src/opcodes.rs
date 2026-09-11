@@ -142,6 +142,13 @@ pub const OP_STEPS: u8 = 0x7C; // rD <- instruções retiradas (determinístico)
 // RFC-0038: retrieval (0x50-0x53/0x56-0x57, v1.15; turno 1: ADD/DEL).
 pub const OP_RAG_INDEX_ADD: u8 = 0x50; // anexa vetor (rDb=0 cria; rD <- id/contagem)
 pub const OP_RAG_INDEX_DEL: u8 = 0x51; // remove por id (rD <- restante)
+pub const OP_RAG_SEARCH: u8 = 0x52; // busca top-k (rD <- [1,2*TOPK])
+pub const OP_EMBED_LOOKUP: u8 = 0x53; // bag: média das linhas (rD <- [1,D])
+// Métricas — RAG_SEARCH (payload[2]): namespace próprio (não confundir
+// com DIST_METRIC_*; o mapeamento é explícito no exec).
+pub const RAG_METRIC_COSINE: u8 = 0;
+pub const RAG_METRIC_EUCLID: u8 = 1;
+pub const RAG_METRIC_DOT: u8 = 2;
 // RFC-0025: bloco de conversão (0x67/0x68/0x69, v1.7).
 pub const OP_CAST: u8 = 0x67; // conversão de valor FP32<->F16/BF16/I8/U8
 pub const OP_QUANTIZE: u8 = 0x68; // F32 -> blocos Q4_0/Q8_0
@@ -608,6 +615,8 @@ impl Instruction {
             OP_FOREST => "FOREST",
             OP_RAG_INDEX_ADD => "RAG_INDEX_ADD",
             OP_RAG_INDEX_DEL => "RAG_INDEX_DEL",
+            OP_RAG_SEARCH => "RAG_SEARCH",
+            OP_EMBED_LOOKUP => "EMBED_LOOKUP",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -2506,6 +2515,13 @@ impl Instruction {
         self.payload[2..4].copy_from_slice(&max_depth.to_le_bytes());
         self.payload[4] = mode;
     }
+
+    /// RAG_SEARCH: payload[0..2]=topk u16, [2]=metric (0/1/2).
+    pub fn search_params(&self) -> (u16, u8) {
+        let mut b = [0u8; 2];
+        b.copy_from_slice(&self.payload[0..2]);
+        (u16::from_le_bytes(b), self.payload[2])
+    }
 }
 
 /// FOREST rD, rF, rT, rL [TREES=n] [DEPTH=d] [MODE=VOTE|MEAN]
@@ -2528,6 +2544,24 @@ pub fn instr_rag_index_add(rdest: u8, r_db: u8, r_vec: u8, r_id: u8) -> Instruct
 /// RAG_INDEX_DEL rD, rDb, rId — rD <- contagem restante.
 pub fn instr_rag_index_del(rdest: u8, r_db: u8, r_id: u8) -> Instruction {
     Instruction::new(OP_RAG_INDEX_DEL, 0, rdest, r_db, r_id, 0xFF)
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0038 turno 2: SEARCH (payload[0..2]=topk u16, [2]=metric u8) +
+// LOOKUP (sem payload; tabela [V,D] validada no exec).
+// ---------------------------------------------------------------------------
+
+/// RAG_SEARCH rD, rQuery, rDb [TOPK=n] [METRIC=...] — rD <- [1,2*TOPK].
+pub fn instr_rag_search(rdest: u8, r_query: u8, r_db: u8, topk: u16, metric: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_RAG_SEARCH, 0, rdest, r_query, r_db, 0xFF);
+    instr.payload[0..2].copy_from_slice(&topk.to_le_bytes());
+    instr.payload[2] = metric;
+    instr
+}
+
+/// EMBED_LOOKUP rD, rIds, rTable — rD <- [1,D] média das linhas.
+pub fn instr_embed_lookup(rdest: u8, r_ids: u8, r_table: u8) -> Instruction {
+    Instruction::new(OP_EMBED_LOOKUP, 0, rdest, r_ids, r_table, 0xFF)
 }
 
 /// Detecta uso da faixa V-2 (`0x50-0x53/0x56-0x57`) p/ o bit REQUIRED
@@ -5522,6 +5556,54 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                 return Err(anyhow!("RAG_INDEX_DEL precisa de rdest, rDb, rId — ex: RAG_INDEX_DEL r4, r0, r1"));
             }
             Ok(instr_rag_index_del(
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
+            ))
+        }
+        "RAG_SEARCH" => {
+            // RAG_SEARCH rD, rQuery, rDb [TOPK=n] [METRIC=COSINE|EUCLID|DOT]
+            if parts.len() < 4 {
+                return Err(anyhow!("RAG_SEARCH precisa de rdest, rQuery, rDb — ex: RAG_SEARCH r4, r0, r1 TOPK=3"));
+            }
+            let (mut topk, mut metric) = (1u16, RAG_METRIC_COSINE);
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("TOPK=") {
+                    // Literal u16 ou `.equ` (faixa u16; 0 veta abaixo).
+                    if let Ok(n) = v.parse::<u16>() { topk = n; }
+                    else if let Ok(n) = syms.resolve_const(v) {
+                        topk = u16::try_from(n).map_err(|_| anyhow!("RAG_SEARCH TOPK inválido '{}'", p))?;
+                    }
+                    else { return Err(anyhow!("RAG_SEARCH TOPK inválido '{}'", p)); }
+                } else if let Some(v) = up.strip_prefix("METRIC=") {
+                    metric = match v {
+                        "COSINE" | "0" => RAG_METRIC_COSINE,
+                        "EUCLID" | "1" => RAG_METRIC_EUCLID,
+                        "DOT" | "2" => RAG_METRIC_DOT,
+                        _ => return Err(anyhow!("RAG_SEARCH METRIC inválida '{}' (use COSINE/EUCLID/DOT)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("RAG_SEARCH token desconhecido '{}' (use TOPK=/METRIC=)", p));
+                }
+            }
+            if topk == 0 {
+                return Err(anyhow!("RAG_SEARCH TOPK=0 (explícito; TOPK>=1)"));
+            }
+            Ok(instr_rag_search(
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
+                topk,
+                metric,
+            ))
+        }
+        "EMBED_LOOKUP" => {
+            // EMBED_LOOKUP rD, rIds, rTable (formas extras vetam).
+            if parts.len() != 4 {
+                return Err(anyhow!("EMBED_LOOKUP precisa de rdest, rIds, rTable — ex: EMBED_LOOKUP r4, r0, r1"));
+            }
+            Ok(instr_embed_lookup(
                 parse_reg(parts[1], syms)?,
                 parse_reg(parts[2], syms)?,
                 parse_reg(parts[3], syms)?,

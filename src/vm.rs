@@ -24,7 +24,7 @@ use pollster;
 use crate::opcodes::{
     Instruction, ProgramInstr, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
     OP_COMPARE, OP_CTX_SWITCH, OP_DISTANCE, OP_EMBED, OP_FFN, OP_FORK, OP_GATHER, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
-    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RAG_INDEX_ADD, OP_RAG_INDEX_DEL, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
+    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RAG_INDEX_ADD, OP_RAG_INDEX_DEL, OP_RAG_SEARCH, OP_EMBED_LOOKUP, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
     OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_AUDIO_PCM, SENSE_CODEC_FRAME, SENSE_TOKEN, SENSE_USER_INPUT,
     SENSE_VAD, STREAM_FLAG_BLOCKING, OP_RNG_SEED, OP_RNG_NEXT, OP_RNG_UNIFORM, OP_RNG_NORMAL,
     OP_HASH, OP_CHECKSUM, OP_HMAC, OP_CYCLES_COUNT, OP_TRACE_EVENT, OP_SANITY_CHECK,
@@ -171,6 +171,8 @@ pub struct VmStats {
     pub depformer_execs: u64,
     pub rag_index_add_execs: u64,
     pub rag_index_del_execs: u64,
+    pub rag_search_execs: u64,
+    pub embed_lookup_execs: u64,
     pub call_execs: u64,
     pub ret_execs: u64,
     pub start_ns: u64,
@@ -1412,6 +1414,14 @@ impl Vm {
             }
             OP_RAG_INDEX_DEL => {
                 self.exec_rag_index_del(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RAG_SEARCH => {
+                self.exec_rag_search(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_EMBED_LOOKUP => {
+                self.exec_embed_lookup(ctx_id, instr)?;
                 Ok(true)
             }
             OP_CALL => {
@@ -4157,6 +4167,122 @@ impl Vm {
         }
         self.stats.rag_index_del_execs += 1;
         log_debug("rag", &format!("ctx {} RAG_INDEX_DEL db={} id={} -> restantes {}", ctx_id, db, id, remaining));
+        Ok(())
+    }
+
+    fn exec_rag_search(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::rag::{metric_dist, topk_by_id, RagMetric};
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("RAG_SEARCH precisa de rD, rQuery, rDb (0xFF não é registrador)"));
+        }
+        let (topk_p, metric_p) = instr.search_params();
+        let metric = RagMetric::from_u8(metric_p)?;
+        if topk_p == 0 {
+            return Err(anyhow!("RAG_SEARCH TOPK=0 (explícito; TOPK>=1)"));
+        }
+        let (q_addr, db_val) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let db = u64::try_from(db_val).map_err(|_| anyhow!("RAG_SEARCH: rDb {} fora da faixa u64", db_val))?;
+        if db == 0 {
+            return Err(anyhow!("RAG_SEARCH: rDb 0 (índice inexistente)"));
+        }
+        let q = self.read_dense_vec(q_addr, "RAG_SEARCH")?;
+        if q.iter().any(|x| !x.is_finite()) {
+            return Err(anyhow!("RAG_SEARCH: query não-finita recusada (NaN/Inf)"));
+        }
+        let (dim, vecs, ids) = {
+            let store = self.rag_store.read().map_err(|_| anyhow!("RAG: RwLock envenenado (leitura)"))?;
+            let idx = store.get(db)?;
+            (idx.dim, idx.vectors.clone(), idx.vec_ids.clone())
+        };
+        if q.len() != dim {
+            return Err(anyhow!("RAG_SEARCH: query dim {} != índice dim {}", q.len(), dim));
+        }
+        if vecs.is_empty() {
+            return Err(anyhow!("RAG_SEARCH: índice {} vazio", db));
+        }
+        let topk = topk_p as usize;
+        if topk > ids.len() {
+            return Err(anyhow!("RAG_SEARCH: TOPK={} > tamanho {} (explícito)", topk, ids.len()));
+        }
+        let qnorm2: f32 = q.iter().map(|x| x * x).sum();
+        let n = ids.len();
+        let mut scored = Vec::with_capacity(n);
+        for i in 0..n {
+            let row = &vecs[i * dim..(i + 1) * dim];
+            scored.push((ids[i], metric_dist(metric, &q, row, qnorm2)));
+        }
+        let top = topk_by_id(&scored, topk);
+        // ids cabem em f32 exato até 2^24 (limite do formato de saída).
+        for (id, _) in &top {
+            if *id > (1 << 24) {
+                return Err(anyhow!("RAG_SEARCH: id {} acima de 2^24 (f32 da saída perde precisão)", id));
+            }
+        }
+        let mut out = Vec::with_capacity(2 * topk);
+        out.extend(top.iter().map(|&(_, d)| d));
+        out.extend(top.iter().map(|&(id, _)| id as f32));
+        let out_addr = self.memory.alloc_tensor(&[1, 2 * topk], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.rag_search_execs += 1;
+        log_debug("rag", &format!("ctx {} RAG_SEARCH db={} topk={} metric={:?} -> 0x{:x}", ctx_id, db, topk, metric, out_addr));
+        Ok(())
+    }
+
+    fn exec_embed_lookup(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("EMBED_LOOKUP precisa de rD, rIds, rTable (0xFF não é registrador)"));
+        }
+        let (ids_addr, table_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let ids_raw = self.read_dense_vec(ids_addr, "EMBED_LOOKUP")?;
+        if ids_raw.is_empty() {
+            return Err(anyhow!("EMBED_LOOKUP: lista de ids vazia"));
+        }
+        let tmeta = self.memory.get_tensor_meta(table_addr).cloned()
+            .ok_or_else(|| anyhow!("EMBED_LOOKUP: tabela 0x{:x} não encontrada", table_addr))?;
+        if tmeta.is_sparse || tmeta.shape.len() != 2 {
+            return Err(anyhow!("EMBED_LOOKUP: tabela deve ser densa 2D [V,D], achado {:?}", tmeta.shape));
+        }
+        if tmeta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("EMBED_LOOKUP: dtype {:?} (só F32)", tmeta.dtype));
+        }
+        let (rows, dim) = (tmeta.shape[0], tmeta.shape[1]);
+        if rows == 0 || dim == 0 {
+            return Err(anyhow!("EMBED_LOOKUP: tabela vazia {:?}", tmeta.shape));
+        }
+        let table = self.memory.read_f32_tensor(table_addr, rows * dim)?;
+        let mut acc = vec![0.0f32; dim];
+        for f in &ids_raw {
+            if !f.is_finite() || f.fract() != 0.0 || *f < 0.0 {
+                return Err(anyhow!("EMBED_LOOKUP: id '{}' inválido (inteiro >= 0)", f));
+            }
+            let id = *f as usize;
+            if id >= rows {
+                return Err(anyhow!("EMBED_LOOKUP: id {} fora da tabela (V={})", id, rows));
+            }
+            for d in 0..dim {
+                acc[d] += table[id * dim + d];
+            }
+        }
+        let n = ids_raw.len() as f32;
+        for d in 0..dim {
+            acc[d] /= n;
+        }
+        let out_addr = self.memory.alloc_tensor(&[1, dim], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &acc)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.embed_lookup_execs += 1;
+        log_debug("rag", &format!("ctx {} EMBED_LOOKUP {} ids dim={} -> 0x{:x}", ctx_id, ids_raw.len(), dim, out_addr));
         Ok(())
     }
 
@@ -9213,6 +9339,90 @@ mod tests {
     }
 
     // ---- V-2 turno 1: índice (RFC-0038) --------------------------------
+
+    #[tokio::test]
+    async fn test_rag_search_topk() {
+        use crate::opcodes::assemble;
+        // Banco 4×2 craftado ([1,0],[0,1],[1,1],[2,0]) + query [1,0]:
+        // goldens calculados à mão (empate => menor id).
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(200), ..Default::default() });
+        let v0 = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 0.0]);
+        let v1 = rfc0004_f32(&mut vm, &[1, 2], &[0.0, 1.0]);
+        let v2 = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 1.0]);
+        let v3 = rfc0004_f32(&mut vm, &[1, 2], &[2.0, 0.0]);
+        let q = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 0.0]);
+        let tab = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let ids = rfc0004_f32(&mut vm, &[1, 2], &[0.0, 1.0]);
+        let ids1 = rfc0004_f32(&mut vm, &[1, 1], &[1.0]);
+        let template = "LOADI r0, DB0\nLOADI r1, V0\nLOADI r2, V1\nLOADI r3, V2\nLOADI r4, V3\nLOADI r5, QQ\nLOADI r6, TAB\nLOADI r7, IDS\nLOADI r8, IDS1\nRAG_INDEX_ADD r9, r0, r1\nRAG_INDEX_ADD r10, r9, r2\nRAG_INDEX_ADD r11, r9, r3\nRAG_INDEX_ADD r12, r9, r4\nRAG_SEARCH r13, r5, r9 TOPK=2 METRIC=EUCLID\nRAG_SEARCH r14, r5, r9 TOPK=2 METRIC=DOT\nRAG_SEARCH r15, r5, r9 TOPK=1 METRIC=COSINE\nEMBED_LOOKUP r10, r7, r6\nEMBED_LOOKUP r11, r8, r6\nHALT";
+        let src = template
+            .replace("DB0", "0").replace("V0", &v0.to_string()).replace("V1", &v1.to_string())
+            .replace("V2", &v2.to_string()).replace("V3", &v3.to_string()).replace("QQ", &q.to_string())
+            .replace("TAB", &tab.to_string()).replace("IDS1", &ids1.to_string()).replace("IDS", &ids.to_string());
+        // ^ NOTA: IDS1 antes de IDS (substring); resto sem colisão.
+        let prog = assemble(&src).unwrap();
+        vm.load_program(prog);
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        // EUCLID TOPK=2: dists [0,√2,1,1] -> [(0,0.0),(2,1.0)].
+        let e = ctx.reg(13).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(e, 4).unwrap(), vec![0.0, 1.0, 0.0, 2.0]);
+        // DOT TOPK=2: dists [-1,0,-1,-2] -> [(3,-2.0),(0,-1.0)].
+        let d = ctx.reg(14).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(d, 4).unwrap(), vec![-2.0, -1.0, 3.0, 0.0]);
+        // COSINE TOPK=1: match exato -> [(0,0.0)].
+        let c = ctx.reg(15).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(c, 2).unwrap(), vec![0.0, 0.0]);
+        // LOOKUP: média [0,1] => [2,3]; [1] => [3,4].
+        let l = ctx.reg(10).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(l, 2).unwrap(), vec![2.0, 3.0]);
+        let l1 = ctx.reg(11).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(l1, 2).unwrap(), vec![3.0, 4.0]);
+        assert_eq!(vm.stats.rag_search_execs, 3);
+        assert_eq!(vm.stats.embed_lookup_execs, 2);
+        // Forma default: TOPK=1 COSINE (byte-igual ao explícito).
+        let a = assemble("RAG_SEARCH r4, r0, r1").unwrap();
+        let b = assemble("RAG_SEARCH r4, r0, r1 TOPK=1 METRIC=COSINE").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        // Erros de montagem.
+        assert!(assemble("RAG_SEARCH r4, r0").is_err());
+        assert!(assemble("RAG_SEARCH r4, r0, r1 TOPK=0").is_err());
+        assert!(assemble("RAG_SEARCH r4, r0, r1 TOPK=abc").is_err());
+        assert!(assemble("RAG_SEARCH r4, r0, r1 METRIC=HAMMING").is_err());
+        assert!(assemble("RAG_SEARCH r4, r0, r1 FOO=1").is_err());
+        assert!(assemble("EMBED_LOOKUP r4, r0").is_err());
+        assert!(assemble("EMBED_LOOKUP r4, r0, r1, r2").is_err());
+        // Erros de execução (step direto; run() isola no contexto).
+        {
+            use crate::opcodes::{instr_rag_search, instr_embed_lookup, RAG_METRIC_COSINE};
+            // TOPK>tamanho; store ausente; dim divergente; query NaN.
+            let t9 = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 0.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, t9), (1, 1)]);
+            assert!(vm.step_instruction(cid, &instr_rag_search(4, 0, 1, 9, RAG_METRIC_COSINE)).is_err());
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, t9), (1, 77)]);
+            assert!(vm.step_instruction(cid, &instr_rag_search(4, 0, 1, 1, RAG_METRIC_COSINE)).is_err());
+            let t3 = rfc0004_f32(&mut vm, &[1, 3], &[1.0, 0.0, 0.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, t3), (1, 1)]);
+            assert!(vm.step_instruction(cid, &instr_rag_search(4, 0, 1, 1, RAG_METRIC_COSINE)).is_err());
+            let tn = rfc0004_f32(&mut vm, &[1, 2], &[f32::NAN, 0.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, tn), (1, 1)]);
+            assert!(vm.step_instruction(cid, &instr_rag_search(4, 0, 1, 1, RAG_METRIC_COSINE)).is_err());
+            assert!(vm.step_instruction(cid, &instr_rag_search(4, 0, 1, 1, 9)).is_err());
+            assert!(vm.step_instruction(cid, &instr_rag_search(0xFF, 0, 1, 1, RAG_METRIC_COSINE)).is_err());
+            // LOOKUP: OOB, não-inteiro, tabela 1D, regs 0xFF.
+            let bad = rfc0004_f32(&mut vm, &[1, 1], &[5.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, bad), (1, tab)]);
+            assert!(vm.step_instruction(cid, &instr_embed_lookup(4, 0, 1)).is_err());
+            let frac = rfc0004_f32(&mut vm, &[1, 1], &[0.5]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, frac), (1, tab)]);
+            assert!(vm.step_instruction(cid, &instr_embed_lookup(4, 0, 1)).is_err());
+            let flat = rfc0004_f32(&mut vm, &[4], &[0.0, 1.0, 0.0, 1.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, ids), (1, flat)]);
+            assert!(vm.step_instruction(cid, &instr_embed_lookup(4, 0, 1)).is_err());
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, ids), (1, tab)]);
+            assert!(vm.step_instruction(cid, &instr_embed_lookup(0xFF, 0, 1)).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn test_rag_index_lifecycle() {

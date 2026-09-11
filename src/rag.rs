@@ -36,6 +36,16 @@ impl RagMetric {
     pub fn default() -> Self {
         RagMetric::Cosine
     }
+
+    /// Mapeia o byte de payload (`RAG_METRIC_*`); outro => erro alto.
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(RagMetric::Cosine),
+            1 => Ok(RagMetric::Euclid),
+            2 => Ok(RagMetric::Dot),
+            _ => Err(anyhow!("RAG: METRIC {} inválida (0=COSINE,1=EUCLID,2=DOT)", v)),
+        }
+    }
 }
 
 /// Um índice: dimensão fixada na criação + vetores flat + ids.
@@ -140,6 +150,39 @@ impl IndexStore {
     }
 }
 
+/// Distância query×linha — mesmas fórmulas do `DISTANCE` (EUCLID
+/// sqrt-SSE; COSINE 1-cos com zero-norma => 1.0; DOT negado) e mesma
+/// regra de não-finito => `f32::MAX` (entradas finitas por construção:
+/// ADD recusa `NaN/Inf`, query checada no exec).
+pub fn metric_dist(metric: RagMetric, q: &[f32], row: &[f32], qnorm2: f32) -> f32 {
+    let dist = match metric {
+        RagMetric::Euclid => row.iter().zip(q.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt(),
+        RagMetric::Dot => -row.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>(),
+        RagMetric::Cosine => {
+            let rn: f32 = row.iter().map(|x| x * x).sum();
+            if qnorm2 == 0.0 || rn == 0.0 {
+                1.0
+            } else {
+                let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                1.0 - dot / (qnorm2.sqrt() * rn.sqrt())
+            }
+        }
+    };
+    if dist.is_finite() { dist } else { f32::MAX }
+}
+
+/// Top-k estável: ordena por (dist, id) — empate => menor id primeiro
+/// (precedente DISTANCE, que ordena por índice).
+pub fn topk_by_id(scored: &[(u64, f32)], k: usize) -> Vec<(u64, f32)> {
+    let mut order: Vec<usize> = (0..scored.len()).collect();
+    order.sort_by(|&a, &b| {
+        scored[a].1.partial_cmp(&scored[b].1).unwrap_or(std::cmp::Ordering::Equal)
+            .then(scored[a].0.cmp(&scored[b].0))
+    });
+    order.truncate(k.min(scored.len()));
+    order.iter().map(|&i| scored[i]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +208,22 @@ mod tests {
         assert!(s.add(999, &[1.0, 0.0, 0.0, 0.0], None).is_err());
         assert!(s.create(0).is_err());
         assert!(s.len(999).is_err());
+    }
+
+    #[test]
+    fn metric_tie_break() {
+        // Empate => menor id; fórmulas espelham DISTANCE.
+        let q = [1.0f32, 0.0];
+        let scored = vec![(2u64, metric_dist(RagMetric::Euclid, &q, &[1.0, 1.0], 1.0)), (0u64, metric_dist(RagMetric::Euclid, &q, &[1.0, 1.0], 1.0))];
+        assert_eq!(scored[0].1, scored[1].1);
+        let top = topk_by_id(&scored, 2);
+        assert_eq!(top[0].0, 0);
+        assert_eq!(top[1].0, 2);
+        // Euclid exato no match; cosine exato no match; dot negado.
+        assert_eq!(metric_dist(RagMetric::Euclid, &q, &[1.0, 0.0], 1.0), 0.0);
+        assert_eq!(metric_dist(RagMetric::Cosine, &q, &[1.0, 0.0], 1.0), 0.0);
+        assert_eq!(metric_dist(RagMetric::Dot, &[1.0, 0.0], &[2.0, 0.0], 1.0), -2.0);
+        // Métrica inválida erra.
+        assert!(RagMetric::from_u8(3).is_err());
     }
 }

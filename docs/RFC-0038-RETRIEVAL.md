@@ -104,6 +104,7 @@ nomeados) ou por `UnknownOpcode` — nunca execução parcial.
 |:---|:---|:---|
 | 0038-00 | 2026-09-11 | DRAFT: 6 in-band, `0x54`/`0x55` out, bump v1.15, bit 50 REQUIRED |
 | 0038-01 | 2026-09-11 | TURNO 1: `src/rag.rs` + `0x50/0x51` + bit ligado; SEARCH/LOOKUP/PQ pendentes |
+| 0038-02 | 2026-09-11 | TURNO 2: `0x52/0x53` (métrica núcleo DISTANCE, tie menor-id, ids ≤2^24); PQ pendente |
 
 ---
 *Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*
