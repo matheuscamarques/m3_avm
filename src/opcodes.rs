@@ -211,6 +211,13 @@ pub enum DecodeError {
     /// de 8, <=1MiB).
     #[error("ext_len inválido em ESCAPE: {0}")]
     InvalidExtLen(u64),
+    /// W1-remainder: decoder 64B recebeu menos de 64 bytes.
+    #[error("instrução incompleta: esperado 64 bytes, recebido {0}")]
+    Incomplete64(usize),
+    /// Cabeça ESCAPE 0xB0: exige layout ext_len ([R] §3.2), não decode
+    /// 64B plano.
+    #[error("cabeça ESCAPE 0x{0:02x}: exige layout ext_len, não decode 64B plano")]
+    EscapeHead(u8),
 }
 
 /// Largura de instrução por opcode (RFC-0002, ESPEC-V2 §4.3).
@@ -545,6 +552,145 @@ impl std::fmt::Display for Instruction {
             self.rsrc2,
             self.rsrc3,
             &self.payload[..8]
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instrução 64B (ESPEC-V2 §4.2, W1-remainder). Representação decodificada
+// das formas estendidas 0x80-0xAF/0xB4-0xB6. Nomes/mnemonics chegam com as
+// RFCs das Fases 7/9 — até lá, o dispatch rejeita com erro nomeado.
+// ---------------------------------------------------------------------------
+
+/// Instrução 64B decodificada (layout §4.2, tudo LE):
+/// `[0-1]` opcode/flags (canônico, §5) · `[2-7]` rdest/rsrc1-5 ·
+/// `[8-15]` LAMPORT u64 (0=local) · `[16-23]` DEADLINE u64 (MAX=best-effort) ·
+/// `[24-31]` PAYLOAD_EXT (HMAC/RDMA/checksum, 0=none) ·
+/// `[32-63]` PAYLOAD_CORE (32B, por opcode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Instr64 {
+    pub opcode: u8,
+    pub flags: u8,
+    pub rdest: u8,
+    pub rsrc: [u8; 5],
+    pub lamport: u64,
+    pub deadline: u64,
+    pub payload_ext: [u8; 8],
+    pub payload_core: [u8; 32],
+}
+
+impl Instr64 {
+    /// Construtor com extensão neutra (R4: LAMPORT=0, DEADLINE=MAX,
+    /// PAYLOAD_EXT=0) e núcleo zerado.
+    pub fn new(opcode: u8, rdest: u8, rsrc: [u8; 5]) -> Self {
+        Self {
+            opcode,
+            flags: 0,
+            rdest,
+            rsrc,
+            lamport: 0,
+            deadline: u64::MAX,
+            payload_ext: [0u8; 8],
+            payload_core: [0u8; 32],
+        }
+    }
+
+    /// Decodifica 64 bytes. Aceita SOMENTE `Fixed64` plano (0x80-0xAF,
+    /// 0xB4-0xB6); 0xB0 (cabeça ESCAPE), 0xB1/B2/B3, reservados e opcodes
+    /// 32B são rejeitados com erro nomeado — nunca misdecodificados.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < INSTR_SIZE_64 {
+            return Err(DecodeError::Incomplete64(bytes.len()));
+        }
+        let op = bytes[0];
+        if op == 0xB0 {
+            return Err(DecodeError::EscapeHead(op));
+        }
+        match instr_width(op) {
+            InstrWidth::Fixed64 => {}
+            InstrWidth::Reserved => return Err(DecodeError::ReservedOpcode(op)),
+            _ => return Err(DecodeError::UnsupportedWidth(op)),
+        }
+        let mut rsrc = [0u8; 5];
+        rsrc.copy_from_slice(&bytes[3..8]);
+        let mut lamport_b = [0u8; 8];
+        lamport_b.copy_from_slice(&bytes[8..16]);
+        let mut deadline_b = [0u8; 8];
+        deadline_b.copy_from_slice(&bytes[16..24]);
+        let mut payload_ext = [0u8; 8];
+        payload_ext.copy_from_slice(&bytes[24..32]);
+        let mut payload_core = [0u8; 32];
+        payload_core.copy_from_slice(&bytes[32..64]);
+        let ins = Self {
+            opcode: op,
+            flags: bytes[1],
+            rdest: bytes[2],
+            rsrc,
+            lamport: u64::from_le_bytes(lamport_b),
+            deadline: u64::from_le_bytes(deadline_b),
+            payload_ext,
+            payload_core,
+        };
+        ins.validate()?;
+        Ok(ins)
+    }
+
+    /// Codifica para 64 bytes (inverso exato de `decode`).
+    pub fn encode(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[0] = self.opcode;
+        out[1] = self.flags;
+        out[2] = self.rdest;
+        out[3..8].copy_from_slice(&self.rsrc);
+        out[8..16].copy_from_slice(&self.lamport.to_le_bytes());
+        out[16..24].copy_from_slice(&self.deadline.to_le_bytes());
+        out[24..32].copy_from_slice(&self.payload_ext);
+        out[32..64].copy_from_slice(&self.payload_core);
+        out
+    }
+
+    /// Largura em bytes (sempre 64; existe para o stride do fetch ser
+    /// table-driven quando a VM ganhar o programa de largura mista).
+    pub fn byte_len(&self) -> usize {
+        INSTR_SIZE_64
+    }
+
+    /// Extensão neutra (R4: equivalência semântica com a forma básica).
+    pub fn has_neutral_ext(&self) -> bool {
+        self.lamport == 0 && self.deadline == u64::MAX && self.payload_ext == [0u8; 8]
+    }
+
+    /// Nomes chegam com as RFCs das Fases 7/9. Até lá: UNKNOWN honesto.
+    pub fn mnemonic(&self) -> &'static str {
+        "UNKNOWN"
+    }
+
+    /// Valida registradores (0..15 ou 0xFF para unused/descarte).
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.rdest != 0xFF && self.rdest >= 16 {
+            return Err(DecodeError::InvalidRegister(self.rdest));
+        }
+        for r in self.rsrc {
+            if r != 0xFF && r >= 16 {
+                return Err(DecodeError::InvalidRegister(r));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Instr64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "X_{:02x} flags=0x{:02x} rdest=r{} rsrc={:?} lamport={} deadline={} core={:02x?}",
+            self.opcode,
+            self.flags,
+            self.rdest,
+            self.rsrc,
+            self.lamport,
+            self.deadline,
+            &self.payload_core[..8]
         )
     }
 }
@@ -3188,6 +3334,90 @@ mod tests {
                 bad
             );
         }
+    }
+
+    // ---- W1-remainder: instrução 64B (ESPEC-V2 §4.2) --------------------
+
+    fn sample_instr64() -> Instr64 {
+        let mut ins = Instr64::new(0x84, 3, [0, 1, 2, 0xFF, 0xFF]);
+        ins.flags = 0b0010_0001;
+        ins.lamport = 7;
+        ins.deadline = 1_000_000;
+        ins.payload_ext = [9u8, 8, 7, 6, 5, 4, 3, 2];
+        ins.payload_core[0] = 0xAA;
+        ins.payload_core[31] = 0x55;
+        ins
+    }
+
+    #[test]
+    fn test_instr64_roundtrip() {
+        let ins = sample_instr64();
+        let bytes = ins.encode();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes[0], 0x84);
+        assert_eq!(bytes[1], 0b0010_0001);
+        assert_eq!(bytes[2], 3);
+        assert_eq!(&bytes[3..8], &[0, 1, 2, 0xFF, 0xFF]);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 1_000_000);
+        assert_eq!(&bytes[24..32], &[9u8, 8, 7, 6, 5, 4, 3, 2]);
+        assert_eq!(bytes[32], 0xAA);
+        assert_eq!(bytes[63], 0x55);
+        let back = Instr64::decode(&bytes).unwrap();
+        assert_eq!(back, ins);
+        assert_eq!(back.encode(), bytes); // byte-idêntico
+        assert_eq!(back.byte_len(), 64);
+    }
+
+    #[test]
+    fn test_instr64_new_neutral() {
+        let ins = Instr64::new(0x80, 0xFF, [0xFF; 5]);
+        assert!(ins.has_neutral_ext()); // R4-ready
+        assert!(!sample_instr64().has_neutral_ext());
+        assert_eq!(ins.mnemonic(), "UNKNOWN"); // nomes chegam nas RFCs
+        assert!(ins.validate().is_ok());
+    }
+
+    #[test]
+    fn test_instr64_rejections() {
+        // Curto => Incomplete64 (não o Incomplete de 32B).
+        assert!(matches!(Instr64::decode(&[0u8; 63]), Err(DecodeError::Incomplete64(63))));
+        assert!(matches!(Instr64::decode(&[]), Err(DecodeError::Incomplete64(0))));
+        // Opcode 32B => UnsupportedWidth (não misdecode como 64B).
+        let mut b32 = [0u8; 64];
+        b32[0] = 0x01;
+        assert!(matches!(Instr64::decode(&b32), Err(DecodeError::UnsupportedWidth(0x01))));
+        // 0xFF (sempre 32B, R2) também rejeita no decoder 64B.
+        let mut bff = [0u8; 64];
+        bff[0] = 0xFF;
+        assert!(matches!(Instr64::decode(&bff), Err(DecodeError::UnsupportedWidth(0xFF))));
+        // Reservado => ReservedOpcode, sem tamanho assumido.
+        let mut br = [0u8; 64];
+        br[0] = 0xB7;
+        assert!(matches!(Instr64::decode(&br), Err(DecodeError::ReservedOpcode(0xB7))));
+        // Cabeça ESCAPE 0xB0 => layout próprio, não plano.
+        let mut be = [0u8; 64];
+        be[0] = 0xB0;
+        assert!(matches!(Instr64::decode(&be), Err(DecodeError::EscapeHead(0xB0))));
+        // 0xB1/0xB2/0xB3 têm larguras próprias.
+        for op in [0xB1u8, 0xB2, 0xB3] {
+            let mut b = [0u8; 64];
+            b[0] = op;
+            assert!(Instr64::decode(&b).is_err(), "op 0x{:02x} não é 64B plano", op);
+        }
+        // Registrador inválido => InvalidRegister (rdest e rsrc).
+        let mut bad = sample_instr64().encode();
+        bad[2] = 16;
+        assert!(matches!(Instr64::decode(&bad), Err(DecodeError::InvalidRegister(16))));
+        let mut bad2 = sample_instr64().encode();
+        bad2[5] = 42;
+        assert!(matches!(Instr64::decode(&bad2), Err(DecodeError::InvalidRegister(42))));
+    }
+
+    #[test]
+    fn test_instr64_display() {
+        let s = format!("{}", sample_instr64());
+        assert!(s.contains("X_84"), "display deve mostrar opcode: {}", s);
     }
 
     // ---- RFC-0004: GATHER / DISTANCE / RANK1_UPDATE ---------------------
