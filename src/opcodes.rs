@@ -2557,13 +2557,47 @@ fn reject_unknown(op: &str, rest: &[&str], known: &[&str]) -> Result<()> {
 
 pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruction>> {
     let mut labels: HashMap<String, u128> = HashMap::new();
+    let mut syms = SymbolTable::new();
     let mut instr_lines: Vec<(usize, String)> = Vec::new();
 
-    // Passo 1: Varredura de rótulos e mapeamento de instruções
+    // Passo 1: Varredura de rótulos, diretivas `.reg` e mapeamento
     for (lineno, raw) in text.lines().enumerate() {
         let mut line = strip_comment(raw).trim();
         if line.is_empty() {
             continue;
+        }
+
+        // Diretiva `.reg <nome> <rN>` (RFC-0036): vincula apelido
+        // simbólico a registrador físico. Não emite instrução.
+        // Qualquer outra linha com ponto inicial cai no erro padrão
+        // de opcode desconhecido (nada afrouxado).
+        {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if !words.is_empty() && words[0].eq_ignore_ascii_case(".reg") {
+                if words.len() != 3 {
+                    return Err(anyhow!(
+                        "linha {}: `.reg` precisa de nome e registrador — ex: `.reg rTranscript r0` — '{}'",
+                        lineno + 1,
+                        line
+                    ));
+                }
+                let name = words[1].trim_end_matches(',').to_lowercase();
+                let name = name.strip_prefix('r').ok_or_else(|| {
+                    anyhow!("linha {}: nome simbólico deve começar com 'r' — '{}'", lineno + 1, line)
+                })?;
+                if name.is_empty()
+                    || !name.bytes().next().map_or(false, |b| b.is_ascii_alphabetic() || b == b'_')
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(anyhow!("linha {}: nome simbólico inválido '{}'", lineno + 1, words[1]));
+                }
+                let phys = words[2].trim_end_matches(',').trim_start_matches('r');
+                let reg: u8 = phys.parse().map_err(|_| {
+                    anyhow!("linha {}: registrador físico inválido '{}' (use r0..r15)", lineno + 1, words[2])
+                })?;
+                syms.declare(name, reg).map_err(|e| anyhow!("linha {}: {}", lineno + 1, e))?;
+                continue;
+            }
         }
 
         // Verifica se há rótulo no início da linha (ex: "MAIN_LOOP:" ou "MAIN_LOOP: SENSE ...")
@@ -2581,10 +2615,10 @@ pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruct
         }
     }
 
-    // Passo 2: Montagem com resolução de rótulos
+    // Passo 2: Montagem com resolução de rótulos (+ símbolos do Passo 1)
     let mut out = Vec::with_capacity(instr_lines.len());
     for (lineno, line) in instr_lines {
-        let instr = parse_line(&line, &labels).map_err(|e| anyhow!("linha {}: {} — '{}'", lineno, e, line))?;
+        let instr = parse_line(&line, &labels, &mut syms).map_err(|e| anyhow!("linha {}: {} — '{}'", lineno, e, line))?;
         out.push(instr);
     }
     Ok(out)
@@ -2602,20 +2636,79 @@ fn strip_comment(s: &str) -> &str {
     &s[..end]
 }
 
-fn parse_reg(tok: &str) -> Result<u8> {
+/// Tabela de símbolos do assembler (RFC-0036, passo V-1 do PLANO_VISAO).
+/// Apelidos simbólicos (`rTranscript`) vinculados EXPLICITAMENTE via
+/// diretiva `.reg` a um dos 16 GPRs normativos (R5: sem R255, sem
+/// faixas, sem container). Uso sem declaração continua erro — a
+/// auto-alocação foi deliberadamente rejeitada para preservar o gate
+/// do RFC-0008 (typo em posição de registrador deve falhar, ex.
+/// `SANITY_CHECK r4, r0, FOO`). Determinístico; tabela nova por chamada.
+#[derive(Debug, Default)]
+struct SymbolTable {
+    map: HashMap<String, u8>,
+    used: [bool; 16],
+}
+
+impl SymbolTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Vincula `name` (já em minúsculas, com o `r` inicial removido) ao
+    /// registrador físico `reg`. Nome repetido ou físico ocupado: erro.
+    fn declare(&mut self, name: &str, reg: u8) -> Result<()> {
+        if self.map.contains_key(name) {
+            return Err(anyhow!("símbolo '{}' redeclarado (uma definição por arquivo)", name));
+        }
+        if reg >= 16 {
+            return Err(anyhow!("registrador físico r{} fora de 0..15", reg));
+        }
+        if self.used[reg as usize] {
+            return Err(anyhow!("registrador físico r{} já vinculado (sem alias implícito)", reg));
+        }
+        self.used[reg as usize] = true;
+        self.map.insert(name.to_string(), reg);
+        Ok(())
+    }
+
+    /// Resolve nome declarado. Desconhecido => erro que sugere `.reg`
+    /// (nunca aloca sozinho: RFC-0008 acima de conveniência).
+    fn resolve(&self, name: &str) -> Result<u8> {
+        self.map.get(name).copied().ok_or_else(|| {
+            anyhow!(
+                "símbolo '{}' não declarado (declare com `.reg {} rN`)",
+                name,
+                name
+            )
+        })
+    }
+}
+
+fn parse_reg(tok: &str, syms: &SymbolTable) -> Result<u8> {
     let t = tok.trim().trim_end_matches(',').to_lowercase();
     if t == "_" || t == "x" || t == "-" || t == "ff" {
         return Ok(0xFF);
     }
     let t = t.trim_start_matches('r');
-    let n: u8 = t.parse().map_err(|_| anyhow!("registrador inválido '{}'", tok))?;
-    if n >= 16 {
-        return Err(anyhow!("registrador r{} fora de 0..15", n));
+    // Caminho legado: numérico (quirks preservados, ex. "rr1").
+    if let Ok(n) = t.parse::<u8>() {
+        if n >= 16 {
+            return Err(anyhow!("registrador r{} fora de 0..15", n));
+        }
+        return Ok(n);
     }
-    Ok(n)
+    // Novo (RFC-0036): simbólico r+identificador previamente declarado.
+    // Formas inválidas ("r1x", "r", "rfoo-bar") erram como antes.
+    let is_ident = !t.is_empty()
+        && t.bytes().next().map_or(false, |b| b.is_ascii_alphabetic() || b == b'_')
+        && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if is_ident {
+        return syms.resolve(t);
+    }
+    Err(anyhow!("registrador inválido '{}'", tok))
 }
 
-fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction> {
+fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable) -> Result<Instruction> {
     // Normaliza vírgulas -> espaços
     let normalized = line.replace(',', " ");
     let parts: Vec<&str> = normalized.split_whitespace().collect();
@@ -2632,7 +2725,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 2 {
                 return Err(anyhow!("TENSOR precisa de rdest"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             // Tenta detectar forma com shape literal
             // Helper para detectar SPARSE/DENSITY nos tokens restantes
             let detect_sparse = |parts: &[&str]| -> (bool, f32) {
@@ -2711,8 +2804,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             // Forma com registradores
-            let rsrc1 = if parts.len() > 2 { parse_reg(parts[2])? } else { 0xFF };
-            let rsrc2 = if parts.len() > 3 { parse_reg(parts[3])? } else { 0xFF };
+            let rsrc1 = if parts.len() > 2 { parse_reg(parts[2], syms)? } else { 0xFF };
+            let rsrc2 = if parts.len() > 3 { parse_reg(parts[3], syms)? } else { 0xFF };
             // Tenta extrair payload rows/cols/dtype se houver tokens extras
             let mut rows = 2u64;
             let mut cols = 2u64;
@@ -2759,10 +2852,10 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 5 {
                 return Err(anyhow!("ATTN precisa de rdest, rQ, rK, rV — ex: ATTN r3, r0, r1, r2"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rq = parse_reg(parts[2])?;
-            let rk = parse_reg(parts[3])?;
-            let rv = parse_reg(parts[4])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rq = parse_reg(parts[2], syms)?;
+            let rk = parse_reg(parts[3], syms)?;
+            let rv = parse_reg(parts[4], syms)?;
             let notify = if parts.len() > 5 {
                 parts[5..].iter().any(|p| {
                     let up = p.to_ascii_uppercase();
@@ -2782,14 +2875,14 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("STREAM precisa de r_src, r_sink"));
             }
-            let rsrc = parse_reg(parts[1])?;
+            let rsrc = parse_reg(parts[1], syms)?;
             // Suporta periféricos simbólicos: INPUT (1), SAMPLE (2), DECODED (4), OUTPUT (0)
             let rsink = match parts[2].to_ascii_uppercase().as_str() {
                 "INPUT" | "PERIPHERAL_INPUT" | "1" => 1,
                 "SAMPLE" | "PERIPHERAL_SAMPLE" | "2" => 2,
                 "DECODED" | "OUTPUT_DECODED" | "PERIPHERAL_OUTPUT_DECODED" | "4" => 4,
                 "OUTPUT" | "PERIPHERAL_OUTPUT" | "0" => 0,
-                _ => parse_reg(parts[2])?,
+                _ => parse_reg(parts[2], syms)?,
             };
             let blocking = if parts.len() > 3 {
                 // RFC-0008: modo deve ser explícito; qualquer outra coisa
@@ -2811,7 +2904,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("FORK precisa de rdest, prioridade (RED/BLUE/GREEN) ou rótulo"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let second = parts[2].to_ascii_uppercase();
 
             // Se segundo argumento é um rótulo conhecido (ex: FORK R12, MAIN_LOOP, GREEN)
@@ -2859,8 +2952,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("ABORT precisa de r_target, r_timestamp"));
             }
-            let rt = parse_reg(parts[1])?;
-            let ts = parse_reg(parts[2])?;
+            let rt = parse_reg(parts[1], syms)?;
+            let ts = parse_reg(parts[2], syms)?;
             if parts.len() > 3 {
                 reject_unknown("ABORT", &parts[3..], &[])?;
             }
@@ -2870,7 +2963,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("SENSE precisa de rdest, periférico (AUDIO/VAD/TOKEN/USER_INPUT/AUDIO_PCM/CODEC_FRAME/0/1/3/5/6/7)"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let periph = match parts[2].to_ascii_uppercase().as_str() {
                 "AUDIO" | "0" => SENSE_AUDIO,
                 "VAD" | "1" => SENSE_VAD,
@@ -2897,10 +2990,10 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("NORM precisa de rdest, r_src, r_gamma — ex: NORM r2, r0, r1, r3"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rsrc = parse_reg(parts[2])?;
-            let rgamma = if parts.len() > 3 { parse_reg(parts[3])? } else { 0xFF };
-            let rbeta = if parts.len() > 4 { parse_reg(parts[4])? } else { 0xFF };
+            let rdest = parse_reg(parts[1], syms)?;
+            let rsrc = parse_reg(parts[2], syms)?;
+            let rgamma = if parts.len() > 3 { parse_reg(parts[3], syms)? } else { 0xFF };
+            let rbeta = if parts.len() > 4 { parse_reg(parts[4], syms)? } else { 0xFF };
             if parts.len() > 5 {
                 reject_unknown("NORM", &parts[5..], &[])?;
             }
@@ -2910,25 +3003,25 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("FFN precisa de rdest, r_src, r_w1, r_w2 — ex: FFN r3, r0, r1, r2 ou FFN r3, r0, r1, r4, r2, r5 (com bias)"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rsrc = parse_reg(parts[2])?;
-            let rw1 = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rsrc = parse_reg(parts[2], syms)?;
+            let rw1 = parse_reg(parts[3], syms)?;
             if parts.len() >= 7 {
-                let rb1 = parse_reg(parts[4])?;
-                let rw2 = parse_reg(parts[5])?;
-                let rb2 = parse_reg(parts[6])?;
+                let rb1 = parse_reg(parts[4], syms)?;
+                let rw2 = parse_reg(parts[5], syms)?;
+                let rb2 = parse_reg(parts[6], syms)?;
                 if parts.len() > 7 {
                     reject_unknown("FFN", &parts[7..], &[])?;
                 }
                 Ok(instr_ffn_with_bias(rdest, rsrc, rw1, rb1, rw2, rb2))
             } else if parts.len() == 6 {
-                let rw2 = parse_reg(parts[4])?;
-                let maybe_rb = parse_reg(parts[5])?;
+                let rw2 = parse_reg(parts[4], syms)?;
+                let maybe_rb = parse_reg(parts[5], syms)?;
                 let mut instr = instr_ffn(rdest, rsrc, rw1, rw2);
                 instr.payload[1] = maybe_rb;
                 Ok(instr)
             } else {
-                let rw2 = parse_reg(parts[4])?;
+                let rw2 = parse_reg(parts[4], syms)?;
                 Ok(instr_ffn(rdest, rsrc, rw1, rw2))
             }
         }
@@ -2936,9 +3029,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("EMBED precisa de rdest, r_token, r_table — ex: EMBED r10, r11, r1"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rtoken = parse_reg(parts[2])?;
-            let rtable = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rtoken = parse_reg(parts[2], syms)?;
+            let rtable = parse_reg(parts[3], syms)?;
             if parts.len() > 4 {
                 reject_unknown("EMBED", &parts[4..], &[])?;
             }
@@ -2948,9 +3041,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("ADD precisa de rdest, r_src1, r_src2 — ex: ADD r10, r10, r14"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rsrc1 = parse_reg(parts[2])?;
-            let rsrc2 = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rsrc1 = parse_reg(parts[2], syms)?;
+            let rsrc2 = parse_reg(parts[3], syms)?;
             if parts.len() > 4 {
                 reject_unknown("ADD", &parts[4..], &[])?;
             }
@@ -2960,8 +3053,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("SAMPLE precisa de rdest, r_logits — ex: SAMPLE r11, r15"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rlogits = parse_reg(parts[2])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rlogits = parse_reg(parts[2], syms)?;
             let mut temp = 1.0f32;
             let mut topk = 0u16;
             for p in &parts[3..] {
@@ -2990,11 +3083,11 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("COMPARE precisa de r_src1, r_src2/imediato — ex: COMPARE r11, EOS_TOKEN"));
             }
-            let rsrc1 = parse_reg(parts[1])?;
+            let rsrc1 = parse_reg(parts[1], syms)?;
             let second = parts[2].to_ascii_uppercase();
             let mut instr = if second == "EOS_TOKEN" {
                 instr_compare(rsrc1, 0xFF, EOS_TOKEN_DEFAULT)
-            } else if let Ok(r2) = parse_reg(parts[2]) {
+            } else if let Ok(r2) = parse_reg(parts[2], syms) {
                 instr_compare(rsrc1, r2, 0)
             } else if let Ok(n) = parts[2].parse::<u128>() {
                 instr_compare(rsrc1, 0xFF, n)
@@ -3051,7 +3144,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para IF_INTERRUPT", label))?;
                 Ok(instr_if_interrupt(0xFF, target_pc))
             } else if parts.len() >= 3 {
-                let rcond = parse_reg(parts[1])?;
+                let rcond = parse_reg(parts[1], syms)?;
                 let label = parts[2].to_ascii_uppercase();
                 let target_pc = *labels.get(&label)
                     .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para IF_INTERRUPT", label))?;
@@ -3067,9 +3160,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("MATVEC precisa de rdest, r_x, r_w — ex: MATVEC r2, r0, r1"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rx = parse_reg(parts[2])?;
-            let rw = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rx = parse_reg(parts[2], syms)?;
+            let rw = parse_reg(parts[3], syms)?;
             if parts.len() > 4 {
                 reject_unknown("MATVEC", &parts[4..], &[])?;
             }
@@ -3079,9 +3172,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("MUL precisa de rdest, r1, r2 — ex: MUL r6, r6, r7"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let r1 = parse_reg(parts[2])?;
-            let r2 = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let r1 = parse_reg(parts[2], syms)?;
+            let r2 = parse_reg(parts[3], syms)?;
             if parts.len() > 4 {
                 reject_unknown("MUL", &parts[4..], &[])?;
             }
@@ -3091,8 +3184,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("SILU precisa de rdest, rsrc — ex: SILU r6, r6"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rsrc = parse_reg(parts[2])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rsrc = parse_reg(parts[2], syms)?;
             if parts.len() > 3 {
                 reject_unknown("SILU", &parts[3..], &[])?;
             }
@@ -3103,10 +3196,10 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 5 {
                 return Err(anyhow!("SSM_SCAN precisa de rdest, r_x, r_h, r_params — ex: SSM_SCAN r5, r0, r1, r2 D_INNER=8 D_STATE=4"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rx = parse_reg(parts[2])?;
-            let rh = parse_reg(parts[3])?;
-            let rp = parse_reg(parts[4])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rx = parse_reg(parts[2], syms)?;
+            let rh = parse_reg(parts[3], syms)?;
+            let rp = parse_reg(parts[4], syms)?;
             let (mut di, mut ds, mut layer) = (1usize, 1usize, 0u8);
             let mut flags = 0u8;
             for p in &parts[5..] {
@@ -3127,7 +3220,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 2 {
                 return Err(anyhow!("SSM_RESET precisa de r_h — ex: SSM_RESET r1"));
             }
-            let rh = parse_reg(parts[1])?;
+            let rh = parse_reg(parts[1], syms)?;
             let (mut di, mut ds, mut layer) = (1usize, 1usize, 0u8);
             for p in &parts[2..] {
                 let up = p.to_ascii_uppercase();
@@ -3143,8 +3236,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("CODEC_ENC precisa de rdest, r_pcm — ex: CODEC_ENC r2, r0"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rpcm = parse_reg(parts[2])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rpcm = parse_reg(parts[2], syms)?;
             let as_tensor = parts[3..].iter().any(|p| p.to_ascii_uppercase() == "TENSOR");
             if !as_tensor && !parts[3..].is_empty() {
                 reject_unknown("CODEC_ENC", &parts[3..], &["TENSOR"])?;
@@ -3156,8 +3249,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("CODEC_DEC precisa de rdest, r_codes — ex: CODEC_DEC r3, r2"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rc = parse_reg(parts[2])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rc = parse_reg(parts[2], syms)?;
             let as_tensor = parts[3..].iter().any(|p| p.to_ascii_uppercase() == "TENSOR");
             if !as_tensor && !parts[3..].is_empty() {
                 reject_unknown("CODEC_DEC", &parts[3..], &["TENSOR"])?;
@@ -3169,9 +3262,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("AUDIO_ALIGN precisa de rdest, r_user, r_ai — ex: AUDIO_ALIGN r4, r0, r1"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let ru = parse_reg(parts[2])?;
-            let ra = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let ru = parse_reg(parts[2], syms)?;
+            let ra = parse_reg(parts[3], syms)?;
             let (mut sr, mut spf, mut hz, mut dl) = (24_000u32, 1920u32, 12.5f32, 160.0f32);
             for p in &parts[4..] {
                 let up = p.to_ascii_uppercase();
@@ -3197,7 +3290,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 _ => {
                     // RFC-0008: pipe desconhecido é erro (antes: silenciosamente
                     // TRANSFORMER, a menos que fosse registrador válido legado).
-                    if parse_reg(parts[1]).is_ok() {
+                    if parse_reg(parts[1], syms).is_ok() {
                         return Err(anyhow!("CTX_SWITCH pipe '{}' deve ser MAMBA/TRANSFORMER/AUDIO (forma legado por registrador removida no modo estrito)", parts[1]));
                     } else {
                         return Err(anyhow!("CTX_SWITCH pipe '{}' inválido (use MAMBA/TRANSFORMER/AUDIO)", parts[1]));
@@ -3220,8 +3313,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("ROPE precisa de rdest, rsrc — ex: ROPE r2, r0 POS=0 HDIM=8 NHEADS=2"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rsrc = parse_reg(parts[2])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rsrc = parse_reg(parts[2], syms)?;
             let (mut pos, mut hd, mut nh, mut theta) = (0u32, 2usize, 1usize, 10_000.0f32);
             let mut inplace = false;
             for p in &parts[3..] {
@@ -3243,9 +3336,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("GATHER precisa de rdest, rTable, rIdx — ex: GATHER r5, r0, r1 AXIS=0"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rtable = parse_reg(parts[2])?;
-            let ridx = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rtable = parse_reg(parts[2], syms)?;
+            let ridx = parse_reg(parts[3], syms)?;
             let (mut axis, mut mode, mut racc) = (0u8, GATHER_MODE_GATHER, 0xFF);
             let mut rpos = 4;
             if op == "SCATTER_ADD" {
@@ -3257,7 +3350,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 let is_kv = up.contains('=') || up == "AXIS" || up == "MODE"
                     || up.starts_with("AXIS=") || up.starts_with("MODE=");
                 if !is_kv {
-                    if let Ok(r) = parse_reg(parts[rpos]) {
+                    if let Ok(r) = parse_reg(parts[rpos], syms) {
                         racc = r;
                         rpos += 1;
                     }
@@ -3286,9 +3379,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("DISTANCE precisa de rdest, rQuery, rBank — ex: DISTANCE r5, r0, r1 METRIC=COSINE TOPK=5"));
             }
-            let rdest = parse_reg(parts[1])?;
-            let rquery = parse_reg(parts[2])?;
-            let rbank = parse_reg(parts[3])?;
+            let rdest = parse_reg(parts[1], syms)?;
+            let rquery = parse_reg(parts[2], syms)?;
+            let rbank = parse_reg(parts[3], syms)?;
             let (mut metric, mut topk) = (DIST_METRIC_EUCLID, 0u16);
             for p in &parts[4..] {
                 let up = p.to_ascii_uppercase();
@@ -3314,9 +3407,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 4 {
                 return Err(anyhow!("RANK1_UPDATE precisa de rH, rV, rK — ex: RANK1_UPDATE rH, r1, r2 ALPHA=0.99 BETA=1.0"));
             }
-            let rh = parse_reg(parts[1])?;
-            let rv = parse_reg(parts[2])?;
-            let rk = parse_reg(parts[3])?;
+            let rh = parse_reg(parts[1], syms)?;
+            let rv = parse_reg(parts[2], syms)?;
+            let rk = parse_reg(parts[3], syms)?;
             let (mut alpha, mut beta, mut mode, mut layer) = (1.0f32, 1.0f32, RANK1_MODE_HEBBIAN, 0u8);
             for p in &parts[4..] {
                 let up = p.to_ascii_uppercase();
@@ -3354,7 +3447,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if up == "DEFAULT" {
                 Ok(instr_rng_seed(0xFF))
             } else {
-                Ok(instr_rng_seed(parse_reg(parts[1])?))
+                Ok(instr_rng_seed(parse_reg(parts[1], syms)?))
             }
         }
         "RNG_NEXT" => {
@@ -3364,14 +3457,14 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("RNG_NEXT", &parts[2..], &[])?;
             }
-            Ok(instr_rng_next(parse_reg(parts[1])?))
+            Ok(instr_rng_next(parse_reg(parts[1], syms)?))
         }
         "RNG_UNIFORM" => {
             // RNG_UNIFORM rD [A=a] [B=b]
             if parts.len() < 2 {
                 return Err(anyhow!("RNG_UNIFORM precisa de rdest"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let (mut a, mut b) = (0.0f32, 1.0f32);
             for p in &parts[2..] {
                 let up = p.to_ascii_uppercase();
@@ -3392,7 +3485,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 2 {
                 return Err(anyhow!("RNG_NORMAL precisa de rdest"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let (mut mean, mut std) = (0.0f32, 1.0f32);
             for p in &parts[2..] {
                 let up = p.to_ascii_uppercase();
@@ -3415,7 +3508,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 3 {
                 reject_unknown("HASH", &parts[3..], &[])?;
             }
-            Ok(instr_hash(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_hash(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "CHECKSUM" => {
             if parts.len() < 3 {
@@ -3424,7 +3517,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 3 {
                 reject_unknown("CHECKSUM", &parts[3..], &[])?;
             }
-            Ok(instr_checksum(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_checksum(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "HMAC" => {
             if parts.len() < 4 {
@@ -3433,7 +3526,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 4 {
                 reject_unknown("HMAC", &parts[4..], &[])?;
             }
-            Ok(instr_hmac(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?))
+            Ok(instr_hmac(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?))
         }
         "CYCLES_COUNT" => {
             if parts.len() < 2 {
@@ -3442,7 +3535,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("CYCLES_COUNT", &parts[2..], &[])?;
             }
-            Ok(instr_cycles_count(parse_reg(parts[1])?))
+            Ok(instr_cycles_count(parse_reg(parts[1], syms)?))
         }
         "TRACE_EVENT" => {
             if parts.len() < 3 {
@@ -3451,7 +3544,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 3 {
                 reject_unknown("TRACE_EVENT", &parts[3..], &[])?;
             }
-            Ok(instr_trace_event(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_trace_event(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "SANITY_CHECK" => {
             // SANITY_CHECK rD, rT [, rCount]
@@ -3461,14 +3554,14 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             // RFC-0008: 4º token, se presente, DEVE ser registrador (antes:
             // lixo silenciosamente virava 0xFF = sem contagem).
             let rcount = if parts.len() > 3 {
-                parse_reg(parts[3]).map_err(|_| anyhow!("SANITY_CHECK 4º operando '{}' inválido (use registrador)", parts[3]))?
+                parse_reg(parts[3], syms).map_err(|_| anyhow!("SANITY_CHECK 4º operando '{}' inválido (use registrador)", parts[3]))?
             } else {
                 0xFF
             };
             if parts.len() > 4 {
                 reject_unknown("SANITY_CHECK", &parts[4..], &[])?;
             }
-            Ok(instr_sanity_check(parse_reg(parts[1])?, parse_reg(parts[2])?, rcount))
+            Ok(instr_sanity_check(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, rcount))
         }
         "PREEMPT_CHECK" => {
             if parts.len() < 2 {
@@ -3477,7 +3570,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("PREEMPT_CHECK", &parts[2..], &[])?;
             }
-            Ok(instr_preempt_check(parse_reg(parts[1])?))
+            Ok(instr_preempt_check(parse_reg(parts[1], syms)?))
         }
         "ASSERT" => {
             // ASSERT Rs [CODE=n]
@@ -3494,7 +3587,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("ASSERT token desconhecido '{}' (use CODE=)", p));
                 }
             }
-            Ok(instr_assert(parse_reg(parts[1])?, code))
+            Ok(instr_assert(parse_reg(parts[1], syms)?, code))
         }
         "DUMP" => {
             if parts.len() > 1 {
@@ -3515,7 +3608,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("SET_DEADLINE", &parts[2..], &[])?;
             }
-            Ok(instr_set_deadline(parse_reg(parts[1])?))
+            Ok(instr_set_deadline(parse_reg(parts[1], syms)?))
         }
         "GET_DEADLINE" => {
             if parts.len() < 2 {
@@ -3524,7 +3617,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("GET_DEADLINE", &parts[2..], &[])?;
             }
-            Ok(instr_get_deadline(parse_reg(parts[1])?))
+            Ok(instr_get_deadline(parse_reg(parts[1], syms)?))
         }
         "PRIORITY_SET" => {
             if parts.len() < 2 {
@@ -3533,7 +3626,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("PRIORITY_SET", &parts[2..], &[])?;
             }
-            Ok(instr_priority_set(parse_reg(parts[1])?))
+            Ok(instr_priority_set(parse_reg(parts[1], syms)?))
         }
         "PRIORITY_GET" => {
             if parts.len() < 2 {
@@ -3542,7 +3635,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("PRIORITY_GET", &parts[2..], &[])?;
             }
-            Ok(instr_priority_get(parse_reg(parts[1])?))
+            Ok(instr_priority_get(parse_reg(parts[1], syms)?))
         }
         "LOCK" => {
             if parts.len() < 2 {
@@ -3551,7 +3644,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("LOCK", &parts[2..], &[])?;
             }
-            Ok(instr_lock(parse_reg(parts[1])?))
+            Ok(instr_lock(parse_reg(parts[1], syms)?))
         }
         "UNLOCK" => {
             if parts.len() < 2 {
@@ -3560,7 +3653,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 2 {
                 reject_unknown("UNLOCK", &parts[2..], &[])?;
             }
-            Ok(instr_unlock(parse_reg(parts[1])?))
+            Ok(instr_unlock(parse_reg(parts[1], syms)?))
         }
         "FENCE" => {
             if parts.len() > 1 {
@@ -3573,7 +3666,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 3 {
                 return Err(anyhow!("LOADI precisa de rdest, imediato — ex: LOADI r0, 80000000"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let s = parts[2].trim();
             let imm = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
                 u128::from_str_radix(hex, 16)
@@ -3596,7 +3689,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() > 3 {
                 reject_unknown("MOV", &parts[3..], &[])?;
             }
-            Ok(instr_mov(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_mov(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "KV_TRUNCATE" => {
             // KV_TRUNCATE Rs_len [, STREAM=sid]
@@ -3613,7 +3706,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("KV_TRUNCATE token desconhecido '{}' (use STREAM=)", p));
                 }
             }
-            Ok(instr_kv_truncate(parse_reg(parts[1])?, stream))
+            Ok(instr_kv_truncate(parse_reg(parts[1], syms)?, stream))
         }
         "SLICE" => {
             // SLICE rD, rT START=n LEN=n
@@ -3636,7 +3729,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_start || !has_len {
                 return Err(anyhow!("SLICE precisa de START= e LEN= — ex: SLICE r4, r0 START=3 LEN=3"));
             }
-            Ok(instr_slice(parse_reg(parts[1])?, parse_reg(parts[2])?, start, len))
+            Ok(instr_slice(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, start, len))
         }
         "ARENA_ALLOC" => {
             // ARENA_ALLOC rD, SIZE=n [ALIGN=n] [ARENA=id]
@@ -3660,7 +3753,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_size {
                 return Err(anyhow!("ARENA_ALLOC precisa de SIZE= — ex: ARENA_ALLOC r2, SIZE=64"));
             }
-            Ok(instr_arena_alloc(parse_reg(parts[1])?, size, align, arena))
+            Ok(instr_arena_alloc(parse_reg(parts[1], syms)?, size, align, arena))
         }
         "ARENA_RESET" => {
             // ARENA_RESET [ARENA=id]
@@ -3703,7 +3796,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("MEMCPY token desconhecido '{}' (use LEN=/SRC_OFF=/DST_OFF=/DIR=)", p));
                 }
             }
-            Ok(instr_memcpy(parse_reg(parts[1])?, parse_reg(parts[2])?, len, src_off, dst_off, dir))
+            Ok(instr_memcpy(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, len, src_off, dst_off, dir))
         }
         "MEMSET" => {
             // MEMSET rT, PATTERN=n [LEN=n] [OFF=n]
@@ -3727,7 +3820,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_pat {
                 return Err(anyhow!("MEMSET precisa de PATTERN= — ex: MEMSET r1, PATTERN=0"));
             }
-            Ok(instr_memset(parse_reg(parts[1])?, pattern, len, off))
+            Ok(instr_memset(parse_reg(parts[1], syms)?, pattern, len, off))
         }
         "SNAPSHOT" => {
             // SNAPSHOT rD [MASK=n] (só MASK=0b111 executa; resto veta no exec)
@@ -3743,14 +3836,14 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("SNAPSHOT token desconhecido '{}' (use MASK=)", p));
                 }
             }
-            Ok(instr_snapshot(parse_reg(parts[1])?, mask))
+            Ok(instr_snapshot(parse_reg(parts[1], syms)?, mask))
         }
         "RESTORE" => {
             // RESTORE rV (rV guarda version u64; sem chaves)
             if parts.len() != 2 {
                 return Err(anyhow!("RESTORE precisa de exatamente um registrador — ex: RESTORE r5"));
             }
-            Ok(instr_restore(parse_reg(parts[1])?))
+            Ok(instr_restore(parse_reg(parts[1], syms)?))
         }
         "PREFETCH" => {
             // PREFETCH rT [LEN=n] [OFF=n]
@@ -3768,7 +3861,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("PREFETCH token desconhecido '{}' (use LEN=/OFF=)", p));
                 }
             }
-            Ok(instr_prefetch(parse_reg(parts[1])?, len, off))
+            Ok(instr_prefetch(parse_reg(parts[1], syms)?, len, off))
         }
         "RESHAPE" => {
             // RESHAPE rD, rT SHAPE=AxBxC (x-separado, 1-4 dims; helper
@@ -3786,7 +3879,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match dims {
-                Some(d) => Ok(instr_reshape(parse_reg(parts[1])?, parse_reg(parts[2])?, &d)),
+                Some(d) => Ok(instr_reshape(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, &d)),
                 None => Err(anyhow!("RESHAPE precisa de SHAPE= — ex: RESHAPE r1, r0 SHAPE=1x4")),
             }
         }
@@ -3804,7 +3897,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("CONCAT token desconhecido '{}' (use AXIS=)", p));
                 }
             }
-            Ok(instr_concat(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, axis))
+            Ok(instr_concat(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, axis))
         }
         "CAST" => {
             // CAST rD, rT DST=F32|F16|BF16|I8|U8 (0-4 também aceitos)
@@ -3831,7 +3924,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match dst {
-                Some(d) => Ok(instr_cast(parse_reg(parts[1])?, parse_reg(parts[2])?, d)),
+                Some(d) => Ok(instr_cast(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, d)),
                 None => Err(anyhow!("CAST precisa de DST= — ex: CAST r1, r0 DST=F16")),
             }
         }
@@ -3855,7 +3948,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match qtype {
-                Some(q) => Ok(instr_quantize(parse_reg(parts[1])?, parse_reg(parts[2])?, q)),
+                Some(q) => Ok(instr_quantize(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, q)),
                 None => Err(anyhow!("QUANTIZE precisa de Q= — ex: QUANTIZE r3, r0 Q=Q8_0")),
             }
         }
@@ -3864,7 +3957,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() != 3 {
                 return Err(anyhow!("DEQUANT precisa de exatamente rdest, rTensor — ex: DEQUANT r4, r3"));
             }
-            Ok(instr_dequant(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_dequant(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "ADD_IMM" => {
             // ADD_IMM rD, rS, IMM=n (u128 decimal; "-5" erra — use SUB_IMM)
@@ -3881,7 +3974,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match imm {
-                Some(n) => Ok(instr_add_imm(parse_reg(parts[1])?, parse_reg(parts[2])?, n)),
+                Some(n) => Ok(instr_add_imm(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, n)),
                 None => Err(anyhow!("ADD_IMM precisa de IMM= — ex: ADD_IMM r1, r0 IMM=23")),
             }
         }
@@ -3900,7 +3993,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match imm {
-                Some(n) => Ok(instr_sub_imm(parse_reg(parts[1])?, parse_reg(parts[2])?, n)),
+                Some(n) => Ok(instr_sub_imm(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, n)),
                 None => Err(anyhow!("SUB_IMM precisa de IMM= — ex: SUB_IMM r2, r1 IMM=23")),
             }
         }
@@ -3909,7 +4002,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() != 2 {
                 return Err(anyhow!("STEPS precisa de exatamente um registrador — ex: STEPS r3"));
             }
-            Ok(instr_steps(parse_reg(parts[1])?))
+            Ok(instr_steps(parse_reg(parts[1], syms)?))
         }
         "SORT" => {
             // SORT rD, rT [AXIS=n] [ORDER=ASC|DESC]
@@ -3935,7 +4028,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("SORT token desconhecido '{}' (use AXIS=/ORDER=)", p));
                 }
             }
-            Ok(instr_sort(parse_reg(parts[1])?, parse_reg(parts[2])?, axis, order))
+            Ok(instr_sort(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, axis, order))
         }
         "TOPK" => {
             // TOPK rD, rT K=n [AXIS=n] [LARGEST|SMALLEST] [SORTED|UNSORTED]
@@ -3965,7 +4058,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_k {
                 return Err(anyhow!("TOPK precisa de K= — ex: TOPK r2, r0 K=2"));
             }
-            Ok(instr_topk(parse_reg(parts[1])?, parse_reg(parts[2])?, axis, k, largest, sorted))
+            Ok(instr_topk(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, axis, k, largest, sorted))
         }
         "ARGMAX" => {
             // ARGMAX rD, rT [AXIS=n]
@@ -3981,7 +4074,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("ARGMAX token desconhecido '{}' (use AXIS=)", p));
                 }
             }
-            Ok(instr_argmax(parse_reg(parts[1])?, parse_reg(parts[2])?, axis))
+            Ok(instr_argmax(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, axis))
         }
         "REDUCE" => {
             // REDUCE rD, rT OP=SUM|MEAN|MAX|MIN|PROD [AXIS=n]
@@ -4010,7 +4103,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_op {
                 return Err(anyhow!("REDUCE precisa de OP= — ex: REDUCE r4, r0 OP=SUM"));
             }
-            Ok(instr_reduce(parse_reg(parts[1])?, parse_reg(parts[2])?, op, axis))
+            Ok(instr_reduce(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, op, axis))
         }
         "BROADCAST" => {
             // BROADCAST rD, rT SHAPE=AxBxC (mesma regra do RESHAPE)
@@ -4027,7 +4120,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match dims {
-                Some(d) => Ok(instr_broadcast(parse_reg(parts[1])?, parse_reg(parts[2])?, &d)),
+                Some(d) => Ok(instr_broadcast(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, &d)),
                 None => Err(anyhow!("BROADCAST precisa de SHAPE= — ex: BROADCAST r5, r4 SHAPE=2x2")),
             }
         }
@@ -4055,7 +4148,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_value {
                 return Err(anyhow!("PAD precisa de VALUE= — ex: PAD r6, r0 VALUE=0 BEFORE=1 AFTER=1"));
             }
-            Ok(instr_pad(parse_reg(parts[1])?, parse_reg(parts[2])?, value, axis, before, after))
+            Ok(instr_pad(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, value, axis, before, after))
         }
         "TILE" => {
             // TILE rD, rT REPS=n [AXIS=n]
@@ -4077,7 +4170,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_reps {
                 return Err(anyhow!("TILE precisa de REPS= — ex: TILE r7, r0 REPS=2"));
             }
-            Ok(instr_tile(parse_reg(parts[1])?, parse_reg(parts[2])?, reps, axis))
+            Ok(instr_tile(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, reps, axis))
         }
         "TRANSPOSE" => {
             // TRANSPOSE rD, rT AXES=AxBxC (x-separado; vírgula quebraria o
@@ -4102,7 +4195,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             match perm {
-                Some(pm) => Ok(instr_transpose(parse_reg(parts[1])?, parse_reg(parts[2])?, &pm)),
+                Some(pm) => Ok(instr_transpose(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, &pm)),
                 None => Err(anyhow!("TRANSPOSE precisa de AXES= — ex: TRANSPOSE r8, r0 AXES=1x0")),
             }
         }
@@ -4122,43 +4215,43 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("SOFTMAX token desconhecido '{}' (use AXIS=/TEMP=)", p));
                 }
             }
-            Ok(instr_softmax(parse_reg(parts[1])?, parse_reg(parts[2])?, axis, temp))
+            Ok(instr_softmax(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, axis, temp))
         }
         "GELU" => {
             if parts.len() != 3 {
                 return Err(anyhow!("GELU precisa de exatamente rdest, rTensor — ex: GELU r4, r0"));
             }
-            Ok(instr_gelu(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_gelu(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "SIGMOID" => {
             if parts.len() != 3 {
                 return Err(anyhow!("SIGMOID precisa de exatamente rdest, rTensor — ex: SIGMOID r1, r0"));
             }
-            Ok(instr_sigmoid(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_sigmoid(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "TANH" => {
             if parts.len() != 3 {
                 return Err(anyhow!("TANH precisa de exatamente rdest, rTensor — ex: TANH r2, r0"));
             }
-            Ok(instr_tanh(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_tanh(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "RELU" => {
             if parts.len() != 3 {
                 return Err(anyhow!("RELU precisa de exatamente rdest, rTensor — ex: RELU r3, r0"));
             }
-            Ok(instr_relu(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_relu(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "EXP" => {
             if parts.len() != 3 {
                 return Err(anyhow!("EXP precisa de exatamente rdest, rTensor — ex: EXP r5, r0"));
             }
-            Ok(instr_exp(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_exp(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "LOG" => {
             if parts.len() != 3 {
                 return Err(anyhow!("LOG precisa de exatamente rdest, rTensor — ex: LOG r6, r5"));
             }
-            Ok(instr_log(parse_reg(parts[1])?, parse_reg(parts[2])?))
+            Ok(instr_log(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "CLIP" => {
             // CLIP rD, rT MIN=x MAX=x (ambos exigidos: sem default mudo)
@@ -4181,7 +4274,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_min || !has_max {
                 return Err(anyhow!("CLIP precisa de MIN= e MAX= — ex: CLIP r8, r0 MIN=0 MAX=0.4"));
             }
-            Ok(instr_clip(parse_reg(parts[1])?, parse_reg(parts[2])?, min, max))
+            Ok(instr_clip(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, min, max))
         }
         "KV_COMPRESS" => {
             // KV_COMPRESS SINK=n WINDOW=n [MODE=SINK_WINDOW] [STREAM=0]
@@ -4226,7 +4319,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("FLASH_ATTN token desconhecido '{}' (use BLOCK=)", p));
                 }
             }
-            Ok(instr_flash_attn(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, parse_reg(parts[4])?, block))
+            Ok(instr_flash_attn(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, parse_reg(parts[4], syms)?, block))
         }
         "ATTN_SPARSE" => {
             // ATTN_SPARSE rD, rQ, rK, rV [TOPK=n] [METRIC=DOT]
@@ -4248,7 +4341,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("ATTN_SPARSE token desconhecido '{}' (use TOPK=/METRIC=)", p));
                 }
             }
-            Ok(instr_attn_sparse(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, parse_reg(parts[4])?, metric, topk))
+            Ok(instr_attn_sparse(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, parse_reg(parts[4], syms)?, metric, topk))
         }
         "VAD_DETECT" => {
             // VAD_DETECT rD, rT [MODE=ENERGY|ZCR] (ML parseia, exec veta)
@@ -4269,7 +4362,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("VAD_DETECT token desconhecido '{}' (use MODE=)", p));
                 }
             }
-            Ok(instr_vad_detect(parse_reg(parts[1])?, parse_reg(parts[2])?, mode))
+            Ok(instr_vad_detect(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, mode))
         }
         "STREAM_MERGE" => {
             // STREAM_MERGE rD, rA, rB GAIN=x [N_STREAMS=n]
@@ -4291,7 +4384,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_gain {
                 return Err(anyhow!("STREAM_MERGE precisa de GAIN= — ex: STREAM_MERGE r6, r5, r5 GAIN=0.5"));
             }
-            Ok(instr_stream_merge(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, gain, n_streams))
+            Ok(instr_stream_merge(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, gain, n_streams))
         }
         "AUDIO_RESAMPLE" => {
             // AUDIO_RESAMPLE rD, rT SRC=n DST=n (ambos exigidos)
@@ -4314,7 +4407,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if !has_src || !has_dst {
                 return Err(anyhow!("AUDIO_RESAMPLE precisa de SRC= e DST= — ex: AUDIO_RESAMPLE r2, r0 SRC=24000 DST=16000"));
             }
-            Ok(instr_audio_resample(parse_reg(parts[1])?, parse_reg(parts[2])?, src, dst))
+            Ok(instr_audio_resample(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, src, dst))
         }
         "AUDIO_FILTER" => {
             // AUDIO_FILTER rD, rX, rB [MODE=FIR] (IIR parseia, exec veta)
@@ -4334,7 +4427,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("AUDIO_FILTER token desconhecido '{}' (use MODE=)", p));
                 }
             }
-            Ok(instr_audio_filter(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, mode))
+            Ok(instr_audio_filter(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, mode))
         }
         "AUDIO_WINDOW" => {
             // AUDIO_WINDOW rD, rT [TYPE=HANN|HAMMING]
@@ -4354,7 +4447,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("AUDIO_WINDOW token desconhecido '{}' (use TYPE=)", p));
                 }
             }
-            Ok(instr_audio_window(parse_reg(parts[1])?, parse_reg(parts[2])?, wtype))
+            Ok(instr_audio_window(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, wtype))
         }
         "DEPFORMER" => {
             // DEPFORMER rD, rX, rW [STREAM=] [LAYER=] [NCB=] [NHEADS=]
@@ -4387,7 +4480,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                     return Err(anyhow!("DEPFORMER token desconhecido '{}' (use STREAM=/LAYER=/NCB=/NHEADS=/LEVELS=/CONTEXT=/TEMP=/TOPK=)", p));
                 }
             }
-            Ok(instr_depformer(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, stream, layer, ncb, nheads, levels, context, temp, topk))
+            Ok(instr_depformer(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, stream, layer, ncb, nheads, levels, context, temp, topk))
         }
         "CALL" => {
             // CALL LABEL (espelha JUMP: rótulo resolvido, resto veta).
@@ -4415,7 +4508,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 2 {
                 return Err(anyhow!("REMOTE_SPAWN precisa de rdest — ex: REMOTE_SPAWN r3 NODE=0 ENTRY=MAIN GREEN"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let (mut node, mut entry, mut prio) = (0u32, 0u64, 0u8);
             let mut has_entry = false;
             for p in &parts[2..] {
@@ -4458,7 +4551,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 2 {
                 return Err(anyhow!("SIGNAL precisa de rdest — ex: SIGNAL r2 KIND=PING NODE=0 CTX=1"));
             }
-            let rdest = parse_reg(parts[1])?;
+            let rdest = parse_reg(parts[1], syms)?;
             let (mut kind, mut node, mut ctx, mut seq) = (SIGNAL_KIND_PING, 0u32, 0u64, 0u64);
             for p in &parts[2..] {
                 let up = p.to_ascii_uppercase();
@@ -4487,11 +4580,11 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             if parts.len() < 2 {
                 return Err(anyhow!("SEND_TENSOR precisa de rSrc — ex: SEND_TENSOR r5 NODE=0 LEN=64"));
             }
-            let rsrc = parse_reg(parts[1])?;
+            let rsrc = parse_reg(parts[1], syms)?;
             let (mut rdst, mut node, mut off, mut len, mut mode) = (0xFF, 0u32, 0u64, 0u32, SEND_MODE_COPY);
             let mut rpos = 2;
             if parts.len() > rpos {
-                if let Ok(r) = parse_reg(parts[rpos]) {
+                if let Ok(r) = parse_reg(parts[rpos], syms) {
                     rdst = r;
                     rpos += 1;
                 }
@@ -4551,7 +4644,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             // 4º reg opcional (schedule futuro; exec veta salvo 0xFF).
             let mut rsched = 0xFF;
             if parts.len() > rpos {
-                if let Ok(r) = parse_reg(parts[rpos]) {
+                if let Ok(r) = parse_reg(parts[rpos], syms) {
                     let up = parts[rpos].to_ascii_uppercase();
                     // Registrador de verdade, não KV (KV contém '=').
                     if !up.contains('=') {
@@ -4579,9 +4672,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             Ok(instr_denoise_step(
-                parse_reg(parts[1])?,
-                parse_reg(parts[2])?,
-                parse_reg(parts[3])?,
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
                 rsched,
                 alpha,
                 beta,
@@ -4599,7 +4692,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             // 4º reg opcional (pack Wb); KV nunca é reg válido aqui.
             let mut rwb = 0xFF;
             if parts.len() > rpos {
-                if let Ok(r) = parse_reg(parts[rpos]) {
+                if let Ok(r) = parse_reg(parts[rpos], syms) {
                     rwb = r;
                     rpos += 1;
                 }
@@ -4624,9 +4717,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             Ok(instr_ode_step(
-                parse_reg(parts[1])?,
-                parse_reg(parts[2])?,
-                parse_reg(parts[3])?,
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
                 rwb,
                 dt,
                 method,
@@ -4644,7 +4737,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             // 4º reg opcional (pack); KV nunca é reg válido aqui.
             let mut rpack = 0xFF;
             if parts.len() > rpos {
-                if let Ok(r) = parse_reg(parts[rpos]) {
+                if let Ok(r) = parse_reg(parts[rpos], syms) {
                     rpack = r;
                     rpos += 1;
                 }
@@ -4671,9 +4764,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             Ok(instr_spike_step(
-                parse_reg(parts[1])?,
-                parse_reg(parts[2])?,
-                parse_reg(parts[3])?,
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
                 rpack,
                 thresh,
                 decay,
@@ -4694,7 +4787,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             // 4º reg opcional (bias); KV nunca é reg válido aqui.
             let mut rbias = 0xFF;
             if parts.len() > rpos {
-                if let Ok(r) = parse_reg(parts[rpos]) {
+                if let Ok(r) = parse_reg(parts[rpos], syms) {
                     rbias = r;
                     rpos += 1;
                 }
@@ -4725,9 +4818,9 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 }
             }
             Ok(instr_conv(
-                parse_reg(parts[1])?,
-                parse_reg(parts[2])?,
-                parse_reg(parts[3])?,
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
                 rbias,
                 stride,
                 pad,
@@ -4764,10 +4857,10 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 return Err(anyhow!("FOREST TREES/DEPTH fora da faixa (trees>=1, 1<=depth<=16)"));
             }
             Ok(instr_forest(
-                parse_reg(parts[1])?,
-                parse_reg(parts[2])?,
-                parse_reg(parts[3])?,
-                parse_reg(parts[4])?,
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
+                parse_reg(parts[4], syms)?,
                 n_trees,
                 depth,
                 mode,
@@ -6194,5 +6287,39 @@ mod tests {
         }
         let prog = assemble("MAIN_LOOP:\nFORK r5, MAIN_LOOP, GREEN\nJUMP MAIN_LOOP").unwrap();
         assert_eq!(prog[0].opcode, OP_FORK);
+    }
+
+    // ---- RFC-0036: apelidos simbólicos (passo V-1) ---------------------
+
+    #[test]
+    fn test_rfc0036_symbolic_regs() {
+        // Declaração explícita vincula; uso resolve; numéricos intactos.
+        // rBar sem declaração: erro que sugere `.reg` (RFC-0008 preservado).
+        let err = assemble(".reg rFoo r5\nADD rFoo, rBar, rFoo").unwrap_err().to_string();
+        assert!(err.contains(".reg"), "erro deve sugerir .reg: {}", err);
+        // Programa completo declarado monta com os físicos certos.
+        let prog = assemble(".reg rFoo r5\n.reg rBar r1\nADD rFoo, rBar, rFoo").unwrap();
+        assert_eq!((prog[0].rdest, prog[0].rsrc1, prog[0].rsrc2), (5, 1, 5));
+        // Maiúsculas/minúsculas: insensível (lowercase interno).
+        let prog = assemble(".reg rFoo r5\nMOV rFoo, rFOO").unwrap();
+        assert_eq!((prog[0].rdest, prog[0].rsrc1), (5, 5));
+        // Tabela nova por chamada: determinístico entre arquivos.
+        let a = assemble(".reg rFoo r5\nADD rFoo, r0, r1").unwrap();
+        let b = assemble(".reg rFoo r5\nADD rFoo, r0, r1").unwrap();
+        assert_eq!((a[0].rdest, b[0].rdest), (5, 5));
+        // Redeclaração, físico ocupado, físico fora: tudo erro alto.
+        assert!(assemble(".reg rFoo r5\n.reg rFoo r6\nADD rFoo, r0, r1").is_err());
+        assert!(assemble(".reg rFoo r5\n.reg rBar r5\nADD rFoo, rBar, r1").is_err());
+        assert!(assemble(".reg rFoo r16\nADD rFoo, r0, r1").is_err());
+        assert!(assemble(".reg rFoo\nADD rFoo, r0, r1").is_err());
+        assert!(assemble(".reg Foo r5\nADD rFoo, r0, r1").is_err());
+        // Formas inválidas continuam erro (nada afrouxado).
+        assert!(assemble("ADD r1x, r0, r1").is_err());
+        assert!(assemble("ADD r, r0, r1").is_err());
+        assert!(assemble("ADD r16, r0, r1").is_err());
+        assert!(assemble("ADD rFoo-bar, r0, r1").is_err());
+        // Diretiva não emite instrução: só o ADD aparece.
+        let prog = assemble(".reg rFoo r5\nADD rFoo, r0, r1").unwrap();
+        assert_eq!(prog.len(), 1);
     }
 }
