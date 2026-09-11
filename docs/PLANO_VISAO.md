@@ -111,6 +111,20 @@ Fora de escopo permanente: programa `.m3asm` completo da família antes de G2 ·
 | 2026-09-11 | Voz PT-BR adiada (política EN-only até fine-tuning) |
 | 2026-09-11 | `v2.x` reservado ao freeze dual-mode (regra RFC-0028) |
 | 2026-09-11 | HELD sem opcode salvo prova R12 (regra Trilha P) |
+| 2026-09-11 | Fronteira satélites: sem WGSL/shader novo no repo (wgpu ATTN≤64 existente congelado; kernels futuros via `.spv` do collisor); sem I/O de áudio (sem `cpal`/ALSA — WAV/arq + `SENSE` sintético; `m3-audio` via ring/file); headless por design; convenções só via `m3-spec/` (nada unilateral) |
+
+---
+
+## Satélites
+
+Este projeto tem dois satélites:
+
+- **vulkan_collisor_simulator** (C++, Linux-only) — kernel factory `.spv` + vetorização de rosto
+- **m3-audio** (Rust) — I/O de áudio real-time, AEC, hotplug
+
+Contrato compartilhado: `../m3-spec/`. Zero código compartilhado entre projetos.
+
+Convergência no mês 6+ (avatar 3D + áudio real no MVP de voz).
 
 ---
 
