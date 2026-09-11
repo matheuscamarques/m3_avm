@@ -154,6 +154,24 @@ pub const CAST_DST_U8: u8 = 4;
 // assembler — sem soletrar o inexecutável).
 pub const QUANTIZE_Q4_0: u8 = 4;
 pub const QUANTIZE_Q8_0: u8 = 8;
+// RFC-0027: forma (0x30-0x37, v1.9; resto de 0x30-0x43 nas partes 2-3).
+pub const OP_SORT: u8 = 0x30; // ordenação por eixo (NaN=+inf, empate=menor idx)
+pub const OP_TOPK: u8 = 0x31; // top-k fundido [vals|idx] (pack DISTANCE)
+pub const OP_ARGMAX: u8 = 0x32; // índices como f32 (ignora NaN, cf. maxNum)
+pub const OP_REDUCE: u8 = 0x33; // sum/mean/max/min/prod por eixo ou total
+pub const OP_BROADCAST: u8 = 0x34; // expansão p/ shape alvo (cópia)
+pub const OP_PAD: u8 = 0x35; // crescimento single-axis (compõe p/ N-D)
+pub const OP_TILE: u8 = 0x36; // repetição single-axis
+pub const OP_TRANSPOSE: u8 = 0x37; // permuta N-D genérica (cópia)
+// Ordem — SORT (payload[1]): 0=ASC, 1=DESC.
+pub const SORT_ASC: u8 = 0;
+pub const SORT_DESC: u8 = 1;
+// Operações — REDUCE (payload[0]).
+pub const REDUCE_SUM: u8 = 0;
+pub const REDUCE_MEAN: u8 = 1;
+pub const REDUCE_MAX: u8 = 2;
+pub const REDUCE_MIN: u8 = 3;
+pub const REDUCE_PROD: u8 = 4;
 // RFC-0024: views & versions (0x28/0x29/0x2C/0x2D/0x2F; fecha 0x26-0x2F, v1.6).
 pub const OP_SNAPSHOT: u8 = 0x28; // snapshot nomeado -> version handle
 pub const OP_RESTORE: u8 = 0x29; // rewind p/ version (memória + mapas)
@@ -514,6 +532,14 @@ impl Instruction {
             OP_ADD_IMM => "ADD_IMM",
             OP_SUB_IMM => "SUB_IMM",
             OP_STEPS => "STEPS",
+            OP_SORT => "SORT",
+            OP_TOPK => "TOPK",
+            OP_ARGMAX => "ARGMAX",
+            OP_REDUCE => "REDUCE",
+            OP_BROADCAST => "BROADCAST",
+            OP_PAD => "PAD",
+            OP_TILE => "TILE",
+            OP_TRANSPOSE => "TRANSPOSE",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -1602,21 +1628,13 @@ impl Instruction {
 
     /// RESHAPE: payload[0]=ndim u8 (1-4), [1..5]=d0 u32 LE, [5..9]=d1,
     /// [9..13]=d2, [13..17]=d3. Cópia (não view); numel validado no exec.
+    /// Layout compartilhado com BROADCAST (fns livres abaixo).
     pub fn reshape_shape(&self) -> (u8, [u32; 4]) {
-        let mut dims = [0u32; 4];
-        for (i, d) in dims.iter_mut().enumerate() {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&self.payload[1 + i * 4..5 + i * 4]);
-            *d = u32::from_le_bytes(b);
-        }
-        (self.payload[0], dims)
+        reshape_dims_of(self)
     }
 
     pub fn set_reshape_shape(&mut self, ndim: u8, dims: [u32; 4]) {
-        self.payload[0] = ndim;
-        for (i, d) in dims.iter().enumerate() {
-            self.payload[1 + i * 4..5 + i * 4].copy_from_slice(&d.to_le_bytes());
-        }
+        set_reshape_dims(self, ndim, dims);
     }
 
     /// CONCAT: payload[0]=axis u8 (default 0).
@@ -1658,6 +1676,50 @@ pub fn instr_reshape(rdest: u8, r_src: u8, dims: &[u32]) -> Instruction {
     let mut instr = Instruction::new(OP_RESHAPE, 0, rdest, r_src, 0xFF, 0xFF);
     instr.set_reshape_shape(dims.len().min(255) as u8, arr);
     instr
+}
+
+// ---------------------------------------------------------------------------
+// Layout de shape compartilhado RESHAPE/BROADCAST (RFC-0024/0027):
+// payload[0]=ndim (1-4), [1..17]=4×u32 LE. Parse `SHAPE=AxBxC` idem.
+// ---------------------------------------------------------------------------
+
+/// Lê (ndim, dims) do layout de shape (corpo de `reshape_shape` e
+/// `broadcast_shape` — uma implementação só).
+pub fn reshape_dims_of(instr: &Instruction) -> (u8, [u32; 4]) {
+    let mut dims = [0u32; 4];
+    for (i, d) in dims.iter_mut().enumerate() {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&instr.payload[1 + i * 4..5 + i * 4]);
+        *d = u32::from_le_bytes(b);
+    }
+    (instr.payload[0], dims)
+}
+
+/// Escreve (ndim, dims) no layout de shape (corpo de `set_reshape_shape`
+/// e `set_broadcast_shape`).
+pub fn set_reshape_dims(instr: &mut Instruction, ndim: u8, dims: [u32; 4]) {
+    instr.payload[0] = ndim;
+    for (i, d) in dims.iter().enumerate() {
+        instr.payload[1 + i * 4..5 + i * 4].copy_from_slice(&d.to_le_bytes());
+    }
+}
+
+/// Parseia valor `SHAPE=` x-separado em 1-4 dims > 0. Usado por RESHAPE
+/// e BROADCAST (mesma regra, uma implementação só). `v` é o valor após
+/// `SHAPE=`; `op` nomeia o opcode nas mensagens.
+pub fn parse_shape_dims(v: &str, op: &str) -> Result<Vec<u32>> {
+    let mut dims = Vec::new();
+    for d in v.split(|c| c == 'x' || c == 'X') {
+        let n = d.parse::<u32>().map_err(|_| anyhow!("{} SHAPE inválido '{}' (use AxBxC)", op, v))?;
+        if n == 0 {
+            return Err(anyhow!("{} SHAPE com dim 0 (dims > 0)", op));
+        }
+        dims.push(n);
+    }
+    if dims.is_empty() || dims.len() > 4 {
+        return Err(anyhow!("{} SHAPE '{}' precisa de 1-4 dims", op, v));
+    }
+    Ok(dims)
 }
 
 /// CONCAT rD, rA, rB [AXIS=n] — montagem ao longo do eixo.
@@ -1710,6 +1772,178 @@ pub fn instr_quantize(rdest: u8, r_src: u8, qtype: u8) -> Instruction {
 /// DEQUANT rD, rT — rdest <- NOVO tensor F32 (mesmo shape do src).
 pub fn instr_dequant(rdest: u8, r_src: u8) -> Instruction {
     Instruction::new(OP_DEQUANT, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0027: SORT (0x30) / TOPK (0x31) / ARGMAX (0x32) / REDUCE (0x33) /
+// BROADCAST (0x34) / PAD (0x35) / TILE (0x36) / TRANSPOSE (0x37).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// SORT: payload[0]=axis (default 0), [1]=order (0=ASC,1=DESC).
+    pub fn sort_params(&self) -> (u8, u8) {
+        (self.payload[0], self.payload[1])
+    }
+
+    pub fn set_sort_params(&mut self, axis: u8, order: u8) {
+        self.payload[0] = axis;
+        self.payload[1] = order;
+    }
+
+    /// TOPK: payload[0]=axis, [1..3]=k u16 LE, [3]=largest, [4]=sorted.
+    pub fn topk_params(&self) -> (u8, u16, u8, u8) {
+        let k = u16::from_le_bytes([self.payload[1], self.payload[2]]);
+        (self.payload[0], k, self.payload[3], self.payload[4])
+    }
+
+    pub fn set_topk_params(&mut self, axis: u8, k: u16, largest: u8, sorted: u8) {
+        self.payload[0] = axis;
+        self.payload[1..3].copy_from_slice(&k.to_le_bytes());
+        self.payload[3] = largest;
+        self.payload[4] = sorted;
+    }
+
+    /// ARGMAX: payload[0]=axis (default 0).
+    pub fn argmax_axis(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_argmax_axis(&mut self, axis: u8) {
+        self.payload[0] = axis;
+    }
+
+    /// REDUCE: payload[0]=op (0-4), [1]=axis (0xFF=total).
+    pub fn reduce_params(&self) -> (u8, u8) {
+        (self.payload[0], self.payload[1])
+    }
+
+    pub fn set_reduce_params(&mut self, op: u8, axis: u8) {
+        self.payload[0] = op;
+        self.payload[1] = axis;
+    }
+
+    /// BROADCAST: payload[0]=ndim (1-4), [1..17]=4×u32 dims (RESHAPE).
+    pub fn broadcast_shape(&self) -> (u8, [u32; 4]) {
+        reshape_dims_of(self)
+    }
+
+    pub fn set_broadcast_shape(&mut self, ndim: u8, dims: [u32; 4]) {
+        set_reshape_dims(self, ndim, dims);
+    }
+
+    /// PAD: payload[0..4]=value f32 LE, [4]=axis, [5..9]=before u32,
+    /// [9..13]=after u32.
+    pub fn pad_params(&self) -> (f32, u8, u32, u32) {
+        let mut bv = [0u8; 4];
+        bv.copy_from_slice(&self.payload[0..4]);
+        let mut bb = [0u8; 4];
+        bb.copy_from_slice(&self.payload[5..9]);
+        let mut ba = [0u8; 4];
+        ba.copy_from_slice(&self.payload[9..13]);
+        (
+            f32::from_le_bytes(bv),
+            self.payload[4],
+            u32::from_le_bytes(bb),
+            u32::from_le_bytes(ba),
+        )
+    }
+
+    pub fn set_pad_params(&mut self, value: f32, axis: u8, before: u32, after: u32) {
+        self.payload[0..4].copy_from_slice(&value.to_le_bytes());
+        self.payload[4] = axis;
+        self.payload[5..9].copy_from_slice(&before.to_le_bytes());
+        self.payload[9..13].copy_from_slice(&after.to_le_bytes());
+    }
+
+    /// TILE: payload[0..4]=reps u32 LE, [4]=axis.
+    pub fn tile_params(&self) -> (u32, u8) {
+        let mut br = [0u8; 4];
+        br.copy_from_slice(&self.payload[0..4]);
+        (u32::from_le_bytes(br), self.payload[4])
+    }
+
+    pub fn set_tile_params(&mut self, reps: u32, axis: u8) {
+        self.payload[0..4].copy_from_slice(&reps.to_le_bytes());
+        self.payload[4] = axis;
+    }
+
+    /// TRANSPOSE: payload[0]=ndim (1-4), [1..5]=perm u8 ×4.
+    pub fn transpose_perm(&self) -> (u8, [u8; 4]) {
+        let mut perm = [0u8; 4];
+        perm.copy_from_slice(&self.payload[1..5]);
+        (self.payload[0], perm)
+    }
+
+    pub fn set_transpose_perm(&mut self, ndim: u8, perm: [u8; 4]) {
+        self.payload[0] = ndim;
+        self.payload[1..5].copy_from_slice(&perm);
+    }
+}
+
+/// SORT rD, rT [AXIS=n] [ORDER=ASC|DESC].
+pub fn instr_sort(rdest: u8, r_src: u8, axis: u8, order: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_SORT, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_sort_params(axis, order);
+    instr
+}
+
+/// TOPK rD, rT K=k [AXIS=n] [largest] [sorted].
+pub fn instr_topk(rdest: u8, r_src: u8, axis: u8, k: u16, largest: u8, sorted: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_TOPK, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_topk_params(axis, k, largest, sorted);
+    instr
+}
+
+/// ARGMAX rD, rT [AXIS=n] — índices como f32.
+pub fn instr_argmax(rdest: u8, r_src: u8, axis: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_ARGMAX, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_argmax_axis(axis);
+    instr
+}
+
+/// REDUCE rD, rT OP=... [AXIS=n] (0xFF = total).
+pub fn instr_reduce(rdest: u8, r_src: u8, op: u8, axis: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_REDUCE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_reduce_params(op, axis);
+    instr
+}
+
+/// BROADCAST rD, rT SHAPE=... — expansão (cópia).
+pub fn instr_broadcast(rdest: u8, r_src: u8, dims: &[u32]) -> Instruction {
+    debug_assert!((1..=4).contains(&dims.len()));
+    let mut arr = [0u32; 4];
+    for (i, d) in dims.iter().take(4).enumerate() {
+        arr[i] = *d;
+    }
+    let mut instr = Instruction::new(OP_BROADCAST, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_broadcast_shape(dims.len().min(255) as u8, arr);
+    instr
+}
+
+/// PAD rD, rT VALUE=x [AXIS=n] [BEFORE=n] [AFTER=n].
+pub fn instr_pad(rdest: u8, r_src: u8, value: f32, axis: u8, before: u32, after: u32) -> Instruction {
+    let mut instr = Instruction::new(OP_PAD, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_pad_params(value, axis, before, after);
+    instr
+}
+
+/// TILE rD, rT REPS=n [AXIS=n].
+pub fn instr_tile(rdest: u8, r_src: u8, reps: u32, axis: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_TILE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_tile_params(reps, axis);
+    instr
+}
+
+/// TRANSPOSE rD, rT perm — permuta N-D (validada no exec).
+pub fn instr_transpose(rdest: u8, r_src: u8, perm: &[u8]) -> Instruction {
+    debug_assert!((1..=4).contains(&perm.len()));
+    let mut arr = [0u8; 4];
+    for (i, p) in perm.iter().take(4).enumerate() {
+        arr[i] = *p;
+    }
+    let mut instr = Instruction::new(OP_TRANSPOSE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_transpose_perm(perm.len().min(255) as u8, arr);
+    instr
 }
 
 // ---------------------------------------------------------------------------
@@ -3170,7 +3404,8 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             Ok(instr_prefetch(parse_reg(parts[1])?, len, off))
         }
         "RESHAPE" => {
-            // RESHAPE rD, rT SHAPE=AxBxC (x-separado, 1-4 dims)
+            // RESHAPE rD, rT SHAPE=AxBxC (x-separado, 1-4 dims; helper
+            // compartilhado com BROADCAST — mesma regra).
             if parts.len() < 3 {
                 return Err(anyhow!("RESHAPE precisa de rdest, rTensor e SHAPE= — ex: RESHAPE r1, r0 SHAPE=1x4"));
             }
@@ -3178,18 +3413,7 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             for p in &parts[3..] {
                 let up = p.to_ascii_uppercase();
                 if let Some(v) = up.strip_prefix("SHAPE=") {
-                    let mut parsed = Vec::new();
-                    for d in v.split(|c| c == 'x' || c == 'X') {
-                        let n = d.parse::<u32>().map_err(|_| anyhow!("RESHAPE SHAPE inválido '{}' (use AxBxC)", p))?;
-                        if n == 0 {
-                            return Err(anyhow!("RESHAPE SHAPE com dim 0 '{}' (dims > 0)", p));
-                        }
-                        parsed.push(n);
-                    }
-                    if parsed.is_empty() || parsed.len() > 4 {
-                        return Err(anyhow!("RESHAPE SHAPE '{}' precisa de 1-4 dims", p));
-                    }
-                    dims = Some(parsed);
+                    dims = Some(parse_shape_dims(v, "RESHAPE")?);
                 } else {
                     return Err(anyhow!("RESHAPE token desconhecido '{}' (use SHAPE=AxBxC)", p));
                 }
@@ -3319,6 +3543,201 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 return Err(anyhow!("STEPS precisa de exatamente um registrador — ex: STEPS r3"));
             }
             Ok(instr_steps(parse_reg(parts[1])?))
+        }
+        "SORT" => {
+            // SORT rD, rT [AXIS=n] [ORDER=ASC|DESC]
+            if parts.len() < 3 {
+                return Err(anyhow!("SORT precisa de rdest, rTensor — ex: SORT r1, r0 AXIS=1 ORDER=DESC"));
+            }
+            let (mut axis, mut order) = (0u8, SORT_ASC);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("SORT AXIS inválido '{}'", p))?;
+                } else if up == "ASC" {
+                    order = SORT_ASC;
+                } else if up == "DESC" {
+                    order = SORT_DESC;
+                } else if let Some(v) = up.strip_prefix("ORDER=") {
+                    order = match v {
+                        "ASC" => SORT_ASC,
+                        "DESC" => SORT_DESC,
+                        _ => return Err(anyhow!("SORT ORDER '{}' inválido (use ASC/DESC)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("SORT token desconhecido '{}' (use AXIS=/ORDER=)", p));
+                }
+            }
+            Ok(instr_sort(parse_reg(parts[1])?, parse_reg(parts[2])?, axis, order))
+        }
+        "TOPK" => {
+            // TOPK rD, rT K=n [AXIS=n] [LARGEST|SMALLEST] [SORTED|UNSORTED]
+            if parts.len() < 3 {
+                return Err(anyhow!("TOPK precisa de rdest, rTensor e K= — ex: TOPK r2, r0 K=2 AXIS=1"));
+            }
+            let (mut axis, mut k, mut has_k, mut largest, mut sorted) = (0u8, 0u16, false, 1u8, 1u8);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("K=") {
+                    k = v.parse::<u16>().map_err(|_| anyhow!("TOPK K inválido '{}'", p))?;
+                    has_k = true;
+                } else if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("TOPK AXIS inválido '{}'", p))?;
+                } else if up == "LARGEST" {
+                    largest = 1;
+                } else if up == "SMALLEST" {
+                    largest = 0;
+                } else if up == "SORTED" {
+                    sorted = 1;
+                } else if up == "UNSORTED" {
+                    sorted = 0;
+                } else {
+                    return Err(anyhow!("TOPK token desconhecido '{}' (use K=/AXIS=/LARGEST/SMALLEST/SORTED/UNSORTED)", p));
+                }
+            }
+            if !has_k {
+                return Err(anyhow!("TOPK precisa de K= — ex: TOPK r2, r0 K=2"));
+            }
+            Ok(instr_topk(parse_reg(parts[1])?, parse_reg(parts[2])?, axis, k, largest, sorted))
+        }
+        "ARGMAX" => {
+            // ARGMAX rD, rT [AXIS=n]
+            if parts.len() < 3 {
+                return Err(anyhow!("ARGMAX precisa de rdest, rTensor — ex: ARGMAX r3, r0 AXIS=1"));
+            }
+            let mut axis = 0u8;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("ARGMAX AXIS inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("ARGMAX token desconhecido '{}' (use AXIS=)", p));
+                }
+            }
+            Ok(instr_argmax(parse_reg(parts[1])?, parse_reg(parts[2])?, axis))
+        }
+        "REDUCE" => {
+            // REDUCE rD, rT OP=SUM|MEAN|MAX|MIN|PROD [AXIS=n]
+            if parts.len() < 3 {
+                return Err(anyhow!("REDUCE precisa de rdest, rTensor e OP= — ex: REDUCE r4, r0 OP=SUM"));
+            }
+            let (mut op, mut has_op, mut axis) = (0u8, false, 0xFFu8);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("OP=") {
+                    op = match v {
+                        "SUM" | "0" => REDUCE_SUM,
+                        "MEAN" | "1" => REDUCE_MEAN,
+                        "MAX" | "2" => REDUCE_MAX,
+                        "MIN" | "3" => REDUCE_MIN,
+                        "PROD" | "4" => REDUCE_PROD,
+                        _ => return Err(anyhow!("REDUCE OP '{}' inválido (use SUM/MEAN/MAX/MIN/PROD)", p)),
+                    };
+                    has_op = true;
+                } else if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("REDUCE AXIS inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("REDUCE token desconhecido '{}' (use OP=/AXIS=)", p));
+                }
+            }
+            if !has_op {
+                return Err(anyhow!("REDUCE precisa de OP= — ex: REDUCE r4, r0 OP=SUM"));
+            }
+            Ok(instr_reduce(parse_reg(parts[1])?, parse_reg(parts[2])?, op, axis))
+        }
+        "BROADCAST" => {
+            // BROADCAST rD, rT SHAPE=AxBxC (mesma regra do RESHAPE)
+            if parts.len() < 3 {
+                return Err(anyhow!("BROADCAST precisa de rdest, rTensor e SHAPE= — ex: BROADCAST r5, r4 SHAPE=2x2"));
+            }
+            let mut dims: Option<Vec<u32>> = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("SHAPE=") {
+                    dims = Some(parse_shape_dims(v, "BROADCAST")?);
+                } else {
+                    return Err(anyhow!("BROADCAST token desconhecido '{}' (use SHAPE=AxBxC)", p));
+                }
+            }
+            match dims {
+                Some(d) => Ok(instr_broadcast(parse_reg(parts[1])?, parse_reg(parts[2])?, &d)),
+                None => Err(anyhow!("BROADCAST precisa de SHAPE= — ex: BROADCAST r5, r4 SHAPE=2x2")),
+            }
+        }
+        "PAD" => {
+            // PAD rD, rT VALUE=x [AXIS=n] [BEFORE=n] [AFTER=n]
+            if parts.len() < 3 {
+                return Err(anyhow!("PAD precisa de rdest, rTensor e VALUE= — ex: PAD r6, r0 VALUE=0 AXIS=1 BEFORE=1 AFTER=1"));
+            }
+            let (mut value, mut has_value, mut axis, mut before, mut after) = (0.0f32, false, 0u8, 0u32, 0u32);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("VALUE=") {
+                    value = v.parse::<f32>().map_err(|_| anyhow!("PAD VALUE inválido '{}'", p))?;
+                    has_value = true;
+                } else if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("PAD AXIS inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("BEFORE=") {
+                    before = v.parse::<u32>().map_err(|_| anyhow!("PAD BEFORE inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("AFTER=") {
+                    after = v.parse::<u32>().map_err(|_| anyhow!("PAD AFTER inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("PAD token desconhecido '{}' (use VALUE=/AXIS=/BEFORE=/AFTER=)", p));
+                }
+            }
+            if !has_value {
+                return Err(anyhow!("PAD precisa de VALUE= — ex: PAD r6, r0 VALUE=0 BEFORE=1 AFTER=1"));
+            }
+            Ok(instr_pad(parse_reg(parts[1])?, parse_reg(parts[2])?, value, axis, before, after))
+        }
+        "TILE" => {
+            // TILE rD, rT REPS=n [AXIS=n]
+            if parts.len() < 3 {
+                return Err(anyhow!("TILE precisa de rdest, rTensor e REPS= — ex: TILE r7, r0 REPS=2 AXIS=0"));
+            }
+            let (mut reps, mut has_reps, mut axis) = (0u32, false, 0u8);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("REPS=") {
+                    reps = v.parse::<u32>().map_err(|_| anyhow!("TILE REPS inválido '{}'", p))?;
+                    has_reps = true;
+                } else if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("TILE AXIS inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("TILE token desconhecido '{}' (use REPS=/AXIS=)", p));
+                }
+            }
+            if !has_reps {
+                return Err(anyhow!("TILE precisa de REPS= — ex: TILE r7, r0 REPS=2"));
+            }
+            Ok(instr_tile(parse_reg(parts[1])?, parse_reg(parts[2])?, reps, axis))
+        }
+        "TRANSPOSE" => {
+            // TRANSPOSE rD, rT AXES=AxBxC (x-separado; vírgula quebraria o
+            // split do assembler — por isso x, como SHAPE=)
+            if parts.len() < 3 {
+                return Err(anyhow!("TRANSPOSE precisa de rdest, rTensor e AXES= — ex: TRANSPOSE r8, r0 AXES=1x0"));
+            }
+            let mut perm: Option<Vec<u8>> = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("AXES=") {
+                    let mut parsed = Vec::new();
+                    for a in v.split(|c| c == 'x' || c == 'X') {
+                        parsed.push(a.parse::<u8>().map_err(|_| anyhow!("TRANSPOSE AXES inválido '{}' (use AxBxC)", p))?);
+                    }
+                    if parsed.is_empty() || parsed.len() > 4 {
+                        return Err(anyhow!("TRANSPOSE AXES '{}' precisa de 1-4 eixos", p));
+                    }
+                    perm = Some(parsed);
+                } else {
+                    return Err(anyhow!("TRANSPOSE token desconhecido '{}' (use AXES=AxBxC)", p));
+                }
+            }
+            match perm {
+                Some(pm) => Ok(instr_transpose(parse_reg(parts[1])?, parse_reg(parts[2])?, &pm)),
+                None => Err(anyhow!("TRANSPOSE precisa de AXES= — ex: TRANSPOSE r8, r0 AXES=1x0")),
+            }
         }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
@@ -4766,6 +5185,86 @@ mod tests {
         assert!(assemble("SUB_IMM r2, r1 FOO=1").is_err());
         assert!(assemble("STEPS").is_err());
         assert!(assemble("STEPS r3 EXTRA").is_err());
+    }
+
+    // ---- RFC-0027: forma ------------------------------------------------
+
+    #[test]
+    fn test_rfc0027_ctor_roundtrip() {
+        let s = instr_sort(1, 0, 1, SORT_DESC);
+        assert_eq!(s.opcode, OP_SORT);
+        assert_eq!(s.sort_params(), (1, SORT_DESC));
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "SORT");
+        let t = instr_topk(2, 0, 1, 2, 1, 1);
+        assert_eq!(t.opcode, OP_TOPK);
+        assert_eq!(t.topk_params(), (1, 2, 1, 1));
+        let d = Instruction::decode(&t.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "TOPK");
+        let a = instr_argmax(3, 0, 1);
+        assert_eq!(a.opcode, OP_ARGMAX);
+        assert_eq!(a.argmax_axis(), 1);
+        let d = Instruction::decode(&a.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "ARGMAX");
+        let r = instr_reduce(4, 0, REDUCE_SUM, 0xFF);
+        assert_eq!(r.opcode, OP_REDUCE);
+        assert_eq!(r.reduce_params(), (REDUCE_SUM, 0xFF));
+        let d = Instruction::decode(&r.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "REDUCE");
+        let b = instr_broadcast(5, 4, &[2, 2]);
+        assert_eq!(b.opcode, OP_BROADCAST);
+        assert_eq!(b.broadcast_shape(), (2, [2, 2, 0, 0]));
+        let d = Instruction::decode(&b.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "BROADCAST");
+        let p = instr_pad(6, 0, 0.5, 1, 1, 1);
+        assert_eq!(p.opcode, OP_PAD);
+        assert_eq!(p.pad_params(), (0.5, 1, 1, 1));
+        let d = Instruction::decode(&p.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "PAD");
+        let l = instr_tile(7, 0, 2, 0);
+        assert_eq!(l.opcode, OP_TILE);
+        assert_eq!(l.tile_params(), (2, 0));
+        let d = Instruction::decode(&l.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "TILE");
+        let x = instr_transpose(8, 0, &[1, 0]);
+        assert_eq!(x.opcode, OP_TRANSPOSE);
+        assert_eq!(x.transpose_perm(), (2, [1, 0, 0, 0]));
+        let d = Instruction::decode(&x.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "TRANSPOSE");
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("SORT r1, r0 AXIS=1 ORDER=DESC").unwrap();
+        assert_eq!(prog[0].sort_params(), (1, SORT_DESC));
+        let prog = assemble("SORT r1, r0 DESC").unwrap();
+        assert_eq!(prog[0].sort_params(), (0, SORT_DESC));
+        let prog = assemble("TOPK r2, r0 K=2 AXIS=1 SMALLEST UNSORTED").unwrap();
+        assert_eq!(prog[0].topk_params(), (1, 2, 0, 0));
+        let prog = assemble("ARGMAX r3, r0 AXIS=1").unwrap();
+        assert_eq!(prog[0].argmax_axis(), 1);
+        let prog = assemble("REDUCE r4, r0 OP=MEAN AXIS=0").unwrap();
+        assert_eq!(prog[0].reduce_params(), (REDUCE_MEAN, 0));
+        let prog = assemble("REDUCE r4, r0 OP=SUM").unwrap();
+        assert_eq!(prog[0].reduce_params(), (REDUCE_SUM, 0xFF));
+        let prog = assemble("BROADCAST r5, r4 SHAPE=2x2").unwrap();
+        assert_eq!(prog[0].broadcast_shape(), (2, [2, 2, 0, 0]));
+        let prog = assemble("PAD r6, r0 VALUE=0.5 BEFORE=1 AFTER=2").unwrap();
+        assert_eq!(prog[0].pad_params(), (0.5, 0, 1, 2));
+        let prog = assemble("TILE r7, r0 REPS=3 AXIS=1").unwrap();
+        assert_eq!(prog[0].tile_params(), (3, 1));
+        let prog = assemble("TRANSPOSE r8, r0 AXES=1x0").unwrap();
+        assert_eq!(prog[0].transpose_perm(), (2, [1, 0, 0, 0]));
+        assert!(assemble("SORT r1").is_err());
+        assert!(assemble("SORT r1, r0 ORDER=UP").is_err());
+        assert!(assemble("SORT r1, r0 FOO=1").is_err());
+        assert!(assemble("TOPK r2, r0").is_err());
+        assert!(assemble("TOPK r2, r0 K=2 FOO=1").is_err());
+        assert!(assemble("ARGMAX r3").is_err());
+        assert!(assemble("REDUCE r4, r0").is_err());
+        assert!(assemble("REDUCE r4, r0 OP=MEDIAN").is_err());
+        assert!(assemble("BROADCAST r5, r4").is_err());
+        assert!(assemble("PAD r6, r0").is_err());
+        assert!(assemble("TILE r7, r0").is_err());
+        assert!(assemble("TRANSPOSE r8, r0").is_err());
+        assert!(assemble("TRANSPOSE r8, r0 AXES=1,0").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

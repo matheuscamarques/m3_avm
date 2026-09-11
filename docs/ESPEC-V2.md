@@ -241,18 +241,18 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x2E` | `SLICE` | 32 | IMPL | S | Flat [start,len) => [1,len] (RFC-0019) |
 | `0x2F` | `CONCAT` | 32 | IMPL | S | N-D axis assembly (RFC-0024) |
 
-### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — DRAFT, 32B
+### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — PARTIAL (0x30-0x37 IMPL, resto DRAFT), 32B
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x30` | `SORT` | 32 | DRAFT | S | Axis+order |
-| `0x31` | `TOPK` | 32 | DRAFT | S | k+axis+largest+sorted |
-| `0x32` | `ARGMAX` | 32 | DRAFT | S | Axis |
-| `0x33` | `REDUCE` | 32 | DRAFT | S | sum/mean/max/min/prod |
-| `0x34` | `BROADCAST` | 32 | DRAFT | S | Target shape |
-| `0x35` | `PAD` | 32 | DRAFT | S | Per-axis |
-| `0x36` | `TILE` | 32 | DRAFT | S | Repeats |
-| `0x37` | `TRANSPOSE` | 32 | DRAFT | S | Axis permute |
+| `0x30` | `SORT` | 32 | IMPL | S | Total order, NaN=+inf (RFC-0027) |
+| `0x31` | `TOPK` | 32 | IMPL | S | [vals\|idx] pack, det. ties (RFC-0027) |
+| `0x32` | `ARGMAX` | 32 | IMPL | S | maxNum-consistent (RFC-0027) |
+| `0x33` | `REDUCE` | 32 | IMPL | S | 5 ops, axis/full (RFC-0027) |
+| `0x34` | `BROADCAST` | 32 | IMPL | S | Right-aligned copy (RFC-0027) |
+| `0x35` | `PAD` | 32 | IMPL | S | Single-axis, composes (RFC-0027) |
+| `0x36` | `TILE` | 32 | IMPL | S | Single-axis reps (RFC-0027) |
+| `0x37` | `TRANSPOSE` | 32 | IMPL | S | Generic N-D permute (RFC-0027) |
 | `0x38` | `KV_TRUNCATE` | 32 | IMPL | F2 | KV_CACHE; len+stream gate (RFC-0010) |
 | `0x39` | `KV_COMPRESS` | 32 | DRAFT | F2 | KV_CACHE |
 | `0x3A` | `FLASH_ATTN` | 32 | DRAFT | F2 | KV_CACHE; IO-aware |

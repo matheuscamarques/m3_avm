@@ -60,6 +60,10 @@ harness = false
 name = "alu_bench"
 harness = false
 
+[[bench]]
+name = "shape_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

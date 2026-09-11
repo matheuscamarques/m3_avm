@@ -37,6 +37,9 @@ use crate::opcodes::{
     OP_CAST, OP_QUANTIZE, OP_DEQUANT, CAST_DST_F32, CAST_DST_F16, CAST_DST_BF16,
     CAST_DST_I8, CAST_DST_U8, QUANTIZE_Q4_0, QUANTIZE_Q8_0,
     OP_ADD_IMM, OP_SUB_IMM, OP_STEPS,
+    OP_SORT, OP_TOPK, OP_ARGMAX, OP_REDUCE, OP_BROADCAST, OP_PAD, OP_TILE,
+    OP_TRANSPOSE, SORT_ASC, SORT_DESC, REDUCE_SUM, REDUCE_MEAN, REDUCE_MAX,
+    REDUCE_MIN, REDUCE_PROD,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -134,6 +137,14 @@ pub struct VmStats {
     pub add_imm_execs: u64,
     pub sub_imm_execs: u64,
     pub steps_execs: u64,
+    pub sort_execs: u64,
+    pub topk_execs: u64,
+    pub argmax_execs: u64,
+    pub reduce_execs: u64,
+    pub broadcast_execs: u64,
+    pub pad_execs: u64,
+    pub tile_execs: u64,
+    pub transpose_execs: u64,
     pub start_ns: u64,
 }
 
@@ -1160,6 +1171,38 @@ impl Vm {
             }
             OP_STEPS => {
                 self.exec_steps(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SORT => {
+                self.exec_sort(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_TOPK => {
+                self.exec_topk(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ARGMAX => {
+                self.exec_argmax(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_REDUCE => {
+                self.exec_reduce(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_BROADCAST => {
+                self.exec_broadcast(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_PAD => {
+                self.exec_pad(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_TILE => {
+                self.exec_tile(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_TRANSPOSE => {
+                self.exec_transpose(ctx_id, instr)?;
                 Ok(true)
             }
             OP_FOREST => {
@@ -4287,6 +4330,501 @@ impl Vm {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // RFC-0027: forma (0x30-0x37). Invariantes de índice: todo índice
+    // escrito é < out.len() por construção (cada produto parcial <= total
+    // final <= usize::MAX); estouros de parse (u64) usam try_from/checked.
+    // -----------------------------------------------------------------------
+
+    /// Decomposição (outer, dim, inner) de um eixo. None se eixo >= rank.
+    fn axis_decomp(shape: &[usize], axis: usize) -> Option<(usize, usize, usize)> {
+        if axis >= shape.len() {
+            return None;
+        }
+        let outer: usize = shape[..axis].iter().product();
+        let inner: usize = shape[axis + 1..].iter().product();
+        Some((outer, shape[axis], inner))
+    }
+
+    /// Ordem total determinística (RFC-0027): NaN como +inf; empate
+    /// (incl. -0.0/0.0) sempre resolve para o menor índice original,
+    /// nas duas direções.
+    fn lane_cmp(a: (f32, usize), b: (f32, usize), desc: bool) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        let ord = match (a.0.is_nan(), b.0.is_nan()) {
+            (true, true) => Equal,
+            (true, false) => Greater,
+            (false, true) => Less,
+            (false, false) => a.0.partial_cmp(&b.0).unwrap_or(Equal),
+        };
+        let ord = if desc && ord != Equal { ord.reverse() } else { ord };
+        if ord == Equal {
+            a.1.cmp(&b.1)
+        } else {
+            ord
+        }
+    }
+
+    /// Lê tensor denso F32 + shape (guards uniformes RFC-0027: meta
+    /// existe, denso, F32, layout plano, não-vazio).
+    fn read_dense_f32(&self, addr: u128, op: &str) -> Result<(Vec<usize>, Vec<f32>)> {
+        let meta = self.memory.get_tensor_meta(addr).cloned()
+            .ok_or_else(|| anyhow!("{}: 0x{:x} não é tensor", op, addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("{}: esparso não suportado (denso nesta RFC)", op));
+        }
+        if meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("{}: dtype {:?} (só F32 nesta RFC)", op, meta.dtype));
+        }
+        let numel: usize = meta.shape.iter().product();
+        if numel == 0 {
+            return Err(anyhow!("{}: tensor vazio", op));
+        }
+        if meta.byte_len != numel.saturating_mul(4) {
+            return Err(anyhow!("{}: layout não-plano", op));
+        }
+        let data = self.memory.read_f32_tensor(addr, numel)?;
+        Ok((meta.shape, data))
+    }
+
+    /// SORT rD, rT [AXIS] [ORDER] — ordenação por eixo em tensor NOVO.
+    fn exec_sort(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("SORT precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (axis_p, order) = instr.sort_params();
+        if order != SORT_ASC && order != SORT_DESC {
+            return Err(anyhow!("SORT: ORDER={} inválido (0=ASC,1=DESC)", order));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "SORT")?;
+        let axis = axis_p as usize;
+        let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+            .ok_or_else(|| anyhow!("SORT: AXIS {} fora do rank {}", axis, shape.len()))?;
+        let desc = order == SORT_DESC;
+        let mut out = data.clone();
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut lane: Vec<(f32, usize)> =
+                    (0..dim).map(|k| (data[o * dim * inner + k * inner + i], k)).collect();
+                lane.sort_by(|a, b| Self::lane_cmp(*a, *b, desc));
+                for (k, (v, _)) in lane.iter().enumerate() {
+                    out[o * dim * inner + k * inner + i] = *v;
+                }
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.sort_execs += 1;
+        log_debug("sort", &format!("ctx {} SORT 0x{:x}{:?} AXIS={} -> 0x{:x}", ctx_id, t_addr, shape, axis, out_addr));
+        Ok(())
+    }
+
+    /// TOPK rD, rT — [k valores | k índices] ao longo do eixo (pack
+    /// DISTANCE, RFC-0004). Saída: mesmo rank, dim do eixo = 2k.
+    fn exec_topk(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("TOPK precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (axis_p, k_p, largest, sorted) = instr.topk_params();
+        if largest > 1 || sorted > 1 {
+            return Err(anyhow!("TOPK: flags fora de 0/1"));
+        }
+        if k_p == 0 {
+            return Err(anyhow!("TOPK: K 0 (seleção vazia é bug do chamador)"));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "TOPK")?;
+        let axis = axis_p as usize;
+        let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+            .ok_or_else(|| anyhow!("TOPK: AXIS {} fora do rank {}", axis, shape.len()))?;
+        let k = k_p as usize;
+        if k > dim {
+            return Err(anyhow!("TOPK: K={} > dim={} (sem clamp silencioso)", k, dim));
+        }
+        let desc = largest != 0;
+        let mut out_shape = shape.clone();
+        out_shape[axis] = 2 * k;
+        let mut out = vec![0.0f32; outer * (2 * k) * inner];
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut lane: Vec<(f32, usize)> =
+                    (0..dim).map(|kk| (data[o * dim * inner + kk * inner + i], kk)).collect();
+                lane.sort_by(|a, b| Self::lane_cmp(*a, *b, desc));
+                let mut sel = lane[..k].to_vec();
+                if sorted == 0 {
+                    sel.sort_by_key(|&(_, idx)| idx); // ordem original — ainda determinístico
+                }
+                for (j, (v, idx)) in sel.iter().enumerate() {
+                    out[(o * (2 * k) + j) * inner + i] = *v;
+                    out[(o * (2 * k) + k + j) * inner + i] = *idx as f32;
+                }
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.topk_execs += 1;
+        log_debug("topk", &format!("ctx {} TOPK 0x{:x}{:?} K={} AXIS={} -> 0x{:x}", ctx_id, t_addr, shape, k, axis, out_addr));
+        Ok(())
+    }
+
+    /// ARGMAX rD, rT — índices como f32 (exatos p/ dim < 2^24), dim do
+    /// eixo vira 1. NaN ignorado salvo tudo-NaN (menor índice) —
+    /// maxNum-consistente com REDUCE (não numpy, documentado).
+    fn exec_argmax(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("ARGMAX precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let axis = instr.argmax_axis() as usize;
+        let (shape, data) = self.read_dense_f32(t_addr, "ARGMAX")?;
+        let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+            .ok_or_else(|| anyhow!("ARGMAX: AXIS {} fora do rank {}", axis, shape.len()))?;
+        let mut out_shape = shape.clone();
+        out_shape[axis] = 1;
+        let mut out = vec![0.0f32; outer * inner];
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut best_idx = 0usize;
+                let mut best_val = f32::NEG_INFINITY;
+                let mut seen = false;
+                let mut nan_idx: Option<usize> = None;
+                for k in 0..dim {
+                    let v = data[o * dim * inner + k * inner + i];
+                    if v.is_nan() {
+                        if nan_idx.is_none() {
+                            nan_idx = Some(k);
+                        }
+                    } else if !seen || v > best_val {
+                        best_val = v;
+                        best_idx = k;
+                        seen = true;
+                    }
+                }
+                out[o * inner + i] = nan_idx.map_or(best_idx, |n| if seen { best_idx } else { n }) as f32;
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.argmax_execs += 1;
+        log_debug("argmax", &format!("ctx {} ARGMAX 0x{:x}{:?} AXIS={} -> 0x{:x}", ctx_id, t_addr, shape, axis, out_addr));
+        Ok(())
+    }
+
+    /// REDUCE rD, rT OP=... [AXIS=n] — redução em tensor NOVO (eixo vira
+    /// 1; sem eixo = escalar [1]). SUM/MEAN/PROD propagam NaN (aritmética
+    /// f32); MAX/MIN pulam NaN (f32::max), tudo-NaN => NaN.
+    fn exec_reduce(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("REDUCE precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (op, axis_p) = instr.reduce_params();
+        if op > REDUCE_PROD {
+            return Err(anyhow!("REDUCE: OP={} inválido (0-4)", op));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "REDUCE")?;
+        // Sem eixo (0xFF): escalar [1]; com eixo: dim vira 1.
+        let (out_shape, lanes): (Vec<usize>, Vec<(usize, usize, usize)>) = if axis_p == 0xFF {
+            (vec![1], vec![(0, shape.iter().product(), 1)])
+        } else {
+            let axis = axis_p as usize;
+            let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+                .ok_or_else(|| anyhow!("REDUCE: AXIS {} fora do rank {}", axis, shape.len()))?;
+            let mut os = shape.clone();
+            os[axis] = 1;
+            let mut ls = Vec::new();
+            for o in 0..outer {
+                for i in 0..inner {
+                    // Cada lane: base + k*inner, k em 0..dim.
+                    ls.push((o * dim * inner + i, dim, inner));
+                }
+            }
+            (os, ls)
+        };
+        let mut out = Vec::with_capacity(lanes.len());
+        for (base, dim, stride) in lanes {
+            let lane: Vec<f32> = (0..dim).map(|k| data[base + k * stride]).collect();
+            let v = match op {
+                REDUCE_SUM => lane.iter().sum(),
+                REDUCE_MEAN => lane.iter().sum::<f32>() / dim as f32,
+                REDUCE_PROD => lane.iter().product(),
+                REDUCE_MAX => lane.iter().copied().reduce(f32::max).unwrap_or(f32::NAN),
+                _ => lane.iter().copied().reduce(f32::min).unwrap_or(f32::NAN),
+            };
+            out.push(v);
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.reduce_execs += 1;
+        log_debug("reduce", &format!("ctx {} REDUCE 0x{:x}{:?} OP={} -> 0x{:x}", ctx_id, t_addr, shape, op, out_addr));
+        Ok(())
+    }
+
+    /// BROADCAST rD, rT SHAPE=... — expansão right-aligned (cópia).
+    fn exec_broadcast(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("BROADCAST precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (ndim, dims4) = instr.broadcast_shape();
+        if !(1..=4).contains(&ndim) {
+            return Err(anyhow!("BROADCAST: ndim {} fora de 1-4", ndim));
+        }
+        let target: Vec<usize> = dims4[..ndim as usize].iter().map(|&d| d as usize).collect();
+        if target.iter().any(|&d| d == 0) {
+            return Err(anyhow!("BROADCAST: dim 0 (dims > 0)"));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "BROADCAST")?;
+        if target.len() < shape.len() {
+            return Err(anyhow!("BROADCAST: alvo {:?} afunila rank {:?} (sem squeeze silencioso)", target, shape));
+        }
+        let off = target.len() - shape.len();
+        for (i, &sd) in shape.iter().enumerate() {
+            let td = target[off + i];
+            if sd != 1 && sd != td {
+                return Err(anyhow!("BROADCAST: dim {} incompatível ({} vs {})", off + i, sd, td));
+            }
+        }
+        // Strides da fonte (0 onde broadcast: dim fonte 1 repete ou é
+        // constante; stride real só quando fonte e alvo coincidem > 1).
+        let mut src_strides = vec![0usize; target.len()];
+        let mut stride = 1usize;
+        for i in (0..target.len()).rev() {
+            let sd = if i < off { 1 } else { shape[i - off] };
+            src_strides[i] = if target[i] == sd && sd != 1 { stride } else { 0 };
+            stride = stride.checked_mul(target[i])
+                .ok_or_else(|| anyhow!("BROADCAST: shape alvo estoura"))?;
+        }
+        let total: usize = target.iter().try_fold(1usize, |a, &d| a.checked_mul(d))
+            .ok_or_else(|| anyhow!("BROADCAST: shape alvo estoura"))?;
+        if total == 0 {
+            return Err(anyhow!("BROADCAST: alvo vazio"));
+        }
+        // Odômetro sobre o alvo.
+        let mut out = Vec::with_capacity(total);
+        let mut coord = vec![0usize; target.len()];
+        for _ in 0..total {
+            let mut src_flat = 0usize;
+            for (i, &c) in coord.iter().enumerate() {
+                src_flat += c * src_strides[i];
+            }
+            out.push(data[src_flat]);
+            // incrementa odômetro (eixo 0 mais significativo)
+            for i in (0..target.len()).rev() {
+                coord[i] += 1;
+                if coord[i] < target[i] {
+                    break;
+                }
+                coord[i] = 0;
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&target, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.broadcast_execs += 1;
+        log_debug("broadcast", &format!("ctx {} BROADCAST 0x{:x}{:?} -> {:?} 0x{:x}", ctx_id, t_addr, shape, target, out_addr));
+        Ok(())
+    }
+
+    /// PAD rD, rT — crescimento single-axis com valor (tensor NOVO).
+    /// Multi-eixo compõe por repetição (desenho). before==after==0 veta
+    /// (no-op; use MOV).
+    fn exec_pad(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("PAD precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (value, axis_p, before_p, after_p) = instr.pad_params();
+        let (shape, data) = self.read_dense_f32(t_addr, "PAD")?;
+        let axis = axis_p as usize;
+        let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+            .ok_or_else(|| anyhow!("PAD: AXIS {} fora do rank {}", axis, shape.len()))?;
+        let (before, after) = (before_p as usize, after_p as usize);
+        if before == 0 && after == 0 {
+            return Err(anyhow!("PAD: BEFORE=AFTER=0 (no-op; use MOV)"));
+        }
+        let new_dim = dim.checked_add(before).and_then(|d| d.checked_add(after))
+            .ok_or_else(|| anyhow!("PAD: dim resultante estoura"))?;
+        let mut out_shape = shape.clone();
+        out_shape[axis] = new_dim;
+        let total = outer.checked_mul(new_dim).and_then(|t| t.checked_mul(inner))
+            .ok_or_else(|| anyhow!("PAD: shape resultante estoura"))?;
+        let mut out = vec![value; total];
+        for o in 0..outer {
+            for i in 0..inner {
+                for k in 0..dim {
+                    out[(o * new_dim + before + k) * inner + i] =
+                        data[(o * dim + k) * inner + i];
+                }
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.pad_execs += 1;
+        log_debug("pad", &format!("ctx {} PAD 0x{:x}{:?} AXIS={}+{}+{} -> 0x{:x}", ctx_id, t_addr, shape, before, dim, after, out_addr));
+        Ok(())
+    }
+
+    /// TILE rD, rT — repetição single-axis (tensor NOVO). REPS=0 veta.
+    fn exec_tile(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("TILE precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (reps_p, axis_p) = instr.tile_params();
+        if reps_p == 0 {
+            return Err(anyhow!("TILE: REPS 0 (saída vazia é bug do chamador)"));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "TILE")?;
+        let axis = axis_p as usize;
+        let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+            .ok_or_else(|| anyhow!("TILE: AXIS {} fora do rank {}", axis, shape.len()))?;
+        let reps = reps_p as usize;
+        let new_dim = dim.checked_mul(reps)
+            .ok_or_else(|| anyhow!("TILE: dim resultante estoura"))?;
+        let mut out_shape = shape.clone();
+        out_shape[axis] = new_dim;
+        let total = outer.checked_mul(new_dim).and_then(|t| t.checked_mul(inner))
+            .ok_or_else(|| anyhow!("TILE: shape resultante estoura"))?;
+        let mut out = Vec::with_capacity(total);
+        for o in 0..outer {
+            for _ in 0..reps {
+                for k in 0..dim {
+                    out.extend_from_slice(&data[(o * dim + k) * inner..(o * dim + k) * inner + inner]);
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), total);
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.tile_execs += 1;
+        log_debug("tile", &format!("ctx {} TILE 0x{:x}{:?} AXIS={}x{} -> 0x{:x}", ctx_id, t_addr, shape, axis, reps, out_addr));
+        Ok(())
+    }
+
+    /// TRANSPOSE rD, rT — permuta N-D genérica (tensor NOVO, cópia).
+    /// ndim deve igualar o rank; perm total (cada eixo 1×, todos < ndim).
+    fn exec_transpose(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("TRANSPOSE precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (ndim_p, perm4) = instr.transpose_perm();
+        let (shape, data) = self.read_dense_f32(t_addr, "TRANSPOSE")?;
+        let ndim = ndim_p as usize;
+        if ndim != shape.len() || !(1..=4).contains(&ndim) {
+            return Err(anyhow!("TRANSPOSE: ndim {} != rank {} (1-4, exato)", ndim, shape.len()));
+        }
+        let perm = &perm4[..ndim];
+        let mut seen = [false; 4];
+        for &p in perm {
+            if (p as usize) >= ndim {
+                return Err(anyhow!("TRANSPOSE: eixo {} fora do rank {}", p, ndim));
+            }
+            if seen[p as usize] {
+                return Err(anyhow!("TRANSPOSE: eixo {} repetido (permutação total)", p));
+            }
+            seen[p as usize] = true;
+        }
+        let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p as usize]).collect();
+        // Strides row-major (entrada e saída). in_flat abaixo é sempre
+        // < numel por construção (permutação bijetora de coords válidas),
+        // sem clamp: indexação direta, sem máscara de bug.
+        let mut in_strides = vec![0usize; ndim];
+        let mut st = 1usize;
+        for i in (0..ndim).rev() {
+            in_strides[i] = st;
+            st *= shape[i];
+        }
+        let mut out_strides = vec![0usize; ndim];
+        st = 1usize;
+        for i in (0..ndim).rev() {
+            out_strides[i] = st;
+            st *= out_shape[i];
+        }
+        let numel = data.len();
+        let mut out = vec![0.0f32; numel];
+        for out_flat in 0..numel {
+            let mut tmp = out_flat;
+            let mut in_flat = 0usize;
+            for (i, &p) in perm.iter().enumerate() {
+                let c = tmp / out_strides[i];
+                tmp %= out_strides[i];
+                in_flat += c * in_strides[p as usize];
+            }
+            out[out_flat] = data[in_flat];
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.transpose_execs += 1;
+        log_debug("transpose", &format!("ctx {} TRANSPOSE 0x{:x}{:?} {:?} -> 0x{:x}", ctx_id, t_addr, shape, perm, out_addr));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -6241,6 +6779,205 @@ mod tests {
         assert_eq!((stats.add_imm_execs, stats.sub_imm_execs, stats.steps_execs), (1, 1, 1));
         let ctx = vm.scheduler.get(1).unwrap().clone();
         assert_eq!((ctx.reg(1).unwrap(), ctx.reg(2).unwrap(), ctx.reg(3).unwrap()), (123, 100, 3));
+    }
+
+    // ---- RFC-0027: forma ------------------------------------------------
+
+    #[test]
+    fn test_rfc0027_sort_topk_argmax() {
+        use crate::opcodes::{instr_argmax, instr_sort, instr_topk, SORT_DESC};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[2, 4], &[0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0)]);
+        // SORT DESC por linha.
+        vm.step_instruction(cid, &instr_sort(1, 0, 1, SORT_DESC)).unwrap();
+        let s = rfc0005_reg_u64(&vm, cid, 1) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(s, 8).unwrap(), vec![2.0, 1.5, 1.0, 0.5, 4.0, 3.5, 3.0, 2.5]);
+        // SORT ASC por coluna (já ordenado => idêntico).
+        vm.step_instruction(cid, &instr_sort(2, 0, 0, 0)).unwrap();
+        let s0 = rfc0005_reg_u64(&vm, cid, 2) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(s0, 8).unwrap(), vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]);
+        // TOPK k=2 largest sorted: [vals | idx].
+        vm.step_instruction(cid, &instr_topk(3, 0, 1, 2, 1, 1)).unwrap();
+        let t = rfc0005_reg_u64(&vm, cid, 3) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(t, 8).unwrap(), vec![2.0, 1.5, 3.0, 2.0, 4.0, 3.5, 3.0, 2.0]);
+        // TOPK smallest unsorted: ordem original dos índices.
+        vm.step_instruction(cid, &instr_topk(4, 0, 1, 2, 0, 0)).unwrap();
+        let t4 = rfc0005_reg_u64(&vm, cid, 4) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(t4, 8).unwrap(), vec![0.5, 1.0, 0.0, 1.0, 2.5, 3.0, 0.0, 1.0]);
+        // ARGMAX por linha.
+        vm.step_instruction(cid, &instr_argmax(5, 0, 1)).unwrap();
+        let am = rfc0005_reg_u64(&vm, cid, 5) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(am, 2).unwrap(), vec![3.0, 3.0]);
+        // NaN: ASC põe por último; ARGMAX ignora (maxNum); tudo-NaN => idx 0.
+        let an = rfc0004_f32(&mut vm, &[3], &[3.0, f32::NAN, 1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, an).unwrap();
+        vm.step_instruction(cid, &instr_sort(7, 6, 0, 0)).unwrap();
+        let sn = rfc0005_reg_u64(&vm, cid, 7) as u128;
+        let got = vm.memory.read_f32_tensor(sn, 3).unwrap();
+        assert_eq!(got[0], 1.0);
+        assert_eq!(got[1], 3.0);
+        assert!(got[2].is_nan());
+        vm.step_instruction(cid, &instr_argmax(8, 6, 0)).unwrap();
+        let an2 = rfc0005_reg_u64(&vm, cid, 8) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(an2, 1).unwrap(), vec![0.0]);
+        let allnan = rfc0004_f32(&mut vm, &[2], &[f32::NAN, f32::NAN]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, allnan).unwrap();
+        vm.step_instruction(cid, &instr_argmax(8, 6, 0)).unwrap();
+        let an3 = rfc0005_reg_u64(&vm, cid, 8) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(an3, 1).unwrap(), vec![0.0]);
+        // Erros: eixo fora, K=0, K>dim, esparso, meta ausente.
+        assert!(vm.step_instruction(cid, &instr_sort(1, 0, 5, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_topk(1, 0, 1, 0, 1, 1)).is_err());
+        assert!(vm.step_instruction(cid, &instr_topk(1, 0, 1, 5, 1, 1)).is_err());
+        assert!(vm.step_instruction(cid, &instr_argmax(1, 0, 2)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[2, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(9, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_sort(1, 9, 0, 0)).is_err());
+        vm.scheduler.get_mut(cid).unwrap().set_reg(9, 0xdead).unwrap();
+        assert!(vm.step_instruction(cid, &instr_topk(1, 9, 0, 1, 1, 1)).is_err());
+        assert_eq!(vm.stats.sort_execs, 3);
+        assert_eq!(vm.stats.topk_execs, 2);
+        assert_eq!(vm.stats.argmax_execs, 3);
+    }
+
+    #[test]
+    fn test_rfc0027_reduce() {
+        use crate::opcodes::{instr_reduce, REDUCE_SUM, REDUCE_MEAN, REDUCE_MAX, REDUCE_MIN, REDUCE_PROD};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[2, 4], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0)]);
+        let rd = |vm: &Vm, r: u8, n: usize| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, n).unwrap();
+        // Total: SUM=36, MEAN=4.5, PROD=40320, MAX=8, MIN=1.
+        vm.step_instruction(cid, &instr_reduce(1, 0, REDUCE_SUM, 0xFF)).unwrap();
+        assert_eq!(rd(&vm, 1, 1), vec![36.0]);
+        vm.step_instruction(cid, &instr_reduce(1, 0, REDUCE_MEAN, 0xFF)).unwrap();
+        assert_eq!(rd(&vm, 1, 1), vec![4.5]);
+        vm.step_instruction(cid, &instr_reduce(1, 0, REDUCE_PROD, 0xFF)).unwrap();
+        assert_eq!(rd(&vm, 1, 1), vec![40320.0]);
+        vm.step_instruction(cid, &instr_reduce(1, 0, REDUCE_MAX, 0xFF)).unwrap();
+        assert_eq!(rd(&vm, 1, 1), vec![8.0]);
+        vm.step_instruction(cid, &instr_reduce(1, 0, REDUCE_MIN, 0xFF)).unwrap();
+        assert_eq!(rd(&vm, 1, 1), vec![1.0]);
+        // Por eixo: SUM eixo 0 => [6,8,10,12]; MEAN eixo 1 => [2.5,6.5].
+        vm.step_instruction(cid, &instr_reduce(2, 0, REDUCE_SUM, 0)).unwrap();
+        assert_eq!(rd(&vm, 2, 4), vec![6.0, 8.0, 10.0, 12.0]);
+        vm.step_instruction(cid, &instr_reduce(3, 0, REDUCE_MEAN, 1)).unwrap();
+        assert_eq!(rd(&vm, 3, 2), vec![2.5, 6.5]);
+        // NaN: MAX pula (2.0), tudo-NaN => NaN.
+        let an = rfc0004_f32(&mut vm, &[2], &[f32::NAN, 2.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, an).unwrap();
+        vm.step_instruction(cid, &instr_reduce(5, 4, REDUCE_MAX, 0xFF)).unwrap();
+        assert_eq!(rd(&vm, 5, 1), vec![2.0]);
+        let allnan = rfc0004_f32(&mut vm, &[2], &[f32::NAN, f32::NAN]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, allnan).unwrap();
+        vm.step_instruction(cid, &instr_reduce(5, 4, REDUCE_MAX, 0xFF)).unwrap();
+        assert!(rd(&vm, 5, 1)[0].is_nan());
+        // Erros: OP ruim, eixo fora, esparso.
+        let mut bad = instr_reduce(1, 0, REDUCE_SUM, 0xFF);
+        bad.set_reduce_params(9, 0xFF);
+        assert!(vm.step_instruction(cid, &bad).is_err());
+        assert!(vm.step_instruction(cid, &instr_reduce(1, 0, REDUCE_SUM, 3)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[2, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_reduce(1, 4, REDUCE_SUM, 0xFF)).is_err());
+        assert_eq!(vm.stats.reduce_execs, 9);
+    }
+
+    #[test]
+    fn test_rfc0027_broadcast_pad_tile_transpose() {
+        use crate::opcodes::{instr_broadcast, instr_pad, instr_tile, instr_transpose};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let a1 = rfc0004_f32(&mut vm, &[4], &[1.0, 2.0, 3.0, 4.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0), (1, a1)]);
+        let rd = |vm: &Vm, r: u8, n: usize| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, n).unwrap();
+        // BROADCAST [4] -> [2,4]: linhas repetidas.
+        vm.step_instruction(cid, &instr_broadcast(2, 1, &[2, 4])).unwrap();
+        assert_eq!(rd(&vm, 2, 8), vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+        // BROADCAST [1] -> [2,2]: constante.
+        let aone = rfc0004_f32(&mut vm, &[1], &[7.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, aone).unwrap();
+        vm.step_instruction(cid, &instr_broadcast(4, 3, &[2, 2])).unwrap();
+        assert_eq!(rd(&vm, 4, 4), vec![7.0; 4]);
+        // Incompatível e afunilamento vetam.
+        let a23 = rfc0004_f32(&mut vm, &[2, 3], &[0.0; 6]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, a23).unwrap();
+        assert!(vm.step_instruction(cid, &instr_broadcast(4, 0, &[2, 3])).is_err());
+        assert!(vm.step_instruction(cid, &instr_broadcast(4, 0, &[2])).is_err());
+        // PAD eixo 1: [2,2] +1/+1 com 9.0.
+        vm.step_instruction(cid, &instr_pad(5, 0, 9.0, 1, 1, 1)).unwrap();
+        assert_eq!(rd(&vm, 5, 8), vec![9.0, 1.0, 2.0, 9.0, 9.0, 3.0, 4.0, 9.0]);
+        // PAD no-op e eixo fora vetam.
+        assert!(vm.step_instruction(cid, &instr_pad(5, 0, 9.0, 1, 0, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_pad(5, 0, 9.0, 5, 1, 1)).is_err());
+        // TILE eixo 0 x2: bloco do eixo repetido ([1,2],[3,4] ×2).
+        vm.step_instruction(cid, &instr_tile(6, 0, 2, 0)).unwrap();
+        assert_eq!(rd(&vm, 6, 8), vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+        assert!(vm.step_instruction(cid, &instr_tile(6, 0, 0, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_tile(6, 0, 2, 7)).is_err());
+        // TRANSPOSE 2-D + 3-D pontual.
+        vm.step_instruction(cid, &instr_transpose(7, 0, &[1, 0])).unwrap();
+        assert_eq!(rd(&vm, 7, 4), vec![1.0, 3.0, 2.0, 4.0]);
+        let a222 = rfc0004_f32(&mut vm, &[2, 2, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, a222).unwrap();
+        vm.step_instruction(cid, &instr_transpose(8, 3, &[2, 0, 1])).unwrap();
+        // numpy: in_coord[perm[i]] = out_coord[i], i.e. out[a,b,c]=in[b,c,a].
+        assert_eq!(rd(&vm, 8, 8), vec![1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]);
+        // Perm inválida: repetida, fora, ndim != rank.
+        assert!(vm.step_instruction(cid, &instr_transpose(8, 0, &[0, 0])).is_err());
+        assert!(vm.step_instruction(cid, &instr_transpose(8, 0, &[2, 0])).is_err());
+        assert!(vm.step_instruction(cid, &instr_transpose(8, 0, &[0])).is_err());
+        assert_eq!(vm.stats.broadcast_execs, 2);
+        assert_eq!(vm.stats.pad_execs, 1);
+        assert_eq!(vm.stats.tile_execs, 1);
+        assert_eq!(vm.stats.transpose_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0027_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // Pipeline combinado: as 8 formas numa passada (rampa 0.5..4.0).
+        let src = r#"
+            TENSOR r0 2 4 f32
+            SORT r1, r0 AXIS=1 ORDER=DESC
+            TOPK r2, r0 K=2 AXIS=1
+            ARGMAX r3, r0 AXIS=1
+            REDUCE r4, r0 OP=SUM
+            BROADCAST r5, r4 SHAPE=2x2
+            PAD r6, r0 VALUE=0 AXIS=1 BEFORE=1 AFTER=1
+            TILE r7, r0 REPS=2 AXIS=0
+            TRANSPOSE r8, r0 AXES=1x0
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.sort_execs, stats.topk_execs, stats.argmax_execs, stats.reduce_execs), (1, 1, 1, 1));
+        assert_eq!((stats.broadcast_execs, stats.pad_execs, stats.tile_execs, stats.transpose_execs), (1, 1, 1, 1));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let rd = |r: u8, n: usize| vm.memory.read_f32_tensor(ctx.reg(r).unwrap(), n).unwrap();
+        assert_eq!(rd(1, 8), vec![2.0, 1.5, 1.0, 0.5, 4.0, 3.5, 3.0, 2.5]);
+        assert_eq!(rd(2, 8), vec![2.0, 1.5, 3.0, 2.0, 4.0, 3.5, 3.0, 2.0]);
+        assert_eq!(rd(3, 2), vec![3.0, 3.0]);
+        assert_eq!(rd(4, 1), vec![18.0]);
+        assert_eq!(rd(5, 4), vec![18.0; 4]);
+        assert_eq!(rd(6, 12), vec![0.0, 0.5, 1.0, 1.5, 2.0, 0.0, 0.0, 2.5, 3.0, 3.5, 4.0, 0.0]);
+        assert_eq!(rd(7, 16), vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]);
+        assert_eq!(rd(8, 8), vec![0.5, 2.5, 1.0, 3.0, 1.5, 3.5, 2.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0027_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/shape_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.sort_execs, stats.topk_execs, stats.argmax_execs, stats.reduce_execs), (1, 1, 1, 1));
+        assert_eq!((stats.broadcast_execs, stats.pad_execs, stats.tile_execs, stats.transpose_execs), (1, 1, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

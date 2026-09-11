@@ -1,0 +1,13 @@
+; programs/shape_demo.m3asm — RFC-0027: forma (0x30-0x37).
+; Rampa 2x4 (0.5..4.0) -> SORT/TOPK/ARGMAX/REDUCE + BROADCAST/PAD/TILE/
+; TRANSPOSE. Contadores verificados em test_rfc0027_demo_runs: 1 cada.
+TENSOR r0 2 4 f32
+SORT r1, r0 AXIS=1 ORDER=DESC
+TOPK r2, r0 K=2 AXIS=1
+ARGMAX r3, r0 AXIS=1
+REDUCE r4, r0 OP=SUM
+BROADCAST r5, r4 SHAPE=2x2
+PAD r6, r0 VALUE=0 AXIS=1 BEFORE=1 AFTER=1
+TILE r7, r0 REPS=2 AXIS=0
+TRANSPOSE r8, r0 AXES=1x0
+HALT
