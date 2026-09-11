@@ -71,6 +71,10 @@ A resposta leva 2 segundos para ser dita. Mas o primeiro som sai em 700ms. Você
 
 O que você sente: Como conversar com um físico que pensa antes de falar. A pausa é natural. A explicação é fluida. A pergunta final convida a continuar.
 
+> Na versão-alvo, esses 700ms não são silêncio: o sistema pensa em voz
+> alta ("Hmm, boa pergunta...") enquanto processa — ver
+> `docs/FILLER_SPEECH.md`.
+
 ## Interrupção — "Não, não, eu quis dizer..."
 
 Você percebe que ele vai por um caminho muito técnico e interrompe:
