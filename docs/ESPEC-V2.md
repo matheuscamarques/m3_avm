@@ -338,13 +338,16 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x76` | `UNLOCK` | 32 | IMPL | S | Release |
 | `0x77` | `FENCE` | 32 | IMPL | S | SHARED visibility barrier |
 
-### 3.11 Immediates (`0x78-0x79`) + gap (`0x7A-0x7F`)
+### 3.11 Immediates (`0x78-0x79`) + control-plane (`0x7A-0x7C`)
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
 | `0x78` | `LOADI` | 32 | IMPL | S | rdest <- imm u128 (RFC-0007) |
 | `0x79` | `MOV` | 32 | IMPL | S | Reg copy (RFC-0007) |
-| `0x7A-0x7F` | — | — | RESERVED | — | Future 32B control |
+| `0x7A` | `ADD_IMM` | 32 | IMPL | S | Wrapping u128 (RFC-0026) |
+| `0x7B` | `SUB_IMM` | 32 | IMPL | S | Wrapping u128 (RFC-0026) |
+| `0x7C` | `STEPS` | 32 | IMPL | S | Deterministic counter (RFC-0026) |
+| `0x7D-0x7F` | — | — | RESERVED | — | Future 32B control |
 
 ### 3.12 Cluster extended (`0x80-0x8F`) — DRAFT, 64B
 

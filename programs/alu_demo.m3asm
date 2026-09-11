@@ -1,0 +1,9 @@
+; programs/alu_demo.m3asm — RFC-0026: ALU de control-plane.
+; ADD_IMM/SUB_IMM (wrapping) + STEPS determinístico (lê completadas).
+; Contadores verificados em test_rfc0026_demo_runs: 1 cada;
+; r1=123, r2=100, r3=3.
+LOADI r0, 100
+ADD_IMM r1, r0 IMM=23
+SUB_IMM r2, r1 IMM=23
+STEPS r3
+HALT

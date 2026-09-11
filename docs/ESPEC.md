@@ -4,7 +4,7 @@
 Status:   Informational Draft (research prototype, not a standard)
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Version:  ISA v1.7 (76 opcodes: 0x00-0x2F + 0x38,0x60-0x69,0x6A-0x79 + 0xFF implemented; cumulative since v1.6)
+Version:  ISA v1.8 (79 opcodes: 0x00-0x2F + 0x38,0x60-0x69,0x6A-0x79,0x7A-0x7C + 0xFF implemented; cumulative since v1.7)
 License:  AGPL-3.0-or-later (see LICENSE; Section 15)
 Replaces: all documents under docs/arq/ (archived, non-normative)
 ```
@@ -236,10 +236,11 @@ No operation (scheduler/IP bench target).
 
 ### 5.8 Free range
 
-`0x30-0xFE` are free, except `0x38 KV_TRUNCATE`
+`0x30-0x79` and `0x7D-0xFE` are free, except `0x38 KV_TRUNCATE`
 (IMPL, RFC-0010). `0x26-0x2F` are fully allocated and IMPL
-(RFC-0023/0024, incl. `0x2E SLICE` from RFC-0019). Allocation REQUIRES
-a proposal following the stateful-opcode rule (Section 19).
+(RFC-0023/0024, incl. `0x2E SLICE` from RFC-0019); `0x7A-0x7C` allocated
+and IMPL (RFC-0026). Allocation REQUIRES a proposal following the
+stateful-opcode rule (Section 19).
 
 ## 6. Memory Model
 
@@ -600,6 +601,7 @@ outruns the Status column above.
 | `0x26/0x27 ARENA` + `0x2A/0x2B MEMCPY/MEMSET` (memory core) | IMPL | RFC-0023; bump+O(1) reset, bit-exact/OOB/RO/dir goldens, FORK-snapshot/ABORT-restore, demo `arena_memcpy_demo` (exec verified) |
 | `0x28/0x29 SNAPSHOT/RESTORE` + `0x2C/0x2D/0x2F PREFETCH/RESHAPE/CONCAT` (views & versions) | IMPL | RFC-0024; named-version roundtrip, engine rewind, N-D concat/order goldens, demo `snap_concat_demo` (exec verified); v1.6 |
 | `0x67/0x68/0x69 CAST/QUANTIZE/DEQUANT` (conversion) | IMPL | RFC-0025; explicit pairs/RNE/clamp goldens, Q4_0/Q8_0 error-bounded encoders, dispatcher-backed dequant, demo `cast_quant_demo` (exec verified); v1.7 |
+| `0x7A/0x7B/0x7C ADD_IMM/SUB_IMM/STEPS` (control-plane ALU) | IMPL | RFC-0026; wrapping goldens, deterministic STEPS count, demo `alu_demo` (exec verified); v1.8 |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
 `cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,
@@ -671,6 +673,8 @@ ation assumes non-Byzantine peers.
   `SNAPSHOT/RESTORE`, `PREFETCH/RESHAPE/CONCAT`).
 - `ISA v1.7` = v1.6 + conversion family `0x67-0x69` (RFC-0025:
   `CAST`, `QUANTIZE`, `DEQUANT`; Precision Rule enforced on 32B).
+- `ISA v1.8` = v1.7 + control-plane ALU `0x7A-0x7C` (RFC-0026:
+  `ADD_IMM`, `SUB_IMM`, `STEPS`; `0x7D-0x7F` stay RESERVED).
 - Draft v2.0 proposal (reconciled, non-normative): `docs/ESPEC-V2.md`
   (DRAFT — do not code against it; reservations in Sections 12-13 of
   this document remain the only binding future encodings).

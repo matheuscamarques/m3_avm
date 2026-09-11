@@ -36,6 +36,7 @@ use crate::opcodes::{
     OP_SNAPSHOT, OP_RESTORE, OP_PREFETCH, OP_RESHAPE, OP_CONCAT, SNAP_MASK_ALL,
     OP_CAST, OP_QUANTIZE, OP_DEQUANT, CAST_DST_F32, CAST_DST_F16, CAST_DST_BF16,
     CAST_DST_I8, CAST_DST_U8, QUANTIZE_Q4_0, QUANTIZE_Q8_0,
+    OP_ADD_IMM, OP_SUB_IMM, OP_STEPS,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -130,6 +131,9 @@ pub struct VmStats {
     pub cast_execs: u64,
     pub quantize_execs: u64,
     pub dequant_execs: u64,
+    pub add_imm_execs: u64,
+    pub sub_imm_execs: u64,
+    pub steps_execs: u64,
     pub start_ns: u64,
 }
 
@@ -1144,6 +1148,18 @@ impl Vm {
             }
             OP_DEQUANT => {
                 self.exec_dequant(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ADD_IMM => {
+                self.exec_add_imm(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SUB_IMM => {
+                self.exec_sub_imm(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_STEPS => {
+                self.exec_steps(ctx_id, instr)?;
                 Ok(true)
             }
             OP_FOREST => {
@@ -4216,6 +4232,61 @@ impl Vm {
         Ok(())
     }
 
+    /// ADD_IMM rD, rS, IMM=n — rdest <- rsrc wrapping_add imm. Total
+    /// (wrapping documentado, como `advance_pc`); só regs nomeados vetam.
+    fn exec_add_imm(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("ADD_IMM precisa de rdest e rSrc (0xFF não é registrador)"));
+        }
+        let (v, imm) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, instr.imm_u128())
+        };
+        let out = v.wrapping_add(imm);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out)?;
+        }
+        self.stats.add_imm_execs += 1;
+        log_debug("alu", &format!("ctx {} ADD_IMM r{} + {} -> r{}", ctx_id, instr.rsrc1, imm, instr.rdest));
+        Ok(())
+    }
+
+    /// SUB_IMM rD, rS, IMM=n — rdest <- rsrc wrapping_sub imm. Único
+    /// SUB do ISA (antes só havia a construção ADD+COMPARE).
+    fn exec_sub_imm(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("SUB_IMM precisa de rdest e rSrc (0xFF não é registrador)"));
+        }
+        let (v, imm) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, instr.imm_u128())
+        };
+        let out = v.wrapping_sub(imm);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out)?;
+        }
+        self.stats.sub_imm_execs += 1;
+        log_debug("alu", &format!("ctx {} SUB_IMM r{} - {} -> r{}", ctx_id, instr.rsrc1, imm, instr.rdest));
+        Ok(())
+    }
+
+    /// STEPS rD — rdest <- instruções retiradas (u64). Lê o contador de
+    /// COMPLETADAS (o loop incrementa pós-execute): determinístico para
+    /// um caminho de programa — o relógio replay-exato ao lado do
+    /// wall-clock `CYCLES_COUNT` (RFC-0005: tempo nunca dirige lógica).
+    fn exec_steps(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF {
+            return Err(anyhow!("STEPS precisa de rdest (0xFF não é registrador)"));
+        }
+        let n = self.stats.steps;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, n as u128)?;
+        }
+        self.stats.steps_execs += 1;
+        log_debug("alu", &format!("ctx {} STEPS -> r{} = {}", ctx_id, instr.rdest, n));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -6095,6 +6166,81 @@ mod tests {
         vm.load_program(prog);
         let stats = vm.run().unwrap();
         assert_eq!((stats.cast_execs, stats.quantize_execs, stats.dequant_execs), (2, 1, 1));
+    }
+
+    // ---- RFC-0026: ALU de control-plane -------------------------------
+
+    #[test]
+    fn test_rfc0026_alu_wrapping() {
+        use crate::opcodes::{instr_add_imm, instr_sub_imm};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, 100)]);
+        vm.step_instruction(cid, &instr_add_imm(1, 0, 23)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 1) as u128, 123);
+        vm.step_instruction(cid, &instr_sub_imm(2, 1, 23)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 2) as u128, 100);
+        // Wrapping especificado: MAX+100 == 99; 100-101 == MAX.
+        vm.step_instruction(cid, &instr_add_imm(3, 0, u128::MAX)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(3).unwrap(), 99);
+        vm.step_instruction(cid, &instr_sub_imm(4, 0, 101)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(4).unwrap(), u128::MAX);
+        vm.step_instruction(cid, &instr_sub_imm(5, 0, 100)).unwrap();
+        assert_eq!(vm.scheduler.get(cid).unwrap().reg(5).unwrap(), 0);
+        // 0xFF não é registrador.
+        assert!(vm.step_instruction(cid, &instr_add_imm(0xFF, 0, 1)).is_err());
+        assert!(vm.step_instruction(cid, &instr_add_imm(1, 0xFF, 1)).is_err());
+        assert!(vm.step_instruction(cid, &instr_sub_imm(0xFF, 0, 1)).is_err());
+        assert_eq!(vm.stats.add_imm_execs, 2);
+        assert_eq!(vm.stats.sub_imm_execs, 3);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0026_steps_exact() {
+        use crate::opcodes::assemble;
+        // O incremento é pós-execute: STEPS lê as COMPLETADAS.
+        let src = "NOP\nSTEPS r0\nNOP\nSTEPS r1\nHALT\n";
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        vm.load_program(prog);
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 1);
+        assert_eq!(ctx.reg(1).unwrap(), 3);
+        assert_eq!(vm.stats.steps_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0026_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            LOADI r0, 100
+            ADD_IMM r1, r0 IMM=23
+            SUB_IMM r2, r1 IMM=23
+            STEPS r3
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.add_imm_execs, stats.sub_imm_execs, stats.steps_execs), (1, 1, 1));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(1).unwrap(), 123);
+        assert_eq!(ctx.reg(2).unwrap(), 100);
+        assert_eq!(ctx.reg(3).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0026_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/alu_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.add_imm_execs, stats.sub_imm_execs, stats.steps_execs), (1, 1, 1));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!((ctx.reg(1).unwrap(), ctx.reg(2).unwrap(), ctx.reg(3).unwrap()), (123, 100, 3));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

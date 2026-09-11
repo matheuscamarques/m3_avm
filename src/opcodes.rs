@@ -134,6 +134,10 @@ pub const OP_MEMSET: u8 = 0x2B; // fill de padrão byte
 pub const MEMCPY_DIR_HOST: u8 = 0;
 pub const MEMCPY_DIR_GPU: u8 = 1;
 pub const MEMCPY_DIR_NIC: u8 = 2;
+// RFC-0026: ALU de control-plane (0x7A-0x7C; 0x7D-0x7F seguem RSVD).
+pub const OP_ADD_IMM: u8 = 0x7A; // rD = rS wrapping_add imm
+pub const OP_SUB_IMM: u8 = 0x7B; // rD = rS wrapping_sub imm (único SUB do ISA)
+pub const OP_STEPS: u8 = 0x7C; // rD <- instruções retiradas (determinístico)
 // RFC-0025: bloco de conversão (0x67/0x68/0x69, v1.7).
 pub const OP_CAST: u8 = 0x67; // conversão de valor FP32<->F16/BF16/I8/U8
 pub const OP_QUANTIZE: u8 = 0x68; // F32 -> blocos Q4_0/Q8_0
@@ -507,6 +511,9 @@ impl Instruction {
             OP_CAST => "CAST",
             OP_QUANTIZE => "QUANTIZE",
             OP_DEQUANT => "DEQUANT",
+            OP_ADD_IMM => "ADD_IMM",
+            OP_SUB_IMM => "SUB_IMM",
+            OP_STEPS => "STEPS",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -1703,6 +1710,30 @@ pub fn instr_quantize(rdest: u8, r_src: u8, qtype: u8) -> Instruction {
 /// DEQUANT rD, rT — rdest <- NOVO tensor F32 (mesmo shape do src).
 pub fn instr_dequant(rdest: u8, r_src: u8) -> Instruction {
     Instruction::new(OP_DEQUANT, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0026: ADD_IMM (0x7A) / SUB_IMM (0x7B) / STEPS (0x7C). Imediato u128
+// na convenção imm_u128 (payload[0..16]); STEPS sem payload.
+// ---------------------------------------------------------------------------
+
+/// ADD_IMM rD, rS, IMM=n — rdest <- rsrc wrapping_add imm.
+pub fn instr_add_imm(rdest: u8, r_src: u8, imm: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_ADD_IMM, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_imm_u128(imm);
+    instr
+}
+
+/// SUB_IMM rD, rS, IMM=n — rdest <- rsrc wrapping_sub imm.
+pub fn instr_sub_imm(rdest: u8, r_src: u8, imm: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_SUB_IMM, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_imm_u128(imm);
+    instr
+}
+
+/// STEPS rD — rdest <- contador de retiradas (u64).
+pub fn instr_steps(rdest: u8) -> Instruction {
+    Instruction::new(OP_STEPS, 0, rdest, 0xFF, 0xFF, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -3244,6 +3275,51 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_dequant(parse_reg(parts[1])?, parse_reg(parts[2])?))
         }
+        "ADD_IMM" => {
+            // ADD_IMM rD, rS, IMM=n (u128 decimal; "-5" erra — use SUB_IMM)
+            if parts.len() < 3 {
+                return Err(anyhow!("ADD_IMM precisa de rdest, rSrc e IMM= — ex: ADD_IMM r1, r0 IMM=23"));
+            }
+            let mut imm = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("IMM=") {
+                    imm = Some(v.parse::<u128>().map_err(|_| anyhow!("ADD_IMM IMM inválido '{}' (u128 decimal; negativo use SUB_IMM)", p))?);
+                } else {
+                    return Err(anyhow!("ADD_IMM token desconhecido '{}' (use IMM=)", p));
+                }
+            }
+            match imm {
+                Some(n) => Ok(instr_add_imm(parse_reg(parts[1])?, parse_reg(parts[2])?, n)),
+                None => Err(anyhow!("ADD_IMM precisa de IMM= — ex: ADD_IMM r1, r0 IMM=23")),
+            }
+        }
+        "SUB_IMM" => {
+            // SUB_IMM rD, rS, IMM=n (wrapping; único SUB do ISA)
+            if parts.len() < 3 {
+                return Err(anyhow!("SUB_IMM precisa de rdest, rSrc e IMM= — ex: SUB_IMM r2, r1 IMM=23"));
+            }
+            let mut imm = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("IMM=") {
+                    imm = Some(v.parse::<u128>().map_err(|_| anyhow!("SUB_IMM IMM inválido '{}' (u128 decimal)", p))?);
+                } else {
+                    return Err(anyhow!("SUB_IMM token desconhecido '{}' (use IMM=)", p));
+                }
+            }
+            match imm {
+                Some(n) => Ok(instr_sub_imm(parse_reg(parts[1])?, parse_reg(parts[2])?, n)),
+                None => Err(anyhow!("SUB_IMM precisa de IMM= — ex: SUB_IMM r2, r1 IMM=23")),
+            }
+        }
+        "STEPS" => {
+            // STEPS rD (sem chaves)
+            if parts.len() != 2 {
+                return Err(anyhow!("STEPS precisa de exatamente um registrador — ex: STEPS r3"));
+            }
+            Ok(instr_steps(parse_reg(parts[1])?))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -4654,6 +4730,42 @@ mod tests {
         let prog = assemble("TENSOR r0 2 2 bf16").unwrap();
         assert_eq!(prog[0].tensor_dtype(), 64);
         assert!(assemble("TENSOR r0 2 2 bf16x").is_err());
+    }
+
+    // ---- RFC-0026: ALU de control-plane -------------------------------
+
+    #[test]
+    fn test_rfc0026_ctor_roundtrip() {
+        let a = instr_add_imm(1, 0, 23);
+        assert_eq!(a.opcode, OP_ADD_IMM);
+        assert_eq!(a.imm_u128(), 23);
+        let d = Instruction::decode(&a.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "ADD_IMM");
+        assert_eq!(d.imm_u128(), 23);
+        let s = instr_sub_imm(2, 1, u128::MAX);
+        assert_eq!(s.opcode, OP_SUB_IMM);
+        assert_eq!(s.imm_u128(), u128::MAX);
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "SUB_IMM");
+        let t = instr_steps(3);
+        assert_eq!(t.opcode, OP_STEPS);
+        let d = Instruction::decode(&t.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "STEPS");
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("ADD_IMM r1, r0 IMM=23").unwrap();
+        assert_eq!(prog[0].imm_u128(), 23);
+        let prog = assemble("SUB_IMM r2, r1 IMM=23").unwrap();
+        assert_eq!(prog[0].imm_u128(), 23);
+        let prog = assemble("STEPS r3").unwrap();
+        assert_eq!(prog[0].opcode, OP_STEPS);
+        assert!(assemble("ADD_IMM r1, r0").is_err());
+        assert!(assemble("ADD_IMM r1, r0 IMM=-5").is_err());
+        assert!(assemble("ADD_IMM r1, r0 IMM=abc").is_err());
+        assert!(assemble("ADD_IMM r1, r0 FOO=1").is_err());
+        assert!(assemble("SUB_IMM r2, r1").is_err());
+        assert!(assemble("SUB_IMM r2, r1 FOO=1").is_err());
+        assert!(assemble("STEPS").is_err());
+        assert!(assemble("STEPS r3 EXTRA").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

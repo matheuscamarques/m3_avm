@@ -56,6 +56,10 @@ harness = false
 name = "memory_bench"
 harness = false
 
+[[bench]]
+name = "alu_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true
