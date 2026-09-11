@@ -156,6 +156,8 @@ pub const QUANTIZE_Q4_0: u8 = 4;
 pub const QUANTIZE_Q8_0: u8 = 8;
 // RFC-0027: forma (0x30-0x37, v1.9; resto de 0x30-0x43 nas partes 2-3).
 // RFC-0028: ativações (0x3C-0x43, v1.10; 0x39-0x3B na parte 3).
+// RFC-0032: passo depformer (0x44, v1.13; 17 streams na RFC-0033).
+pub const OP_DEPFORMER: u8 = 0x44; // proj+KV deslizante+attn+codes
 // RFC-0029: KV/attention (0x39/0x3A/0x3B, v1.11; fecha 0x30-0x43).
 // RFC-0031: DSP de áudio (0x45-0x49, v1.12; 0x44 na parte 2).
 pub const OP_STREAM_MERGE: u8 = 0x45; // mix com ganho explícito
@@ -581,6 +583,7 @@ impl Instruction {
             OP_EXP => "EXP",
             OP_LOG => "LOG",
             OP_CLIP => "CLIP",
+            OP_DEPFORMER => "DEPFORMER",
             OP_KV_COMPRESS => "KV_COMPRESS",
             OP_FLASH_ATTN => "FLASH_ATTN",
             OP_ATTN_SPARSE => "ATTN_SPARSE",
@@ -2070,6 +2073,60 @@ pub fn instr_exp(rdest: u8, r_src: u8) -> Instruction {
 /// LOG rD, rT (sem payload).
 pub fn instr_log(rdest: u8, r_src: u8) -> Instruction {
     Instruction::new(OP_LOG, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0032: DEPFORMER (0x44). Tabela de pesos com 5 addrs u64 LE +
+// 3 reservados; resto em payload (ver RFC).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// DEPFORMER: payload[0]=stream, [1]=layer, [2..4]=ncb u16 (0=16),
+    /// [4..6]=nheads u16 (0=16), [6..8]=levels Q u16 (0=1024),
+    /// [8..10]=context u16 (0=8), [10..14]=temp f32, [14..16]=topk u16
+    /// (0=argmax determinístico).
+    pub fn depformer_params(&self) -> (u8, u8, u16, u16, u16, u16, f32, u16) {
+        let u16le = |r: std::ops::Range<usize>| {
+            u16::from_le_bytes([self.payload[r.start], self.payload[r.start + 1]])
+        };
+        let mut bt = [0u8; 4];
+        bt.copy_from_slice(&self.payload[10..14]);
+        (
+            self.payload[0],
+            self.payload[1],
+            u16le(2..4),
+            u16le(4..6),
+            u16le(6..8),
+            u16le(8..10),
+            f32::from_le_bytes(bt),
+            u16le(14..16),
+        )
+    }
+
+    pub fn set_depformer_params(
+        &mut self, stream: u8, layer: u8, ncb: u16, nheads: u16,
+        levels: u16, context: u16, temp: f32, topk: u16,
+    ) {
+        self.payload[0] = stream;
+        self.payload[1] = layer;
+        self.payload[2..4].copy_from_slice(&ncb.to_le_bytes());
+        self.payload[4..6].copy_from_slice(&nheads.to_le_bytes());
+        self.payload[6..8].copy_from_slice(&levels.to_le_bytes());
+        self.payload[8..10].copy_from_slice(&context.to_le_bytes());
+        self.payload[10..14].copy_from_slice(&temp.to_le_bytes());
+        self.payload[14..16].copy_from_slice(&topk.to_le_bytes());
+    }
+}
+
+/// DEPFORMER rD, rX, rW [...] — rdest <- pack [Y|codes] (fatiar c/ SLICE).
+#[allow(clippy::too_many_arguments)]
+pub fn instr_depformer(
+    rdest: u8, r_x: u8, r_w: u8, stream: u8, layer: u8, ncb: u16,
+    nheads: u16, levels: u16, context: u16, temp: f32, topk: u16,
+) -> Instruction {
+    let mut instr = Instruction::new(OP_DEPFORMER, 0, rdest, r_x, r_w, 0xFF);
+    instr.set_depformer_params(stream, layer, ncb, nheads, levels, context, temp, topk);
+    instr
 }
 
 // ---------------------------------------------------------------------------
@@ -4277,6 +4334,39 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_audio_window(parse_reg(parts[1])?, parse_reg(parts[2])?, wtype))
         }
+        "DEPFORMER" => {
+            // DEPFORMER rD, rX, rW [STREAM=] [LAYER=] [NCB=] [NHEADS=]
+            // [LEVELS=] [CONTEXT=] [TEMP=] [TOPK=] (tudo default 0)
+            if parts.len() < 4 {
+                return Err(anyhow!("DEPFORMER precisa de rdest, rX, rW — ex: DEPFORMER rD, rX, rW LAYER=0"));
+            }
+            let (mut stream, mut layer) = (0u8, 0u8);
+            let (mut ncb, mut nheads, mut levels, mut context, mut topk) = (0u16, 0u16, 0u16, 0u16, 0u16);
+            let mut temp = 1.0f32;
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("STREAM=") {
+                    stream = v.parse::<u8>().map_err(|_| anyhow!("DEPFORMER STREAM inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("LAYER=") {
+                    layer = v.parse::<u8>().map_err(|_| anyhow!("DEPFORMER LAYER inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("NCB=") {
+                    ncb = v.parse::<u16>().map_err(|_| anyhow!("DEPFORMER NCB inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("NHEADS=") {
+                    nheads = v.parse::<u16>().map_err(|_| anyhow!("DEPFORMER NHEADS inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("LEVELS=") {
+                    levels = v.parse::<u16>().map_err(|_| anyhow!("DEPFORMER LEVELS inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("CONTEXT=") {
+                    context = v.parse::<u16>().map_err(|_| anyhow!("DEPFORMER CONTEXT inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("TEMP=") {
+                    temp = v.parse::<f32>().map_err(|_| anyhow!("DEPFORMER TEMP inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("TOPK=") {
+                    topk = v.parse::<u16>().map_err(|_| anyhow!("DEPFORMER TOPK inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("DEPFORMER token desconhecido '{}' (use STREAM=/LAYER=/NCB=/NHEADS=/LEVELS=/CONTEXT=/TEMP=/TOPK=)", p));
+                }
+            }
+            Ok(instr_depformer(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, stream, layer, ncb, nheads, levels, context, temp, topk))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -5939,6 +6029,27 @@ mod tests {
         assert!(assemble("AUDIO_FILTER r5, r3, r4 MODE=FOO").is_err());
         assert!(assemble("AUDIO_WINDOW r3").is_err());
         assert!(assemble("AUDIO_WINDOW r3, r2 TYPE=FOO").is_err());
+    }
+
+    // ---- RFC-0032: passo depformer ----------------------------------------
+
+    #[test]
+    fn test_rfc0032_ctor_roundtrip() {
+        let d = instr_depformer(9, 0, 1, 2, 3, 4, 5, 6, 7, 0.8, 0);
+        assert_eq!(d.opcode, OP_DEPFORMER);
+        assert_eq!(d.depformer_params(), (2, 3, 4, 5, 6, 7, 0.8, 0));
+        let r = Instruction::decode(&d.encode()).unwrap();
+        assert_eq!(r.mnemonic(), "DEPFORMER");
+        assert_eq!(r.depformer_params(), (2, 3, 4, 5, 6, 7, 0.8, 0));
+        assert_eq!((r.rdest, r.rsrc1, r.rsrc2), (9, 0, 1));
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("DEPFORMER r9, r0, r1 LAYER=2 NCB=4 NHEADS=2 LEVELS=8 CONTEXT=3 TEMP=0.8").unwrap();
+        assert_eq!(prog[0].depformer_params(), (0, 2, 4, 2, 8, 3, 0.8, 0));
+        let prog = assemble("DEPFORMER r9, r0, r1").unwrap();
+        assert_eq!(prog[0].depformer_params(), (0, 0, 0, 0, 0, 0, 1.0, 0));
+        assert!(assemble("DEPFORMER r9, r0").is_err());
+        assert!(assemble("DEPFORMER r9, r0, r1 FOO=1").is_err());
+        assert!(assemble("DEPFORMER r9, r0, r1 NCB=abc").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

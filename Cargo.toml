@@ -76,6 +76,10 @@ harness = false
 name = "audio_dsp_bench"
 harness = false
 
+[[bench]]
+name = "depformer_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

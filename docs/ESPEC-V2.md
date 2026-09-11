@@ -266,11 +266,11 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x42` | `LOG` | 32 | IMPL | S | IEEE, no trap (RFC-0028) |
 | `0x43` | `CLIP` | 32 | IMPL | S | Finite bounds (RFC-0028) |
 
-### 3.6 Full-duplex audio (`0x44-0x49`) — PARTIAL (0x45-0x49 IMPL; 0x44 DRAFT), 32B
+### 3.6 Full-duplex audio (`0x44-0x49`) — IMPL (v1.13), 32B
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x44` | `DEPFORMER` | 32 | DRAFT | F2 | KV_CACHE (Depformer KV); 6x1024x16, 16 codebooks |
+| `0x44` | `DEPFORMER` | 32 | IMPL | F2 | Layer step, sliding KV, sampling (RFC-0032) |
 | `0x45` | `STREAM_MERGE` | 32 | IMPL | S | Gain-explicit 2-mix (RFC-0031) |
 | `0x46` | `VAD_DETECT` | 32 | IMPL | S | Energy/ZCR score; ML traps (RFC-0031) |
 | `0x47` | `AUDIO_RESAMPLE` | 32 | IMPL | S | Linear, any rates (RFC-0031) |

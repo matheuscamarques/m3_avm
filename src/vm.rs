@@ -45,6 +45,7 @@ use crate::opcodes::{
     OP_STREAM_MERGE, OP_VAD_DETECT, OP_AUDIO_RESAMPLE, OP_AUDIO_FILTER,
     OP_AUDIO_WINDOW, VAD_MODE_ENERGY, VAD_MODE_ZCR, VAD_MODE_ML,
     FILTER_MODE_FIR, FILTER_MODE_IIR, WINDOW_HANN, WINDOW_HAMMING,
+    OP_DEPFORMER,
     OP_SOFTMAX, OP_GELU, OP_SIGMOID, OP_TANH, OP_RELU, OP_EXP, OP_LOG, OP_CLIP,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
@@ -167,6 +168,7 @@ pub struct VmStats {
     pub audio_resample_execs: u64,
     pub audio_filter_execs: u64,
     pub audio_window_execs: u64,
+    pub depformer_execs: u64,
     pub start_ns: u64,
 }
 
@@ -454,6 +456,12 @@ pub struct Vm {
     /// rank1_layers); custo do snapshot O(bytes totais), ver RFC.
     pub arenas: HashMap<u8, crate::arena::Arena>,
     arena_snapshots: Vec<(u64, HashMap<u8, crate::arena::Arena>)>,
+    /// KV do depformer por (stream, layer) (DEPFORMER 0x44, RFC-0032).
+    /// Chaveado desde o dia um (17 streams: RFC-0033 adiciona streams,
+    /// nunca reobra). Push no FORK + SNAPSHOT, pop versionado no
+    /// ABORT + RESTORE — as quatro casas, sem exceção.
+    pub dep_kv: HashMap<(u8, u8), crate::depformer::DepKV>,
+    dep_snapshots: Vec<(u64, HashMap<(u8, u8), crate::depformer::DepKV>)>,
     /// Barreiras locais (BARRIER 0x1D, RFC-0018): id -> estado one-shot.
     /// Removida no RELEASE e no timeout (sem reuso silencioso de geração).
     pub barriers: HashMap<u32, BarrierState>,
@@ -526,6 +534,8 @@ impl Vm {
             snn_snapshots: Vec::new(),
             arenas: HashMap::new(),
             arena_snapshots: Vec::new(),
+            dep_kv: HashMap::new(),
+            dep_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -559,6 +569,8 @@ impl Vm {
             snn_snapshots: Vec::new(),
             arenas: HashMap::new(),
             arena_snapshots: Vec::new(),
+            dep_kv: HashMap::new(),
+            dep_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -589,6 +601,8 @@ impl Vm {
             snn_snapshots: Vec::new(),
             arenas: HashMap::new(),
             arena_snapshots: Vec::new(),
+            dep_kv: HashMap::new(),
+            dep_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -1307,6 +1321,10 @@ impl Vm {
                 self.exec_audio_window(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_DEPFORMER => {
+                self.exec_depformer(ctx_id, instr)?;
+                Ok(true)
+            }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
         }
     }
@@ -1841,6 +1859,8 @@ impl Vm {
         self.snn_snapshots.push((snap_version, self.snn_layers.clone()));
         // Snapshot das arenas (mapa; buffers clonados — custo O(total), RFC-0023).
         self.arena_snapshots.push((snap_version, self.arenas.clone()));
+        // Snapshot do KV depformer (RFC-0032; mesma disciplina).
+        self.dep_snapshots.push((snap_version, self.dep_kv.clone()));
         self.stats.forks += 1;
         log_info("fork", &format!("ctx {} FORK -> child {} prio {} (snap v{})", ctx_id, new_id, child_prio, snap_version));
         Ok(())
@@ -2146,6 +2166,19 @@ impl Vm {
             }
         } else if let Some((_, snap)) = self.arena_snapshots.pop() {
             self.arenas = snap;
+        }
+        // Rollback depformer: idem (RFC-0032).
+        if ts_version != 0 {
+            while self.dep_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.dep_snapshots.pop();
+            }
+            if self.dep_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.dep_snapshots.pop() {
+                    self.dep_kv = snap;
+                }
+            }
+        } else if let Some((_, snap)) = self.dep_snapshots.pop() {
+            self.dep_kv = snap;
         }
 
         self.stats.aborts += 1;
@@ -3936,6 +3969,7 @@ impl Vm {
         self.rank1_snapshots.push((v, self.rank1_layers.clone()));
         self.snn_snapshots.push((v, self.snn_layers.clone()));
         self.arena_snapshots.push((v, self.arenas.clone()));
+        self.dep_snapshots.push((v, self.dep_kv.clone()));
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
             if instr.rdest != 0xFF {
                 ctx.set_reg(instr.rdest, v as u128)?;
@@ -3990,6 +4024,14 @@ impl Vm {
         if self.arena_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
             if let Some((_, snap)) = self.arena_snapshots.pop() {
                 self.arenas = snap;
+            }
+        }
+        while self.dep_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.dep_snapshots.pop();
+        }
+        if self.dep_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.dep_snapshots.pop() {
+                self.dep_kv = snap;
             }
         }
         self.stats.restore_execs += 1;
@@ -5415,6 +5457,186 @@ impl Vm {
         }
         self.stats.audio_window_execs += 1;
         log_debug("window", &format!("ctx {} WINDOW 0x{:x}{:?} TYPE={} -> 0x{:x}", ctx_id, t_addr, shape, wtype, out_addr));
+        Ok(())
+    }
+
+    /// DEPFORMER rD, rX, rW — um passo de camada depformer (RFC-0032):
+    /// proj Q/K/V/O + attn causal sobre KV deslizante (sem RoPE,
+    /// paridade moshi) + amostragem por codebook. Pesos via tabela de
+    /// 5 addrs u64 (+3 reservados zerados). Saída pack [Y|codes]
+    /// (fatiar com SLICE). Sem residual/norma/FFN (programa compõe).
+    fn exec_depformer(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("DEPFORMER precisa de rdest, rX, rW (0xFF não é registrador)"));
+        }
+        let (x_addr, w_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let (stream, layer, ncb_p, nheads_p, q_p, ctx_p, temp, topk_p) = instr.depformer_params();
+        let (ncb, nheads, qlevels, context) = (
+            if ncb_p == 0 { crate::depformer::DEPFORMER_DEFAULT_NCB } else { ncb_p as usize },
+            if nheads_p == 0 { crate::depformer::DEPFORMER_DEFAULT_NHEADS } else { nheads_p as usize },
+            if q_p == 0 { crate::depformer::DEPFORMER_DEFAULT_LEVELS } else { q_p as usize },
+            if ctx_p == 0 { crate::depformer::DEPFORMER_DEFAULT_CONTEXT } else { ctx_p as usize },
+        );
+        if ncb == 0 || nheads == 0 || qlevels == 0 || context == 0 {
+            return Err(anyhow!("DEPFORMER: dims inválidas (NCB/NHEADS/LEVELS/CONTEXT >= 1)"));
+        }
+        if !temp.is_finite() {
+            return Err(anyhow!("DEPFORMER: TEMP não-finito"));
+        }
+        if topk_p != 0 && temp <= 0.0 {
+            return Err(anyhow!("DEPFORMER: TEMP={} precisa ser > 0 p/ amostragem", temp));
+        }
+        // Entrada: denso F32, D = numel.
+        let x_meta = self.memory.get_tensor_meta(x_addr).cloned()
+            .ok_or_else(|| anyhow!("DEPFORMER: rX 0x{:x} não é tensor", x_addr))?;
+        if x_meta.is_sparse {
+            return Err(anyhow!("DEPFORMER: rX esparso (denso nesta RFC)"));
+        }
+        if x_meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("DEPFORMER: rX dtype {:?} (só F32)", x_meta.dtype));
+        }
+        let d: usize = x_meta.shape.iter().product();
+        if d == 0 {
+            return Err(anyhow!("DEPFORMER: rX vazio"));
+        }
+        if d % nheads != 0 {
+            return Err(anyhow!("DEPFORMER: D={} não divisível por NHEADS={}", d, nheads));
+        }
+        // Tabela: 8×u64 LE ([Wq,Wk,Wv,Wo,Wh,0,0,0]); cada peso [D,D]
+        // denso F32, Whead [D,NCB*Q].
+        let w_bytes = self.memory.read(w_addr, 64).map_err(|_| anyhow!("DEPFORMER: tabela rW 0x{:x} precisa de 64 bytes (8×u64)", w_addr))?;
+        let mut waddrs = [0u64; 8];
+        for (i, w) in waddrs.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&w_bytes[i * 8..(i + 1) * 8]);
+            *w = u64::from_le_bytes(b);
+        }
+        for (i, r) in waddrs[5..8].iter().enumerate() {
+            if *r != 0 {
+                return Err(anyhow!("DEPFORMER: reservado[{}] != 0 (forward-compat alto)", i));
+            }
+        }
+        let qw = d.checked_mul(d).ok_or_else(|| anyhow!("DEPFORMER: D*D estoura"))?;
+        let hw = d.checked_mul(ncb).and_then(|x| x.checked_mul(qlevels))
+            .ok_or_else(|| anyhow!("DEPFORMER: D*NCB*Q estoura"))?;
+        let names = ["Wq", "Wk", "Wv", "Wo"];
+        let mut wmats: Vec<Vec<f32>> = Vec::with_capacity(5);
+        for (wi, waddr) in waddrs[..4].iter().enumerate() {
+            let wa = *waddr as u128;
+            let meta = self.memory.get_tensor_meta(wa).cloned()
+                .ok_or_else(|| anyhow!("DEPFORMER: {} 0x{:x} não é tensor", names[wi], wa))?;
+            if meta.is_sparse || meta.dtype != crate::memory::DType::F32 {
+                return Err(anyhow!("DEPFORMER: {} dtype/esparso inválido", names[wi]));
+            }
+            if meta.byte_len != qw.saturating_mul(4) {
+                return Err(anyhow!("DEPFORMER: {} com shape {:?} (esperado [{},{}])", names[wi], meta.shape, d, d));
+            }
+            wmats.push(self.memory.read_f32_tensor(wa, qw)?);
+        }
+        let wh_addr = waddrs[4] as u128;
+        let wh_meta = self.memory.get_tensor_meta(wh_addr).cloned()
+            .ok_or_else(|| anyhow!("DEPFORMER: Whead 0x{:x} não é tensor", wh_addr))?;
+        if wh_meta.is_sparse || wh_meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("DEPFORMER: Whead dtype/esparso inválido"));
+        }
+        if wh_meta.byte_len != hw.saturating_mul(4) {
+            return Err(anyhow!("DEPFORMER: Whead com {} bytes (esperado {} = D*NCB*Q*4)", wh_meta.byte_len, hw * 4));
+        }
+        let whead = self.memory.read_f32_tensor(wh_addr, hw)?;
+        let x = self.memory.read_f32_tensor(x_addr, d)?;
+        // Q/K/V = x @ W (GEMV linha; laço escalar como FLASH_ATTN).
+        let matvec = |m: &[f32], v: &[f32]| -> Vec<f32> {
+            let mut y = vec![0.0f32; d];
+            for (j, yj) in y.iter_mut().enumerate() {
+                let mut s = 0.0f32;
+                for (i, &xi) in v.iter().enumerate() {
+                    s += xi * m[i * d + j];
+                }
+                *yj = s;
+            }
+            y
+        };
+        let qv = matvec(&wmats[0], &x);
+        let kv = matvec(&wmats[1], &x);
+        let vv = matvec(&wmats[2], &x);
+        // KV deslizante por (stream, layer).
+        let key = (stream, layer);
+        let entry = self.dep_kv.entry(key).or_insert_with(|| crate::depformer::DepKV::new(d));
+        if entry.d != d {
+            return Err(anyhow!("DEPFORMER: camada (s={},l={}) reconfigurada D={} (era {})", stream, layer, d, entry.d));
+        }
+        entry.push(&kv, &vv, context).map_err(|e| anyhow!("DEPFORMER: {}", e))?;
+        let rows = entry.rows();
+        let attn = crate::depformer::dep_attention(&qv, &entry.k, &entry.v, d, nheads, rows);
+        // Y = attn @ Wo (sem residual — programa compõe).
+        let y = matvec(&wmats[3], &attn);
+        // Códigos: logits_c = Y @ Whead[:, c*Q..]; argmax (TOPK=0,
+        // determinístico) ou top-k + softmax + RNG (SAMPLE).
+        let topk = topk_p as usize;
+        if topk > qlevels {
+            return Err(anyhow!("DEPFORMER: TOPK={} > LEVELS={} (sem clamp)", topk, qlevels));
+        }
+        let mut codes = Vec::with_capacity(ncb);
+        for c in 0..ncb {
+            let logits: Vec<f32> = (0..qlevels)
+                .map(|q| {
+                    let mut s = 0.0f32;
+                    for (i, &yi) in y.iter().enumerate() {
+                        s += yi * whead[i * ncb * qlevels + c * qlevels + q];
+                    }
+                    s
+                })
+                .collect();
+            let code = if topk == 0 {
+                // Argmax determinístico (menor índice no empate).
+                let mut bi = 0usize;
+                let mut bv = logits[0];
+                for (i, &v) in logits.iter().enumerate().skip(1) {
+                    if v > bv {
+                        bv = v;
+                        bi = i;
+                    }
+                }
+                bi as u32
+            } else {
+                // Top-k + softmax + RNG com seed (padrão SAMPLE).
+                let mut order: Vec<usize> = (0..qlevels).collect();
+                order.sort_by(|&a, &b| {
+                    logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+                });
+                order.truncate(topk);
+                let mut probs: Vec<f32> = order.iter().map(|&i| logits[i]).collect();
+                let mx = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for p in probs.iter_mut() {
+                    *p = ((*p - mx) / temp).exp();
+                    sum += *p;
+                }
+                for p in probs.iter_mut() {
+                    *p /= sum;
+                }
+                let draw = self.sample_logits_ctx(ctx_id, &probs)?;
+                order[draw as usize % order.len()] as u32
+            };
+            codes.push(code);
+        }
+        // Pack [Y | codes] (precedente DISTANCE; fatiar com SLICE).
+        let mut packed = Vec::with_capacity(d + ncb);
+        packed.extend_from_slice(&y);
+        packed.extend(codes.iter().map(|&c| c as f32));
+        let out_shape = vec![1, d + ncb];
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &packed)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.depformer_execs += 1;
+        log_debug("depformer", &format!("ctx {} DEPFORMER s={} l={} D={} NCB={} rows={} -> 0x{:x}", ctx_id, stream, layer, d, ncb, rows, out_addr));
         Ok(())
     }
 
@@ -8111,6 +8333,176 @@ mod tests {
         let stats = vm.run().unwrap();
         assert_eq!(stats.vad_detect_execs, 2);
         assert_eq!((stats.audio_resample_execs, stats.audio_window_execs, stats.audio_filter_execs, stats.stream_merge_execs), (1, 1, 1, 1));
+    }
+
+    // ---- RFC-0032: passo depformer --------------------------------------
+
+    /// Monta tabela de pesos [Wq,Wk,Wv,Wo,Wh,0,0,0] (u64 LE) + matrizes
+    /// FILL=fill. `.m3asm` não soletra u64 (sem STORE/.data — follow-up
+    /// Fase 9); tabelas nascem aqui, em Rust.
+    fn rfc0032_table(vm: &mut Vm, d: usize, ncb: usize, q: usize, fill: f32) -> (u128, u128) {
+        use crate::memory::DType;
+        let mat = |vm: &mut Vm, rows: usize, cols: usize| {
+            let a = vm.memory.alloc_tensor(&[rows, cols], DType::F32).unwrap();
+            vm.memory.write_f32_tensor(a, &vec![fill; rows * cols]).unwrap();
+            a
+        };
+        let (wq, wk, wv, wo) = (mat(vm, d, d), mat(vm, d, d), mat(vm, d, d), mat(vm, d, d));
+        let wh = mat(vm, d, ncb * q);
+        let t = vm.memory.alloc_tensor(&[64], DType::U8).unwrap();
+        let mut bytes = Vec::new();
+        for a in [wq, wk, wv, wo, wh] {
+            bytes.extend_from_slice(&u64::try_from(a).unwrap().to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 24]);
+        vm.memory.write(t, &bytes).unwrap();
+        // rX [1,d] FILL=1.
+        let x = vm.memory.alloc_tensor(&[1, d], DType::F32).unwrap();
+        vm.memory.write_f32_tensor(x, &vec![1.0; d]).unwrap();
+        (x, t)
+    }
+
+    #[test]
+    fn test_rfc0032_depformer_all_ones() {
+        use crate::opcodes::instr_depformer;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // D=4, NCB=2, Q=2, NHEADS=2, tudo FILL=1: Y=[16×4], codes=[0,0].
+        let (x, t) = rfc0032_table(&mut vm, 4, 2, 2, 1.0);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, t)]);
+        vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 8, 1.0, 0)).unwrap();
+        let p = rfc0005_reg_u64(&vm, cid, 9) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(p, 6).unwrap(), vec![16.0, 16.0, 16.0, 16.0, 0.0, 0.0]);
+        // Pack fatiável: Y=[16×4], codes=[0,0].
+        vm.step_instruction(cid, &crate::opcodes::instr_slice(2, 9, 0, 4)).unwrap();
+        let y = rfc0005_reg_u64(&vm, cid, 2) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(y, 4).unwrap(), vec![16.0; 4]);
+        vm.step_instruction(cid, &crate::opcodes::instr_slice(3, 9, 4, 2)).unwrap();
+        let c = rfc0005_reg_u64(&vm, cid, 3) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(c, 2).unwrap(), vec![0.0, 0.0]);
+        // Determinístico: segunda chamada, mesmos códigos.
+        vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 8, 1.0, 0)).unwrap();
+        let p2 = rfc0005_reg_u64(&vm, cid, 9) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(p2, 6).unwrap(), vec![16.0, 16.0, 16.0, 16.0, 0.0, 0.0]);
+        assert_eq!(vm.dep_kv.get(&(0, 0)).unwrap().rows(), 2);
+        assert_eq!(vm.stats.depformer_execs, 2);
+    }
+
+    #[test]
+    fn test_rfc0032_kv_window_and_rollback() {
+        use crate::opcodes::{instr_arena_alloc, instr_depformer, instr_restore, instr_snapshot, SNAP_MASK_ALL};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let (x, t) = rfc0032_table(&mut vm, 4, 2, 2, 1.0);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, t)]);
+        let run = |vm: &mut Vm| {
+            vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 2, 1.0, 0)).unwrap();
+        };
+        run(&mut vm);
+        assert_eq!(vm.dep_kv.get(&(0, 0)).unwrap().rows(), 1);
+        // SNAPSHOT nomeado cobre o mapa (4ª casa, como rank1).
+        vm.step_instruction(cid, &instr_snapshot(5, SNAP_MASK_ALL)).unwrap();
+        run(&mut vm);
+        run(&mut vm);
+        assert_eq!(vm.dep_kv.get(&(0, 0)).unwrap().rows(), 2); // CONTEXT=2 drena
+        vm.step_instruction(cid, &instr_restore(5)).unwrap();
+        assert_eq!(vm.dep_kv.get(&(0, 0)).unwrap().rows(), 1);
+        // FORK/ABORT idem (2ª/3ª casas): filho cresce, abort restaura.
+        vm.step_instruction(cid, &crate::opcodes::instr_fork(6, crate::opcodes::FORK_FLAG_GREEN)).unwrap();
+        let child = rfc0005_reg_u64(&vm, cid, 6);
+        vm.step_instruction(child, &instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 8, 1.0, 0)).unwrap();
+        assert_eq!(vm.dep_kv.get(&(0, 0)).unwrap().rows(), 2);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, child as u128).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(8, 0).unwrap();
+        vm.step_instruction(cid, &crate::opcodes::instr_abort(7, 8)).unwrap();
+        assert_eq!(vm.dep_kv.get(&(0, 0)).unwrap().rows(), 1);
+        // ARENA coexistindo não quebra o push (regressão de tupla).
+        vm.step_instruction(cid, &instr_arena_alloc(0, 16, 0, 0)).unwrap();
+        assert_eq!(vm.stats.depformer_execs, 4);
+    }
+
+    #[test]
+    fn test_rfc0032_sampling_seeded() {
+        use crate::opcodes::{instr_depformer, instr_rng_seed};
+        // Mesmo seed => mesmos códigos (acordo entre runs, padrão RFC-0009).
+        let run_seeded = |seed: u64| {
+            let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+            let (x, t) = rfc0032_table(&mut vm, 4, 2, 4, 0.5);
+            let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, t), (2, seed as u128)]);
+            vm.step_instruction(cid, &instr_rng_seed(2)).unwrap();
+            vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 4, 4, 8, 1.0, 4)).unwrap();
+            let p = rfc0005_reg_u64(&vm, cid, 9) as u128;
+            vm.memory.read_f32_tensor(p, 6).unwrap()
+        };
+        let a = run_seeded(42);
+        let b = run_seeded(42);
+        assert_eq!(a, b);
+        // Códigos dentro do range [0,4) e seeds distintas ao menos tentam divergir
+        // (não garantido estatisticamente com 2 draws — só range é assert).
+        for v in a[4..6].iter() {
+            assert!(*v >= 0.0 && *v < 4.0, "{:?}", a);
+        }
+    }
+
+    #[test]
+    fn test_rfc0032_errors() {
+        use crate::opcodes::instr_depformer;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let (x, t) = rfc0032_table(&mut vm, 4, 2, 2, 1.0);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, t)]);
+        let ok = || instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 8, 1.0, 0);
+        vm.step_instruction(cid, &ok()).unwrap();
+        // NHEADS ∤ D; TOPK > Q; TEMP NaN c/ amostragem; tabela curta;
+        // peso ausente; reservado != 0; rX esparso; camada reconfigurada.
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 3, 2, 8, 1.0, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 8, 1.0, 3)).is_err());
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 0, 1, 0, 0, 2, 2, 2, 8, f32::NAN, 2)).is_err());
+        let tshort = vm.memory.alloc_tensor(&[4], crate::memory::DType::U8).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, tshort).unwrap();
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 0, 2, 0, 0, 2, 2, 2, 8, 1.0, 0)).is_err());
+        let tbad = vm.memory.alloc_tensor(&[64], crate::memory::DType::U8).unwrap();
+        let mut raw = vec![0u8; 64];
+        raw[0..8].copy_from_slice(&0xdeadbeefu64.to_le_bytes());
+        vm.memory.write(tbad, &raw).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, tbad).unwrap();
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 0, 2, 0, 0, 2, 2, 2, 8, 1.0, 0)).is_err());
+        let trsv = vm.memory.alloc_tensor(&[64], crate::memory::DType::U8).unwrap();
+        // tabela válida mas reservado[0] != 0.
+        let mut tb = vec![0u8; 64];
+        // copia tabela válida e suja o reservado.
+        let good = vm.memory.read(t, 64).unwrap();
+        tb.copy_from_slice(&good);
+        tb[40] = 1;
+        vm.memory.write(trsv, &tb).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, trsv).unwrap();
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 0, 2, 0, 0, 2, 2, 2, 8, 1.0, 0)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[1, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 2, 1, 0, 0, 2, 2, 2, 8, 1.0, 0)).is_err());
+        // Reconfiguração real: mesma (stream,layer), D=8 com pesos [8,8].
+        let (x8, t8) = rfc0032_table(&mut vm, 8, 2, 2, 1.0);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, x8).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, t8).unwrap();
+        assert!(vm.step_instruction(cid, &instr_depformer(9, 2, 3, 0, 0, 2, 2, 2, 8, 1.0, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_depformer(0xFF, 0, 1, 0, 0, 2, 2, 2, 8, 1.0, 0)).is_err());
+        assert_eq!(vm.stats.depformer_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0032_combined_runs() {
+        use crate::opcodes::assemble;
+        // Programa .m3asm de verdade dirigindo tabelas feitas em Rust
+        // (u64 não se soletra em .m3asm — Fase 9): prova o caminho CLI.
+        let src = "DEPFORMER r9, r0, r1 LAYER=0 NCB=2 NHEADS=2 LEVELS=2 CONTEXT=8\nHALT\n";
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        let (x, t) = rfc0032_table(&mut vm, 4, 2, 2, 1.0);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, t)]);
+        vm.load_program(prog);
+        // load_program cria ctx novo se vazio — aqui já há ctx com regs.
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.depformer_execs, 1);
+        let ctx = vm.scheduler.get(cid).unwrap().clone();
+        let p = ctx.reg(9).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(p, 6).unwrap(), vec![16.0, 16.0, 16.0, 16.0, 0.0, 0.0]);
     }
 
     // ---- RFC-0005: determinismo -------------------------------------
