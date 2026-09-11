@@ -241,7 +241,7 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x2E` | `SLICE` | 32 | IMPL | S | Flat [start,len) => [1,len] (RFC-0019) |
 | `0x2F` | `CONCAT` | 32 | IMPL | S | N-D axis assembly (RFC-0024) |
 
-### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — PARTIAL (0x30-0x38 + 0x3C-0x43 IMPL; 0x39-0x3B DRAFT), 32B
+### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — IMPL (v1.11), 32B
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
@@ -254,9 +254,9 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x36` | `TILE` | 32 | IMPL | S | Single-axis reps (RFC-0027) |
 | `0x37` | `TRANSPOSE` | 32 | IMPL | S | Generic N-D permute (RFC-0027) |
 | `0x38` | `KV_TRUNCATE` | 32 | IMPL | F2 | KV_CACHE; len+stream gate (RFC-0010) |
-| `0x39` | `KV_COMPRESS` | 32 | DRAFT | F2 | KV_CACHE |
-| `0x3A` | `FLASH_ATTN` | 32 | DRAFT | F2 | KV_CACHE; IO-aware |
-| `0x3B` | `ATTN_SPARSE` | 32 | DRAFT | F2 | KV_CACHE; top-k via DISTANCE (T4) |
+| `0x39` | `KV_COMPRESS` | 32 | IMPL | F2 | Sink+window eviction (RFC-0029) |
+| `0x3A` | `FLASH_ATTN` | 32 | IMPL | S | Blocked online-softmax, tol-verified (RFC-0029) |
+| `0x3B` | `ATTN_SPARSE` | 32 | IMPL | S | Fused DOT top-k (RFC-0029; closes RFC-0004 follow-up) |
 | `0x3C` | `SOFTMAX` | 32 | IMPL | S | Stable, temp-explicit (RFC-0028) |
 | `0x3D` | `GELU` | 32 | IMPL | S | Exact erf (RFC-0028) |
 | `0x3E` | `SIGMOID` | 32 | IMPL | S | Elementwise (RFC-0028) |

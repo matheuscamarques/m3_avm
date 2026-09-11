@@ -4,7 +4,7 @@
 Status:   Informational Draft (research prototype, not a standard)
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Version:  ISA v1.10 (95 opcodes: 0x00-0x43 except 0x39-0x3B, + 0x60-0x69,0x6A-0x79,0x7A-0x7C + 0xFF implemented; cumulative since v1.9)
+Version:  ISA v1.11 (98 opcodes: 0x00-0x43 + 0x60-0x69,0x6A-0x79,0x7A-0x7C + 0xFF implemented; cumulative since v1.10)
 License:  AGPL-3.0-or-later (see LICENSE; Section 15)
 Replaces: all documents under docs/arq/ (archived, non-normative)
 ```
@@ -236,11 +236,10 @@ No operation (scheduler/IP bench target).
 
 ### 5.8 Free range
 
-`0x39-0x3B`, `0x44-0x79` and `0x7D-0xFE` are free, except `0x38
-KV_TRUNCATE` (IMPL, RFC-0010). `0x26-0x2F` are fully allocated and IMPL
-(RFC-0023/0024, incl. `0x2E SLICE` from RFC-0019); `0x30-0x37` allocated
-and IMPL (RFC-0027); `0x3C-0x43` allocated and IMPL (RFC-0028);
-`0x7A-0x7C` allocated and IMPL (RFC-0026). Allocation REQUIRES a
+`0x44-0x79` and `0x7D-0xFE` are free. Allocated and IMPL nearby:
+`0x26-0x2F` (RFC-0023/0024, incl. `0x2E SLICE` from RFC-0019),
+`0x30-0x37` (RFC-0027), `0x38` (RFC-0010), `0x39-0x3B` (RFC-0029),
+`0x3C-0x43` (RFC-0028), `0x7A-0x7C` (RFC-0026). Allocation REQUIRES a
 proposal following the stateful-opcode rule (Section 19).
 
 ## 6. Memory Model
@@ -605,6 +604,7 @@ outruns the Status column above.
 | `0x7A/0x7B/0x7C ADD_IMM/SUB_IMM/STEPS` (control-plane ALU) | IMPL | RFC-0026; wrapping goldens, deterministic STEPS count, demo `alu_demo` (exec verified); v1.8 |
 | `0x30-0x37 SORT/TOPK/ARGMAX/REDUCE/BROADCAST/PAD/TILE/TRANSPOSE` (shape) | IMPL | RFC-0027; total-order/NaN/tie goldens, N-D concat-style lanes, demo `shape_demo` (exec verified); v1.9 |
 | `0x3C-0x43 SOFTMAX/GELU/SIGMOID/TANH/RELU/EXP/LOG/CLIP` (activations) | IMPL | RFC-0028; stable-softmax/temp goldens, exact-erf GELU, NaN table, demo `activation_demo` (exec verified); v1.10 |
+| `0x39/0x3A/0x3B KV_COMPRESS/FLASH_ATTN/ATTN_SPARSE` (KV/attention) | IMPL | RFC-0029; sink+window values, tolerance-vs-ATTN goldens, fused top-k, demo `sparse_attn_demo` (exec verified); v1.11 |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
 `cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,
@@ -684,6 +684,8 @@ ation assumes non-Byzantine peers.
   `SOFTMAX`, `GELU`, `SIGMOID`, `TANH`, `RELU`, `EXP`, `LOG`, `CLIP`).
   The 1.x line continues past 1.9 as 1.10+; `v2.x` stays reserved for
   the dual-mode freeze (never "the minor after 1.9").
+- `ISA v1.11` = v1.10 + KV/attention family `0x39-0x3B` (RFC-0029:
+  `KV_COMPRESS`, `FLASH_ATTN`, `ATTN_SPARSE`; Fase 3 de 3 completa).
 - Draft v2.0 proposal (reconciled, non-normative): `docs/ESPEC-V2.md`
   (DRAFT — do not code against it; reservations in Sections 12-13 of
   this document remain the only binding future encodings).

@@ -962,6 +962,44 @@ impl MemoryManager {
         }
     }
 
+    /// Compressão sink+janela estilo StreamingLLM (RFC-0029): por camada,
+    /// se seq > sink+window, mantém as linhas [0..sink) + [seq-window..seq)
+    /// em K e V e descarta o meio (drain = memmove). No-op Ok quando já
+    /// cabe (chamadas por passo não devem falhar). Chamador valida
+    /// sink+window > 0 (degenerado veta no opcode). Escopo = camadas
+    /// (kv_heap intocado, como TRUNCATE); rollback via snapshots.
+    pub fn kv_cache_compress_sink_window(&mut self, sink: usize, window: usize) {
+        for layer in &mut self.kv_cache_layers {
+            let s = layer.seq_len();
+            if s <= sink.saturating_add(window) {
+                continue;
+            }
+            let h = layer.hidden;
+            let keep_head = sink * h;
+            let tail_start = (s - window) * h;
+            let mut nk = Vec::with_capacity((sink + window) * h);
+            nk.extend_from_slice(&layer.k[..keep_head]);
+            nk.extend_from_slice(&layer.k[tail_start..]);
+            let mut nv = Vec::with_capacity((sink + window) * h);
+            nv.extend_from_slice(&layer.v[..keep_head]);
+            nv.extend_from_slice(&layer.v[tail_start..]);
+            layer.k = nk;
+            layer.v = nv;
+            layer.seq_len = sink + window;
+        }
+    }
+
+    /// Lê linha (K, V) de uma camada (inspeção/teste, RFC-0029).
+    /// None se camada/posição inexistente.
+    pub fn kv_cache_row(&self, layer: usize, pos: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        let l = self.kv_cache_layers.get(layer)?;
+        if pos >= l.seq_len() {
+            return None;
+        }
+        let h = l.hidden;
+        Some((l.k[pos * h..(pos + 1) * h].to_vec(), l.v[pos * h..(pos + 1) * h].to_vec()))
+    }
+
     /// Aloca um tensor no KV_CACHE (para debug via endereços 0x30...)
     /// Retorna addr canônico na região KV_CACHE.
     pub fn alloc_kv_tensor(&mut self, size: usize) -> Result<u128> {

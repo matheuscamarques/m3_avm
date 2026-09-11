@@ -406,6 +406,7 @@ impl WgpuMemoryManager {
     pub fn kv_cache_seq_len(&self) -> usize { self.cpu_fallback.kv_cache_seq_len() }
     pub fn kv_cache_n_layers(&self) -> usize { self.cpu_fallback.kv_cache_n_layers() }
     pub fn kv_cache_truncate(&mut self, seq: usize) { self.cpu_fallback.kv_cache_truncate(seq) }
+    pub fn kv_cache_compress_sink_window(&mut self, sink: usize, window: usize) { self.cpu_fallback.kv_cache_compress_sink_window(sink, window) }
     pub fn kv_cache_clear(&mut self) { self.cpu_fallback.kv_cache_clear() }
     pub fn kv_cache_attention(&self, layer: usize, q: &[f32]) -> anyhow::Result<Vec<f32>> { self.cpu_fallback.kv_cache_attention(layer, q) }
     pub fn kv_cache_stats(&self) -> String { self.cpu_fallback.kv_cache_stats() }

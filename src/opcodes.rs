@@ -156,6 +156,14 @@ pub const QUANTIZE_Q4_0: u8 = 4;
 pub const QUANTIZE_Q8_0: u8 = 8;
 // RFC-0027: forma (0x30-0x37, v1.9; resto de 0x30-0x43 nas partes 2-3).
 // RFC-0028: ativações (0x3C-0x43, v1.10; 0x39-0x3B na parte 3).
+// RFC-0029: KV/attention (0x39/0x3A/0x3B, v1.11; fecha 0x30-0x43).
+pub const OP_KV_COMPRESS: u8 = 0x39; // evicção sink+janela no KV_CACHE
+pub const OP_FLASH_ATTN: u8 = 0x3A; // atenção em blocos, online-softmax
+pub const OP_ATTN_SPARSE: u8 = 0x3B; // top-k fundido por DOT + atenção
+// Modo — KV_COMPRESS (payload[4]): só SINK_WINDOW.
+pub const KVCOMP_MODE_SINK_WINDOW: u8 = 0;
+// Métrica — ATTN_SPARSE (payload[0]): só DOT (scores são dots).
+pub const SPARSE_METRIC_DOT: u8 = 0;
 pub const OP_SOFTMAX: u8 = 0x3C; // softmax estável por eixo + temperatura
 pub const OP_GELU: u8 = 0x3D; // gelu exato (erf A&S)
 pub const OP_SIGMOID: u8 = 0x3E; // 1/(1+e^-x)
@@ -557,6 +565,9 @@ impl Instruction {
             OP_EXP => "EXP",
             OP_LOG => "LOG",
             OP_CLIP => "CLIP",
+            OP_KV_COMPRESS => "KV_COMPRESS",
+            OP_FLASH_ATTN => "FLASH_ATTN",
+            OP_ATTN_SPARSE => "ATTN_SPARSE",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -2038,6 +2049,70 @@ pub fn instr_exp(rdest: u8, r_src: u8) -> Instruction {
 /// LOG rD, rT (sem payload).
 pub fn instr_log(rdest: u8, r_src: u8) -> Instruction {
     Instruction::new(OP_LOG, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0029: KV_COMPRESS (0x39) / FLASH_ATTN (0x3A) / ATTN_SPARSE (0x3B).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// KV_COMPRESS: payload[0..2]=sink u16 LE, [2..4]=window u16 LE,
+    /// [4]=mode (0=SINK_WINDOW), [5..7]=stream u16 LE (0=só).
+    pub fn kv_compress_params(&self) -> (u16, u16, u8, u16) {
+        let sink = u16::from_le_bytes([self.payload[0], self.payload[1]]);
+        let window = u16::from_le_bytes([self.payload[2], self.payload[3]]);
+        let stream = u16::from_le_bytes([self.payload[5], self.payload[6]]);
+        (sink, window, self.payload[4], stream)
+    }
+
+    pub fn set_kv_compress_params(&mut self, sink: u16, window: u16, mode: u8, stream: u16) {
+        self.payload[0..2].copy_from_slice(&sink.to_le_bytes());
+        self.payload[2..4].copy_from_slice(&window.to_le_bytes());
+        self.payload[4] = mode;
+        self.payload[5..7].copy_from_slice(&stream.to_le_bytes());
+    }
+
+    /// FLASH_ATTN: payload[0..2]=block_rows u16 LE (0=default 32).
+    pub fn flash_block(&self) -> u16 {
+        u16::from_le_bytes([self.payload[0], self.payload[1]])
+    }
+
+    pub fn set_flash_block(&mut self, block: u16) {
+        self.payload[0..2].copy_from_slice(&block.to_le_bytes());
+    }
+
+    /// ATTN_SPARSE: payload[0]=metric (0=DOT), [1..3]=topk u16 LE
+    /// (0=todos = caminho denso-equivalente).
+    pub fn sparse_params(&self) -> (u8, u16) {
+        let topk = u16::from_le_bytes([self.payload[1], self.payload[2]]);
+        (self.payload[0], topk)
+    }
+
+    pub fn set_sparse_params(&mut self, metric: u8, topk: u16) {
+        self.payload[0] = metric;
+        self.payload[1..3].copy_from_slice(&topk.to_le_bytes());
+    }
+}
+
+/// KV_COMPRESS SINK=n WINDOW=n [MODE=..] [STREAM=0] (sem registradores).
+pub fn instr_kv_compress(sink: u16, window: u16, mode: u8, stream: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_KV_COMPRESS, 0, 0xFF, 0xFF, 0xFF, 0xFF);
+    instr.set_kv_compress_params(sink, window, mode, stream);
+    instr
+}
+
+/// FLASH_ATTN rD, rQ, rK, rV [BLOCK=n] (0=default 32).
+pub fn instr_flash_attn(rdest: u8, r_q: u8, r_k: u8, r_v: u8, block: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_FLASH_ATTN, 0, rdest, r_q, r_k, r_v);
+    instr.set_flash_block(block);
+    instr
+}
+
+/// ATTN_SPARSE rD, rQ, rK, rV [TOPK=n] [METRIC=DOT].
+pub fn instr_attn_sparse(rdest: u8, r_q: u8, r_k: u8, r_v: u8, metric: u8, topk: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_ATTN_SPARSE, 0, rdest, r_q, r_k, r_v);
+    instr.set_sparse_params(metric, topk);
+    instr
 }
 
 // ---------------------------------------------------------------------------
@@ -3910,6 +3985,73 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_clip(parse_reg(parts[1])?, parse_reg(parts[2])?, min, max))
         }
+        "KV_COMPRESS" => {
+            // KV_COMPRESS SINK=n WINDOW=n [MODE=SINK_WINDOW] [STREAM=0]
+            // (sem registradores; DUMP-precedente: operandos ignorados N/A)
+            let (mut sink, mut window, mut has_sink, mut has_window) = (0u16, 0u16, false, false);
+            let (mut mode, mut stream) = (KVCOMP_MODE_SINK_WINDOW, 0u16);
+            for p in &parts[1..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("SINK=") {
+                    sink = v.parse::<u16>().map_err(|_| anyhow!("KV_COMPRESS SINK inválido '{}'", p))?;
+                    has_sink = true;
+                } else if let Some(v) = up.strip_prefix("WINDOW=") {
+                    window = v.parse::<u16>().map_err(|_| anyhow!("KV_COMPRESS WINDOW inválido '{}'", p))?;
+                    has_window = true;
+                } else if let Some(v) = up.strip_prefix("MODE=") {
+                    mode = match v {
+                        "SINK_WINDOW" | "0" => KVCOMP_MODE_SINK_WINDOW,
+                        _ => return Err(anyhow!("KV_COMPRESS MODE '{}' inválido (só SINK_WINDOW)", p)),
+                    };
+                } else if let Some(v) = up.strip_prefix("STREAM=") {
+                    stream = v.parse::<u16>().map_err(|_| anyhow!("KV_COMPRESS STREAM inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("KV_COMPRESS token desconhecido '{}' (use SINK=/WINDOW=/MODE=/STREAM=)", p));
+                }
+            }
+            if !has_sink || !has_window {
+                return Err(anyhow!("KV_COMPRESS precisa de SINK= e WINDOW= — ex: KV_COMPRESS SINK=2 WINDOW=3"));
+            }
+            Ok(instr_kv_compress(sink, window, mode, stream))
+        }
+        "FLASH_ATTN" => {
+            // FLASH_ATTN rD, rQ, rK, rV [BLOCK=n] (0/default 32)
+            if parts.len() < 5 {
+                return Err(anyhow!("FLASH_ATTN precisa de rdest, rQ, rK, rV — ex: FLASH_ATTN r4, r0, r1, r2 BLOCK=2"));
+            }
+            let mut block = 0u16;
+            for p in &parts[5..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("BLOCK=") {
+                    block = v.parse::<u16>().map_err(|_| anyhow!("FLASH_ATTN BLOCK inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("FLASH_ATTN token desconhecido '{}' (use BLOCK=)", p));
+                }
+            }
+            Ok(instr_flash_attn(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, parse_reg(parts[4])?, block))
+        }
+        "ATTN_SPARSE" => {
+            // ATTN_SPARSE rD, rQ, rK, rV [TOPK=n] [METRIC=DOT]
+            // (só DOT parseia — sem soletrar métrica inexecutável)
+            if parts.len() < 5 {
+                return Err(anyhow!("ATTN_SPARSE precisa de rdest, rQ, rK, rV — ex: ATTN_SPARSE r3, r0, r1, r2 TOPK=2"));
+            }
+            let (mut topk, mut metric) = (0u16, SPARSE_METRIC_DOT);
+            for p in &parts[5..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("TOPK=") {
+                    topk = v.parse::<u16>().map_err(|_| anyhow!("ATTN_SPARSE TOPK inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("METRIC=") {
+                    metric = match v {
+                        "DOT" | "0" => SPARSE_METRIC_DOT,
+                        _ => return Err(anyhow!("ATTN_SPARSE METRIC '{}' sem implementação (só DOT)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("ATTN_SPARSE token desconhecido '{}' (use TOPK=/METRIC=)", p));
+                }
+            }
+            Ok(instr_attn_sparse(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, parse_reg(parts[4])?, metric, topk))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -5482,6 +5624,43 @@ mod tests {
         assert!(assemble("CLIP r8, r0").is_err());
         assert!(assemble("CLIP r8, r0 MIN=0").is_err());
         assert!(assemble("CLIP r8, r0 MIN=0 MAX=0.4 FOO=1").is_err());
+    }
+
+    // ---- RFC-0029: KV/attention -----------------------------------------
+
+    #[test]
+    fn test_rfc0029_ctor_roundtrip() {
+        let k = instr_kv_compress(2, 3, KVCOMP_MODE_SINK_WINDOW, 0);
+        assert_eq!(k.opcode, OP_KV_COMPRESS);
+        assert_eq!(k.kv_compress_params(), (2, 3, KVCOMP_MODE_SINK_WINDOW, 0));
+        let d = Instruction::decode(&k.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "KV_COMPRESS");
+        let f = instr_flash_attn(4, 0, 1, 2, 2);
+        assert_eq!(f.opcode, OP_FLASH_ATTN);
+        assert_eq!(f.flash_block(), 2);
+        assert_eq!((f.rdest, f.rsrc1, f.rsrc2, f.rsrc3), (4, 0, 1, 2));
+        let d = Instruction::decode(&f.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "FLASH_ATTN");
+        let s = instr_attn_sparse(3, 0, 1, 2, SPARSE_METRIC_DOT, 2);
+        assert_eq!(s.opcode, OP_ATTN_SPARSE);
+        assert_eq!(s.sparse_params(), (SPARSE_METRIC_DOT, 2));
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "ATTN_SPARSE");
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("KV_COMPRESS SINK=2 WINDOW=3").unwrap();
+        assert_eq!(prog[0].kv_compress_params(), (2, 3, KVCOMP_MODE_SINK_WINDOW, 0));
+        let prog = assemble("FLASH_ATTN r4, r0, r1, r2 BLOCK=2").unwrap();
+        assert_eq!(prog[0].flash_block(), 2);
+        let prog = assemble("ATTN_SPARSE r3, r0, r1, r2 TOPK=2").unwrap();
+        assert_eq!(prog[0].sparse_params(), (SPARSE_METRIC_DOT, 2));
+        assert!(assemble("KV_COMPRESS SINK=2").is_err());
+        assert!(assemble("KV_COMPRESS SINK=2 WINDOW=3 MODE=FOO").is_err());
+        assert!(assemble("KV_COMPRESS SINK=2 WINDOW=3 FOO=1").is_err());
+        assert!(assemble("FLASH_ATTN r4, r0, r1").is_err());
+        assert!(assemble("FLASH_ATTN r4, r0, r1, r2 FOO=1").is_err());
+        assert!(assemble("ATTN_SPARSE r3, r0, r1").is_err());
+        assert!(assemble("ATTN_SPARSE r3, r0, r1, r2 METRIC=COSINE").is_err());
+        assert!(assemble("ATTN_SPARSE r3, r0, r1, r2 FOO=1").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

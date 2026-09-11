@@ -68,6 +68,10 @@ harness = false
 name = "activation_bench"
 harness = false
 
+[[bench]]
+name = "attention_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

@@ -1,0 +1,10 @@
+; programs/sparse_attn_demo.m3asm — RFC-0029: KV/attention.
+; KV vazio => COMPRESS no-op Ok; top-k fundido + flash em blocos sobre
+; rampas. Contadores verificados em test_rfc0029_demo_runs: 1 cada.
+TENSOR r0 2 4 f32
+TENSOR r1 4 4 f32
+TENSOR r2 4 2 f32
+KV_COMPRESS SINK=2 WINDOW=3
+ATTN_SPARSE r3, r0, r1, r2 TOPK=2
+FLASH_ATTN r4, r0, r1, r2 BLOCK=2
+HALT

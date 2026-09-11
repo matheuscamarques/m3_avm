@@ -40,6 +40,8 @@ use crate::opcodes::{
     OP_SORT, OP_TOPK, OP_ARGMAX, OP_REDUCE, OP_BROADCAST, OP_PAD, OP_TILE,
     OP_TRANSPOSE, SORT_ASC, SORT_DESC, REDUCE_SUM, REDUCE_MEAN, REDUCE_MAX,
     REDUCE_MIN, REDUCE_PROD,
+    OP_KV_COMPRESS, OP_FLASH_ATTN, OP_ATTN_SPARSE, KVCOMP_MODE_SINK_WINDOW,
+    SPARSE_METRIC_DOT,
     OP_SOFTMAX, OP_GELU, OP_SIGMOID, OP_TANH, OP_RELU, OP_EXP, OP_LOG, OP_CLIP,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
@@ -154,6 +156,9 @@ pub struct VmStats {
     pub exp_execs: u64,
     pub log_execs: u64,
     pub clip_execs: u64,
+    pub kv_compress_execs: u64,
+    pub flash_attn_execs: u64,
+    pub attn_sparse_execs: u64,
     pub start_ns: u64,
 }
 
@@ -359,6 +364,12 @@ impl MemBackend {
         match self {
             MemBackend::Cpu(m) => m.kv_cache_truncate(seq),
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_truncate(seq),
+        }
+    }
+    pub fn kv_cache_compress_sink_window(&mut self, sink: usize, window: usize) {
+        match self {
+            MemBackend::Cpu(m) => m.kv_cache_compress_sink_window(sink, window),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_compress_sink_window(sink, window),
         }
     }
     pub fn kv_cache_clear(&mut self) {
@@ -1254,6 +1265,18 @@ impl Vm {
             }
             OP_FOREST => {
                 self.exec_forest(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_KV_COMPRESS => {
+                self.exec_kv_compress(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_FLASH_ATTN => {
+                self.exec_flash_attn(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ATTN_SPARSE => {
+                self.exec_attn_sparse(ctx_id, instr)?;
                 Ok(true)
             }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
@@ -4976,6 +4999,180 @@ impl Vm {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // RFC-0029: KV/attention (0x39/0x3A/0x3B). Equivalência com ATTN denso
+    // verificada por TOLERÂNCIA (associação fp difere do path ndarray) —
+    // nunca afirmada bit-exata.
+    // -----------------------------------------------------------------------
+
+    /// KV_COMPRESS SINK=n WINDOW=n — evicção sink+janela por camada
+    /// (StreamingLLM-style). Sem registradores. No-op Ok quando já cabe;
+    /// (0,0) veta (degenerado). Rollback via snapshots (não snapshota).
+    fn exec_kv_compress(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (sink_p, window_p, mode, stream) = instr.kv_compress_params();
+        if mode != KVCOMP_MODE_SINK_WINDOW {
+            return Err(anyhow!("KV_COMPRESS: MODE={} inválido (só SINK_WINDOW)", mode));
+        }
+        if stream != 0 {
+            return Err(anyhow!("KV_COMPRESS: STREAM={} não suportado (single-stream; 17 streams é follow-up)", stream));
+        }
+        if sink_p == 0 && window_p == 0 {
+            return Err(anyhow!("KV_COMPRESS: SINK=WINDOW=0 esvaziaria o cache (degenerado)"));
+        }
+        let before = self.memory.kv_cache_seq_len();
+        self.memory.kv_cache_compress_sink_window(sink_p as usize, window_p as usize);
+        let after = self.memory.kv_cache_seq_len();
+        self.stats.kv_compress_execs += 1;
+        log_debug("kv", &format!("ctx {} KV_COMPRESS sink={} window={} seq {} -> {}", ctx_id, sink_p, window_p, before, after));
+        Ok(())
+    }
+
+    /// Lê Q/K/V densos F32 2-D (guards uniformes; formas validadas como
+    /// ATTN: Q.cols==K.cols, K.rows==V.rows). Retorna (M, N, D, Vd, q, k, v).
+    fn read_qkv(&self, ctx_id: u64, instr: &Instruction, op: &str) -> Result<(usize, usize, usize, usize, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF || instr.rsrc3 == 0xFF {
+            return Err(anyhow!("{} precisa de rdest, rQ, rK, rV (0xFF não é registrador)", op));
+        }
+        let (aq, ak, av) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?, ctx.reg(instr.rsrc3)?)
+        };
+        let (sq, q) = self.read_dense_f32(aq, op)?;
+        let (sk, k) = self.read_dense_f32(ak, op)?;
+        let (sv, v) = self.read_dense_f32(av, op)?;
+        if sq.len() != 2 || sk.len() != 2 || sv.len() != 2 {
+            return Err(anyhow!("{}: tensores 2-D (Q{:?} K{:?} V{:?})", op, sq, sk, sv));
+        }
+        if sq[1] != sk[1] {
+            return Err(anyhow!("{} incompatível: Q cols {} != K cols {}", op, sq[1], sk[1]));
+        }
+        if sk[0] != sv[0] {
+            return Err(anyhow!("{} incompatível: K rows {} != V rows {}", op, sk[0], sv[0]));
+        }
+        Ok((sq[0], sk[0], sq[1], sv[1], q, k, v))
+    }
+
+    /// FLASH_ATTN rD, rQ, rK, rV [BLOCK=n] — atenção em blocos com online
+    /// softmax (o algoritmo FlashAttention de verdade, tamanho CPU):
+    /// máximo/normalizador/acumulador correntes com reescala por bloco.
+    /// Flags devem ser 0 (NOTIFY não existe no path em blocos — alto, não
+    /// descartado quieto). Saída [M, Vd], tolerância-verificada vs ATTN.
+    fn exec_flash_attn(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.flags != 0 {
+            return Err(anyhow!("FLASH_ATTN: flags 0x{:02x} sem suporte no path em blocos", instr.flags));
+        }
+        let block_p = instr.flash_block();
+        let block = if block_p == 0 { 32 } else { block_p as usize };
+        let (mq, n, d, vd, q, k, v) = self.read_qkv(ctx_id, instr, "FLASH_ATTN")?;
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut out = vec![0.0f32; mq * vd];
+        for m in 0..mq {
+            let mut rm = f32::NEG_INFINITY;
+            let mut rl = 0.0f32;
+            let mut ro = vec![0.0f32; vd];
+            let mut b0 = 0usize;
+            while b0 < n {
+                let b1 = (b0 + block).min(n);
+                // Máximo do bloco (duas passadas: clareza > micro-ótimo;
+                // fundir é follow-up de perf, semântica idêntica).
+                let mut bm = f32::NEG_INFINITY;
+                for j in b0..b1 {
+                    let mut s = 0.0f32;
+                    for dd in 0..d {
+                        s += q[m * d + dd] * k[j * d + dd];
+                    }
+                    let s = s * scale;
+                    if s > bm {
+                        bm = s;
+                    }
+                }
+                let new_m = if bm > rm { bm } else { rm };
+                let a_old = (rm - new_m).exp();
+                rl *= a_old;
+                for x in ro.iter_mut() {
+                    *x *= a_old;
+                }
+                for j in b0..b1 {
+                    let mut s = 0.0f32;
+                    for dd in 0..d {
+                        s += q[m * d + dd] * k[j * d + dd];
+                    }
+                    let p = ((s * scale) - new_m).exp();
+                    rl += p;
+                    for vv in 0..vd {
+                        ro[vv] += p * v[j * vd + vv];
+                    }
+                }
+                rm = new_m;
+                b0 = b1;
+            }
+            for vv in 0..vd {
+                out[m * vd + vv] = ro[vv] / rl;
+            }
+        }
+        let out_shape = vec![mq, vd];
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.flash_attn_execs += 1;
+        log_debug("flash", &format!("ctx {} FLASH_ATTN [{}x{}]x[{}x{}] BLOCK={} -> 0x{:x}", ctx_id, mq, d, n, vd, block, out_addr));
+        Ok(())
+    }
+
+    /// ATTN_SPARSE rD, rQ, rK, rV [TOPK] — top-k fundido por DOT (scores
+    /// são dots) + softmax + V. Mesma ordem total da casa (lane_cmp:
+    /// NaN-primeiro em desc, empate menor idx). k=0 = todos (mesmo
+    /// kernel, sem caso especial). Fecha o follow-up da RFC-0004.
+    fn exec_attn_sparse(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (metric, topk_p) = instr.sparse_params();
+        if metric != SPARSE_METRIC_DOT {
+            return Err(anyhow!("ATTN_SPARSE: METRIC={} sem implementação (só DOT)", metric));
+        }
+        let (mq, n, d, vd, q, k, v) = self.read_qkv(ctx_id, instr, "ATTN_SPARSE")?;
+        let kk = if topk_p == 0 { n } else { topk_p as usize };
+        if kk > n {
+            return Err(anyhow!("ATTN_SPARSE: TOPK={} > N={} (sem clamp silencioso)", kk, n));
+        }
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut out = vec![0.0f32; mq * vd];
+        for m in 0..mq {
+            // Scores + seleção top-k (ordem total da casa).
+            let mut scored: Vec<(f32, usize)> = (0..n)
+                .map(|j| {
+                    let mut s = 0.0f32;
+                    for dd in 0..d {
+                        s += q[m * d + dd] * k[j * d + dd];
+                    }
+                    (s * scale, j)
+                })
+                .collect();
+            scored.sort_by(|a, b| Self::lane_cmp(*a, *b, true));
+            let mut sel: Vec<f32> = scored[..kk].iter().map(|&(s, _)| s).collect();
+            crate::activations::softmax_lane(&mut sel, 1.0);
+            for (t, w) in sel.iter().enumerate() {
+                let j = scored[t].1;
+                for vv in 0..vd {
+                    out[m * vd + vv] += *w * v[j * vd + vv];
+                }
+            }
+        }
+        let out_shape = vec![mq, vd];
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.attn_sparse_execs += 1;
+        log_debug("sparse-attn", &format!("ctx {} ATTN_SPARSE [{}x{}] TOPK={}/{} -> 0x{:x}", ctx_id, mq, d, kk, n, out_addr));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -7305,6 +7502,163 @@ mod tests {
         let stats = vm.run().unwrap();
         assert_eq!((stats.sigmoid_execs, stats.tanh_execs, stats.relu_execs, stats.gelu_execs), (1, 1, 1, 1));
         assert_eq!((stats.exp_execs, stats.log_execs, stats.softmax_execs, stats.clip_execs), (1, 1, 1, 1));
+    }
+
+    // ---- RFC-0029: KV/attention ---------------------------------------
+
+    #[test]
+    fn test_rfc0029_kv_compress() {
+        use crate::opcodes::instr_kv_compress;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.memory.kv_cache_init(2, 4);
+        for t in 0..10u32 {
+            for layer in 0..2usize {
+                let k = vec![(layer as u32 * 100 + t) as f32; 4];
+                let v = vec![(layer as u32 * 1000 + t) as f32; 4];
+                vm.memory.kv_cache_append(layer, &k, &v).unwrap();
+            }
+        }
+        assert_eq!(vm.memory.kv_cache_seq_len(), 10);
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        let row = |vm: &mut Vm, l: usize, p: usize| {
+            vm.memory.as_cpu_mut().unwrap().kv_cache_row(l, p).unwrap()
+        };
+        // SINK=2 WINDOW=3: mantém pos 0,1 + 7,8,9.
+        vm.step_instruction(cid, &instr_kv_compress(2, 3, 0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 5);
+        assert_eq!(row(&mut vm, 0, 0).0, vec![0.0; 4]);
+        assert_eq!(row(&mut vm, 0, 1).0, vec![1.0; 4]);
+        assert_eq!(row(&mut vm, 0, 2).0, vec![7.0; 4]);
+        assert_eq!(row(&mut vm, 0, 4).1, vec![9.0; 4]);
+        assert_eq!(row(&mut vm, 1, 0).0, vec![100.0; 4]);
+        assert_eq!(row(&mut vm, 1, 4).1, vec![1009.0; 4]);
+        // No-op quando já cabe (chamada por passo não deve falhar).
+        vm.step_instruction(cid, &instr_kv_compress(5, 5, 0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 5);
+        // Erros: degenerado, stream, modo.
+        assert!(vm.step_instruction(cid, &instr_kv_compress(0, 0, 0, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_kv_compress(2, 3, 0, 1)).is_err());
+        assert!(vm.step_instruction(cid, &instr_kv_compress(2, 3, 9, 0)).is_err());
+        // Rollback: snapshot -> append -> compress -> restore volta tudo.
+        let snap = vm.memory.snapshot();
+        for layer in 0..2usize {
+            vm.memory.kv_cache_append(layer, &[50.0; 4], &[60.0; 4]).unwrap();
+            vm.memory.kv_cache_append(layer, &[51.0; 4], &[61.0; 4]).unwrap();
+        }
+        assert_eq!(vm.memory.kv_cache_seq_len(), 7);
+        vm.step_instruction(cid, &instr_kv_compress(1, 1, 0, 0)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 2);
+        vm.memory.restore(snap).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 5);
+        assert_eq!(row(&mut vm, 0, 2).0, vec![7.0; 4]);
+        assert_eq!(vm.stats.kv_compress_execs, 3);
+    }
+
+    #[test]
+    fn test_rfc0029_flash_attn() {
+        use crate::opcodes::{instr_attn, instr_flash_attn};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let q = rfc0004_f32(&mut vm, &[2, 4], &[0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]);
+        let k = rfc0004_f32(&mut vm, &[4, 4], &[0.5, 0.0, 1.0, 0.0, 0.0, 0.5, 0.0, 1.0, 1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5]);
+        let v = rfc0004_f32(&mut vm, &[4, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 2.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, q), (1, k), (2, v)]);
+        let rd = |vm: &Vm, r: u8| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, 4).unwrap();
+        // Referência densa + flash em blocos: tolerância, nunca bits.
+        vm.step_instruction(cid, &instr_attn(10, 0, 1, 2)).unwrap();
+        let aref = rd(&vm, 10);
+        vm.step_instruction(cid, &instr_flash_attn(11, 0, 1, 2, 2)).unwrap();
+        let got2 = rd(&vm, 11);
+        for (a, b) in aref.iter().zip(got2.iter()) {
+            assert!((a - b).abs() <= 1e-4, "attn={:?} flash={:?}", aref, got2);
+        }
+        // Invariância de tiling: BLOCK=default vs 2 vs 64.
+        vm.step_instruction(cid, &instr_flash_attn(12, 0, 1, 2, 0)).unwrap();
+        vm.step_instruction(cid, &instr_flash_attn(13, 0, 1, 2, 64)).unwrap();
+        let g0 = rd(&vm, 12);
+        let g64 = rd(&vm, 13);
+        for (a, b) in got2.iter().zip(g0.iter()).chain(got2.iter().zip(g64.iter())) {
+            assert!((a - b).abs() <= 1e-4);
+        }
+        // Erros: incompatível, esparso, flags.
+        let kbad = rfc0004_f32(&mut vm, &[4, 3], &[0.0; 12]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, kbad).unwrap();
+        assert!(vm.step_instruction(cid, &instr_flash_attn(11, 0, 3, 2, 2)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[2, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_flash_attn(11, 3, 1, 2, 2)).is_err());
+        let mut flagged = instr_flash_attn(11, 0, 1, 2, 2);
+        flagged.flags = 1;
+        assert!(vm.step_instruction(cid, &flagged).is_err());
+        assert_eq!(vm.stats.flash_attn_execs, 3);
+    }
+
+    #[test]
+    fn test_rfc0029_attn_sparse() {
+        use crate::opcodes::{instr_attn, instr_attn_sparse, SPARSE_METRIC_DOT};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        // K quase-ortogonal escalado: seleção top-2 óbvia por linha.
+        let q = rfc0004_f32(&mut vm, &[1, 4], &[1.0, 0.0, 0.0, 0.0]);
+        let k = rfc0004_f32(&mut vm, &[4, 4], &[10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0]);
+        let v = rfc0004_f32(&mut vm, &[4, 2], &[0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, q), (1, k), (2, v)]);
+        // scores/2 = [5,0,0,0]: top-2 = idx {0,1}; softmax = [w0,w1].
+        vm.step_instruction(cid, &instr_attn_sparse(3, 0, 1, 2, SPARSE_METRIC_DOT, 2)).unwrap();
+        let got = vm.memory.read_f32_tensor(rfc0005_reg_u64(&vm, cid, 3) as u128, 2).unwrap();
+        let e5 = 5.0f64.exp();
+        let w0 = e5 / (e5 + 1.0);
+        let w1 = 1.0 / (e5 + 1.0);
+        let e0 = w0 * 0.0 + w1 * 10.0;
+        let e1 = w0 * 1.0 + w1 * 11.0;
+        assert!((got[0] as f64 - e0).abs() < 1e-4, "{:?} vs [{},{}]", got, e0, e1);
+        assert!((got[1] as f64 - e1).abs() < 1e-4, "{:?} vs [{},{}]", got, e0, e1);
+        // TOPK=0 e k=N: mesmo kernel, tolerância vs ATTN (não bits).
+        vm.step_instruction(cid, &instr_attn(4, 0, 1, 2)).unwrap();
+        let aref = vm.memory.read_f32_tensor(rfc0005_reg_u64(&vm, cid, 4) as u128, 2).unwrap();
+        vm.step_instruction(cid, &instr_attn_sparse(5, 0, 1, 2, SPARSE_METRIC_DOT, 0)).unwrap();
+        vm.step_instruction(cid, &instr_attn_sparse(6, 0, 1, 2, SPARSE_METRIC_DOT, 4)).unwrap();
+        for r in [5u8, 6u8] {
+            let g = vm.memory.read_f32_tensor(rfc0005_reg_u64(&vm, cid, r) as u128, 2).unwrap();
+            for (a, b) in aref.iter().zip(g.iter()) {
+                assert!((a - b).abs() <= 1e-4, "attn={:?} sparse={:?}", aref, g);
+            }
+        }
+        // Erros: k > N, métrica, esparso.
+        assert!(vm.step_instruction(cid, &instr_attn_sparse(3, 0, 1, 2, SPARSE_METRIC_DOT, 5)).is_err());
+        assert!(vm.step_instruction(cid, &instr_attn_sparse(3, 0, 1, 2, 1, 2)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[1, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_attn_sparse(3, 7, 1, 2, SPARSE_METRIC_DOT, 2)).is_err());
+        assert_eq!(vm.stats.attn_sparse_execs, 3);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0029_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            TENSOR r0 2 4 f32
+            TENSOR r1 4 4 f32
+            TENSOR r2 4 2 f32
+            KV_COMPRESS SINK=2 WINDOW=3
+            ATTN_SPARSE r3, r0, r1, r2 TOPK=2
+            FLASH_ATTN r4, r0, r1, r2 BLOCK=2
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.kv_compress_execs, stats.attn_sparse_execs, stats.flash_attn_execs), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn test_rfc0029_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/sparse_attn_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.kv_compress_execs, stats.attn_sparse_execs, stats.flash_attn_execs), (1, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------
