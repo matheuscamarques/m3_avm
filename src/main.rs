@@ -79,11 +79,11 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         emit_asm: Option<PathBuf>,
     },
-    /// Monta .m3asm -> .m3bin
+    /// Monta .m3asm -> .m3bin (ou .m3bc se a saída terminar em .m3bc)
     Assemble {
         /// Arquivo .m3asm
         input: PathBuf,
-        /// Saída .m3bin (default: input com extensão trocada)
+        /// Saída .m3bin (default: input com extensão trocada; .m3bc = container)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
@@ -1127,10 +1127,27 @@ fn assemble_file(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
     let text = fs::read_to_string(&input)?;
     let prog = assemble(&text)?;
     let out_path = output.unwrap_or_else(|| input.with_extension("m3bin"));
-    let mut bytes = Vec::with_capacity(prog.len() * INSTR_SIZE);
+    let mut payload = Vec::with_capacity(prog.len() * INSTR_SIZE);
     for instr in &prog {
-        bytes.extend_from_slice(&instr.encode());
+        payload.extend_from_slice(&instr.encode());
     }
+    // Extensão .m3bc => container (header + CRC32 + negociação, ESPEC-V2
+    // §8). ENTRY_PC=0: o assembler só emite 32B a partir da base, e todos
+    // os labels já são PCs absolutos — nada a relocar.
+    let bytes = if out_path.extension().and_then(|s| s.to_str()) == Some("m3bc") {
+        let header = m3bc::M3bcHeader {
+            major: m3bc::M3BC_VERSION.0,
+            minor: m3bc::M3BC_VERSION.1,
+            patch: m3bc::M3BC_VERSION.2,
+            required: 0,
+            optional: 0,
+            entry_pc: 0,
+        };
+        println!(";; container .m3bc v{}.{}.{} (entry_pc=0, CRC32 incluído)", header.major, header.minor, header.patch);
+        m3bc::encode_m3bc(&header, &payload)
+    } else {
+        payload
+    };
     fs::write(&out_path, &bytes)?;
     println!("OK: {} instruções -> {} ({} bytes)", prog.len(), out_path.display(), bytes.len());
     Ok(())
