@@ -1,0 +1,13 @@
+; programs/call_ret_demo.m3asm — RFC-0034: sub-rotinas aninhadas.
+; main -> LEVEL1 -> LEVEL2, retorno em cadeia. r0: 5 -> 6 -> 16.
+; Contadores verificados em test_rfc0034_demo_runs: call=2, ret=2.
+LOADI r0, 5
+CALL LEVEL1
+HALT
+LEVEL1:
+    ADD_IMM r0, r0 IMM=1
+    CALL LEVEL2
+    RET
+LEVEL2:
+    ADD_IMM r0, r0 IMM=10
+    RET

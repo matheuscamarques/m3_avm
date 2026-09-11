@@ -45,7 +45,7 @@ use crate::opcodes::{
     OP_STREAM_MERGE, OP_VAD_DETECT, OP_AUDIO_RESAMPLE, OP_AUDIO_FILTER,
     OP_AUDIO_WINDOW, VAD_MODE_ENERGY, VAD_MODE_ZCR, VAD_MODE_ML,
     FILTER_MODE_FIR, FILTER_MODE_IIR, WINDOW_HANN, WINDOW_HAMMING,
-    OP_DEPFORMER,
+    OP_DEPFORMER, OP_CALL, OP_RET,
     OP_SOFTMAX, OP_GELU, OP_SIGMOID, OP_TANH, OP_RELU, OP_EXP, OP_LOG, OP_CLIP,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
@@ -169,6 +169,8 @@ pub struct VmStats {
     pub audio_filter_execs: u64,
     pub audio_window_execs: u64,
     pub depformer_execs: u64,
+    pub call_execs: u64,
+    pub ret_execs: u64,
     pub start_ns: u64,
 }
 
@@ -1349,6 +1351,16 @@ impl Vm {
                 self.exec_depformer(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_CALL => {
+                self.exec_call(ctx_id, instr)?;
+                // CALL define PC diretamente — sem avanço automático
+                Ok(false)
+            }
+            OP_RET => {
+                self.exec_ret(ctx_id, instr)?;
+                // RET define PC diretamente — sem avanço automático
+                Ok(false)
+            }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
         }
     }
@@ -1869,6 +1881,7 @@ impl Vm {
         if let Some(child) = self.scheduler.get_mut(new_id) {
             child.regs = parent.regs;
             child.rng_state = parent.rng_state; // RFC-0005: herda stream RNG
+            child.call_stack = parent.call_stack.clone(); // RFC-0034: Unix (retorna pela cadeia)
             child.root_version = snap_version;
         }
         // Retorna ID do filho em rdest do pai
@@ -5664,6 +5677,43 @@ impl Vm {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // RFC-0034: sub-rotinas (0x7D/0x7E). Pilha por contexto; FORK clona,
+    // ABORT descarta com o contexto; fora de versionamento (código imutável).
+    // -----------------------------------------------------------------------
+
+    /// CALL LABEL — empilha pc+32 (a CALL é sempre 32B) e pula p/ alvo
+    /// (validado como JUMP). Teto `MAX_CALL_DEPTH`, alto em vez de estourar.
+    fn exec_call(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let target = instr.imm_u128();
+        self.check_jump_target(target)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if ctx.call_stack.len() >= crate::context::MAX_CALL_DEPTH {
+                return Err(anyhow!("CALL: pilha cheia ({} frames)", crate::context::MAX_CALL_DEPTH));
+            }
+            let ret = ctx.pc.wrapping_add(32);
+            ctx.call_stack.push(ret);
+            ctx.pc = target;
+        }
+        self.stats.call_execs += 1;
+        log_debug("call", &format!("ctx {} CALL -> {:032x}", ctx_id, target));
+        Ok(())
+    }
+
+    /// RET — desempilha retorno p/ pc. Pilha vazia veta alto (nunca cai
+    /// em bytes aleatórios).
+    fn exec_ret(&mut self, ctx_id: u64, _instr: &Instruction) -> Result<()> {
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            match ctx.call_stack.pop() {
+                Some(ret) => ctx.pc = ret,
+                None => return Err(anyhow!("RET sem CALL (pilha vazia)")),
+            }
+        }
+        self.stats.ret_execs += 1;
+        log_debug("ret", &format!("ctx {} RET", ctx_id));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -8681,6 +8731,99 @@ mod tests {
         vm.load_program(prog);
         let stats = vm.run().unwrap();
         assert_eq!((stats.kv_truncate_execs, stats.kv_compress_execs), (1, 1));
+    }
+
+    // ---- RFC-0034: sub-rotinas ------------------------------------------
+
+    #[test]
+    fn test_rfc0034_ret_underflow() {
+        use crate::opcodes::instr_ret;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(10), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // Pilha vazia: RET veta alto em vez de cair em bytes aleatórios.
+        assert!(vm.step_instruction(cid, &instr_ret()).is_err());
+        assert_eq!(vm.stats.ret_execs, 0);
+    }
+
+    #[test]
+    fn test_rfc0034_depth_overflow() {
+        use crate::opcodes::instr_call;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(5000), ..Default::default() });
+        let prog = crate::opcodes::assemble("HALT").unwrap();
+        vm.load_program(prog);
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // 1024 CALLs aninhados passam; o 1025º veta (teto exato).
+        for _ in 0..crate::context::MAX_CALL_DEPTH {
+            vm.step_instruction(cid, &instr_call(0x1000)).unwrap();
+        }
+        assert_eq!(vm.scheduler.get(cid).unwrap().call_stack.len(), crate::context::MAX_CALL_DEPTH);
+        assert!(vm.step_instruction(cid, &instr_call(0x1000)).is_err());
+        assert_eq!(vm.stats.call_execs, crate::context::MAX_CALL_DEPTH as u64);
+    }
+
+    #[test]
+    fn test_rfc0034_fork_inherits_stack() {
+        use crate::opcodes::{instr_abort, instr_call, instr_fork, FORK_FLAG_GREEN};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let prog = crate::opcodes::assemble("CALL SUB\nHALT\nSUB:\nRET").unwrap();
+        vm.load_program(prog);
+        let parent = rfc0004_ctx_with(&mut vm, &[]);
+        // Entra na sub-rotina: pilha do pai = [ret].
+        vm.step_instruction(parent, &instr_call(0x1000 + 64)).unwrap();
+        assert_eq!(vm.scheduler.get(parent).unwrap().call_stack.len(), 1);
+        // FORK clona a pilha (semântica Unix).
+        vm.step_instruction(parent, &instr_fork(0, FORK_FLAG_GREEN)).unwrap();
+        let child = rfc0005_reg_u64(&vm, parent, 0);
+        assert_eq!(vm.scheduler.get(child).unwrap().call_stack.len(), 1);
+        assert_eq!(
+            vm.scheduler.get(child).unwrap().call_stack,
+            vm.scheduler.get(parent).unwrap().call_stack
+        );
+        // ABORT mata o filho (pilha morre junto); pai intacto.
+        vm.scheduler.get_mut(parent).unwrap().set_reg(1, child as u128).unwrap();
+        vm.scheduler.get_mut(parent).unwrap().set_reg(2, 0).unwrap();
+        vm.step_instruction(parent, &instr_abort(1, 2)).unwrap();
+        assert!(vm.scheduler.get(child).is_none());
+        assert_eq!(vm.scheduler.get(parent).unwrap().call_stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0034_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            LOADI r0, 5
+            CALL LEVEL1
+            HALT
+        LEVEL1:
+            ADD_IMM r0, r0 IMM=1
+            CALL LEVEL2
+            RET
+        LEVEL2:
+            ADD_IMM r0, r0 IMM=10
+            RET
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.call_execs, stats.ret_execs), (2, 2));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 16);
+        assert!(ctx.call_stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rfc0034_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/call_ret_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.call_execs, stats.ret_execs), (2, 2));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 16);
+        assert!(ctx.call_stack.is_empty());
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

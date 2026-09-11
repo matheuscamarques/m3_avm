@@ -4,7 +4,7 @@
 Status:   Informational Draft (research prototype, not a standard)
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Version:  ISA v1.13 (104 opcodes: 0x00-0x49 + 0x60-0x69,0x6A-0x79,0x7A-0x7C + 0xFF implemented; cumulative since v1.12)
+Version:  ISA v1.14 (106 opcodes: 0x00-0x49 + 0x60-0x69,0x6A-0x79,0x7A-0x7E + 0xFF implemented; cumulative since v1.13)
 License:  AGPL-3.0-or-later (see LICENSE; Section 15)
 Replaces: all documents under docs/arq/ (archived, non-normative)
 ```
@@ -236,11 +236,12 @@ No operation (scheduler/IP bench target).
 
 ### 5.8 Free range
 
-`0x4A-0x79` and `0x7D-0xFE` are free. Allocated and IMPL nearby:
+`0x4A-0x79` and `0x7F-0xFE` are free. Allocated and IMPL nearby:
 `0x26-0x2F` (RFC-0023/0024, incl. `0x2E SLICE` from RFC-0019),
 `0x30-0x37` (RFC-0027), `0x38` (RFC-0010), `0x39-0x3B` (RFC-0029),
-`0x3C-0x43` (RFC-0028), `0x7A-0x7C` (RFC-0026). Allocation REQUIRES a
-proposal following the stateful-opcode rule (Section 19).
+`0x3C-0x43` (RFC-0028), `0x44` (RFC-0032), `0x7A-0x7C` (RFC-0026),
+`0x7D-0x7E` (RFC-0034). Allocation REQUIRES a proposal following the
+stateful-opcode rule (Section 19).
 
 ## 6. Memory Model
 
@@ -614,6 +615,7 @@ outruns the Status column above.
 | `0x39/0x3A/0x3B KV_COMPRESS/FLASH_ATTN/ATTN_SPARSE` (KV/attention) | IMPL | RFC-0029; sink+window values, tolerance-vs-ATTN goldens, fused top-k, demo `sparse_attn_demo` (exec verified); v1.11 |
 | `0x45-0x49 STREAM_MERGE/VAD_DETECT/AUDIO_RESAMPLE/AUDIO_FILTER/AUDIO_WINDOW` (audio DSP) | IMPL | RFC-0031; VAD/RMS/ZCR goldens, exact DSP vectors, demo `audio_dsp_demo` (exec verified); v1.12 |
 | `0x44 DEPFORMER` (depformer step) | IMPL | RFC-0032; all-ones golden, KV window/rollback, seeded sampling, Rust-level combined test (tables need `.data`/STORE — Fase 9); v1.13 |
+| `0x7D/0x7E CALL/RET` (subroutines) | IMPL | RFC-0034; nesting/underflow/overflow/FORK goldens, demo `call_ret_demo` (exec verified); v1.14 |
 | KV per-stream stores 0-16 (stream-aware cache) | IMPL | RFC-0033; isolation/geometry/rollback goldens, TRUNCATE/COMPRESS routing, DEPFORMER foresight proof; no bump (no opcode) |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
@@ -701,6 +703,8 @@ ation assumes non-Byzantine peers.
   `AUDIO_WINDOW`; `0x44 DEPFORMER` stays DRAFT — Fase 5 part 2).
 - `ISA v1.13` = v1.12 + depformer step `0x44` (RFC-0032; KV keyed by
   stream+layer from day one; 17 streams proper is RFC-0033).
+- `ISA v1.14` = v1.13 + call control `0x7D-0x7E` (RFC-0034: `CALL`,
+  `RET` + per-context stack; `0x7F` stays RESERVED).
 - Draft v2.0 proposal (reconciled, non-normative): `docs/ESPEC-V2.md`
   (DRAFT — do not code against it; reservations in Sections 12-13 of
   this document remain the only binding future encodings).

@@ -158,6 +158,9 @@ pub const QUANTIZE_Q8_0: u8 = 8;
 // RFC-0028: ativações (0x3C-0x43, v1.10; 0x39-0x3B na parte 3).
 // RFC-0032: passo depformer (0x44, v1.13; 17 streams na RFC-0033).
 pub const OP_DEPFORMER: u8 = 0x44; // proj+KV deslizante+attn+codes
+// RFC-0034: sub-rotinas (0x7D/0x7E, v1.14; 0x7F segue RSVD).
+pub const OP_CALL: u8 = 0x7D; // push retorno + jump p/ label
+pub const OP_RET: u8 = 0x7E; // pop retorno (pilha vazia veta)
 // RFC-0029: KV/attention (0x39/0x3A/0x3B, v1.11; fecha 0x30-0x43).
 // RFC-0031: DSP de áudio (0x45-0x49, v1.12; 0x44 na parte 2).
 pub const OP_STREAM_MERGE: u8 = 0x45; // mix com ganho explícito
@@ -584,6 +587,8 @@ impl Instruction {
             OP_LOG => "LOG",
             OP_CLIP => "CLIP",
             OP_DEPFORMER => "DEPFORMER",
+            OP_CALL => "CALL",
+            OP_RET => "RET",
             OP_KV_COMPRESS => "KV_COMPRESS",
             OP_FLASH_ATTN => "FLASH_ATTN",
             OP_ATTN_SPARSE => "ATTN_SPARSE",
@@ -2127,6 +2132,23 @@ pub fn instr_depformer(
     let mut instr = Instruction::new(OP_DEPFORMER, 0, rdest, r_x, r_w, 0xFF);
     instr.set_depformer_params(stream, layer, ncb, nheads, levels, context, temp, topk);
     instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0034: CALL (0x7D) / RET (0x7E). Alvo em imm_u128 (label resolvido);
+// RET sem operandos.
+// ---------------------------------------------------------------------------
+
+/// CALL LABEL — alvo PC imediato (validado no exec como JUMP).
+pub fn instr_call(target_pc: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_CALL, 0, 0xFF, 0xFF, 0xFF, 0xFF);
+    instr.set_imm_u128(target_pc);
+    instr
+}
+
+/// RET — sem operandos.
+pub fn instr_ret() -> Instruction {
+    Instruction::new(OP_RET, 0, 0xFF, 0xFF, 0xFF, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -4367,6 +4389,26 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_depformer(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, stream, layer, ncb, nheads, levels, context, temp, topk))
         }
+        "CALL" => {
+            // CALL LABEL (espelha JUMP: rótulo resolvido, resto veta).
+            if parts.len() < 2 {
+                return Err(anyhow!("CALL precisa de rótulo alvo — ex: CALL ADD_TWO"));
+            }
+            let label = parts[1].to_ascii_uppercase();
+            let target_pc = *labels.get(&label)
+                .ok_or_else(|| anyhow!("rótulo '{}' não encontrado para CALL", label))?;
+            if parts.len() > 2 {
+                reject_unknown("CALL", &parts[2..], &[])?;
+            }
+            Ok(instr_call(target_pc))
+        }
+        "RET" => {
+            // RET (sem operandos; resto veta).
+            if !parts[1..].is_empty() {
+                reject_unknown("RET", &parts[1..], &[])?;
+            }
+            Ok(instr_ret())
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -6050,6 +6092,31 @@ mod tests {
         assert!(assemble("DEPFORMER r9, r0").is_err());
         assert!(assemble("DEPFORMER r9, r0, r1 FOO=1").is_err());
         assert!(assemble("DEPFORMER r9, r0, r1 NCB=abc").is_err());
+    }
+
+    // ---- RFC-0034: sub-rotinas ------------------------------------------------
+
+    #[test]
+    fn test_rfc0034_ctor_roundtrip() {
+        let c = instr_call(0x1040);
+        assert_eq!(c.opcode, OP_CALL);
+        assert_eq!(c.imm_u128(), 0x1040);
+        let d = Instruction::decode(&c.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "CALL");
+        assert_eq!(d.imm_u128(), 0x1040);
+        let r = instr_ret();
+        assert_eq!(r.opcode, OP_RET);
+        let d = Instruction::decode(&r.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "RET");
+        // Assembler: rótulos resolvidos + rejeições estritas.
+        let prog = assemble("JUMP DONE\nDONE:\nCALL DONE\nRET\nHALT").unwrap();
+        assert_eq!(prog[1].opcode, OP_CALL);
+        assert_eq!(prog[1].imm_u128(), 0x1000 + 32); // DONE: = índice 1
+        assert_eq!(prog[2].opcode, OP_RET);
+        assert!(assemble("CALL").is_err());
+        assert!(assemble("CALL NOPE").is_err());
+        assert!(assemble("CALL DONE EXTRA").is_err());
+        assert!(assemble("RET r0").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

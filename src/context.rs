@@ -87,6 +87,10 @@ pub const PIPE_MAMBA_CTX: PipelineId = 0;
 pub const PIPE_TRANSFORMER_CTX: PipelineId = 1;
 pub const PIPE_AUDIO_CTX: PipelineId = 2;
 
+/// Teto da pilha de chamadas (RFC-0034): 1024 frames × 16 B.
+/// Estouro e underflow vetam alto; sem enrolação silenciosa.
+pub const MAX_CALL_DEPTH: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct Context {
     pub id: u64,
@@ -95,6 +99,10 @@ pub struct Context {
     pub root_version: u64,
     pub priority: Priority,
     pub state: ContextState,
+    /// Pilha de chamadas (CALL push pc+32, RET pop; RFC-0034). FORK
+    /// clona (semântica Unix); ABORT descarta com o contexto; fora de
+    /// versionamento (endereços nomeiam código imutável).
+    pub call_stack: Vec<u128>,
     /// Timestamp de criação (para TEMPORAL indexing / debug)
     pub created_at_ns: u64,
     /// Flag de igualdade para controle de fluxo (COMPARE / IF_EQUAL)
@@ -121,6 +129,7 @@ impl Context {
             root_version,
             priority,
             state: ContextState::Ready,
+            call_stack: Vec::new(),
             created_at_ns: crate::utils::now_ns(),
             cmp_equal: false,
             interrupt_flag: false,

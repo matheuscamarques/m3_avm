@@ -6,7 +6,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use m3_avm::{
     context::Priority,
-    opcodes::{instr_add_imm, instr_steps, instr_sub_imm},
+    opcodes::{instr_add_imm, instr_halt, instr_steps, instr_sub_imm},
     vm::{Vm, VmConfig},
 };
 use std::time::Duration;
@@ -17,6 +17,8 @@ fn ready_vm() -> (Vm, u64) {
     let root = vm.memory.current_version();
     let cid = vm.scheduler.create_context(Priority::Green, 0x1000, root);
     vm.scheduler.get_mut(cid).unwrap().set_reg(0, 100).unwrap();
+    // Programa mínimo p/ CALL validar alvo (RFC-0034).
+    vm.load_program(vec![instr_halt()]);
     (vm, cid)
 }
 
@@ -40,6 +42,15 @@ fn bench_alu(c: &mut Criterion) {
     g.bench_function("steps", |ben| {
         ben.iter(|| {
             vm.step_instruction(cid, &stp).unwrap();
+        })
+    });
+    // Par CALL+RET (empilha e desempilha; pilha nunca cresce aqui).
+    let call = m3_avm::opcodes::instr_call(0x1000);
+    let ret = m3_avm::opcodes::instr_ret();
+    g.bench_function("call_ret", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &call).unwrap();
+            vm.step_instruction(cid, &ret).unwrap();
         })
     });
     g.finish();
