@@ -121,6 +121,46 @@ fn bench_reshape_concat(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_cast(c: &mut Criterion) {
+    let mut g = c.benchmark_group("cast");
+    g.measurement_time(Duration::from_secs(2));
+    // CAST F32 -> F16, 1024 elems (4 KiB -> 2 KiB).
+    let (mut vm, cid) = ready_vm();
+    let a = f32_tensor(&mut vm, 1024);
+    vm.scheduler.get_mut(cid).unwrap().set_reg(0, a).unwrap();
+    let cp = m3_avm::opcodes::instr_cast(1, 0, 1);
+    g.bench_function("cast_f32_f16_1K", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &cp).unwrap();
+        })
+    });
+    g.finish();
+}
+
+fn bench_quant(c: &mut Criterion) {
+    let mut g = c.benchmark_group("quant");
+    g.measurement_time(Duration::from_secs(2));
+    // QUANTIZE Q8_0 + DEQUANT de 1024 elems (32 blocos).
+    let (mut vm, cid) = ready_vm();
+    let a = f32_tensor(&mut vm, 1024);
+    vm.scheduler.get_mut(cid).unwrap().set_reg(0, a).unwrap();
+    let q = m3_avm::opcodes::instr_quantize(1, 0, 8);
+    let dq = m3_avm::opcodes::instr_dequant(2, 1);
+    g.bench_function("quantize_q8_0_1K", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &q).unwrap();
+        })
+    });
+    // DEQUANT lê o último bloco quantizado (r1 reescrito a cada iter).
+    g.bench_function("dequant_q8_0_1K", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &q).unwrap();
+            vm.step_instruction(cid, &dq).unwrap();
+        })
+    });
+    g.finish();
+}
+
 criterion_group!(
     memory,
     bench_memcpy_4k,
@@ -128,5 +168,7 @@ criterion_group!(
     bench_arena,
     bench_snapshot_restore,
     bench_reshape_concat,
+    bench_cast,
+    bench_quant,
 );
 criterion_main!(memory);

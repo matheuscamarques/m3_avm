@@ -1,0 +1,10 @@
+; programs/cast_quant_demo.m3asm — RFC-0025: bloco de conversão.
+; CAST F32->F16->F32 (exato) + QUANTIZE Q8_0 -> DEQUANT (bound d/2).
+; Contadores verificados em test_rfc0025_demo_runs: cast=2, quantize=1,
+; dequant=1.
+TENSOR r0 8 4 f32 FILL=0.5
+CAST r1, r0 DST=F16
+CAST r2, r1 DST=F32
+QUANTIZE r3, r0 Q=Q8_0
+DEQUANT r4, r3
+HALT

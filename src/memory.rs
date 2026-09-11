@@ -110,6 +110,10 @@ pub enum DType {
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
+    /// Brain float (RFC-0025). Discriminante 64: fora de todas as
+    /// numerações em jogo (DType ≤ 15, GGML ≤ ~40) — `from_u8/from_u32`
+    /// existentes não mudam para nenhum valor anterior.
+    BF16 = 64,
 }
 
 impl DType {
@@ -126,6 +130,7 @@ impl DType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             15 => Self::Q8_K,
+            64 => Self::BF16,
             _ => Self::F32,
         }
     }
@@ -134,6 +139,7 @@ impl DType {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
+            Self::BF16 => 2,
             Self::I8 => 1,
             Self::U8 => 1,
             Self::Q4_0 => 18, // 32 *0.5 +16 (não usado direto)
@@ -457,6 +463,24 @@ impl MemoryManager {
     }
 
     /// Variante que registra metadados de tensor (shape + dtype).
+    /// Aloca tensor com `byte_len` explícito (layouts em bloco, onde
+    /// `numel * byte_width()` mente: Q4_0/Q8_0/etc.). NÃO consulta o
+    /// mapeamento GGUF de propósito: saída nova nunca pode ser alias de
+    /// pesos (escrever ali corromperia o modelo). RFC-0025.
+    pub fn alloc_tensor_bytes(&mut self, shape: &[usize], dtype: DType, byte_len: usize) -> Result<u128> {
+        let addr = self.alloc_global(byte_len)?;
+        let meta = TensorMeta {
+            addr,
+            shape: shape.to_vec(),
+            dtype,
+            byte_len,
+            is_sparse: false,
+            density: 1.0,
+        };
+        self.tensor_meta.insert(addr, meta);
+        Ok(addr)
+    }
+
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> Result<u128> {
         // Tenta zero-copy do GGUF f32 antes de alocar dummy
         if let Some(addr) = self.try_gguf_tensor(shape, dtype) {

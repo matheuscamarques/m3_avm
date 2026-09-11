@@ -34,6 +34,8 @@ use crate::opcodes::{
     OP_REMOTE_SPAWN, OP_SIGNAL, OP_SEND_TENSOR, OP_BARRIER, OP_SLICE,
     OP_ARENA_ALLOC, OP_ARENA_RESET, OP_MEMCPY, OP_MEMSET, MEMCPY_DIR_HOST,
     OP_SNAPSHOT, OP_RESTORE, OP_PREFETCH, OP_RESHAPE, OP_CONCAT, SNAP_MASK_ALL,
+    OP_CAST, OP_QUANTIZE, OP_DEQUANT, CAST_DST_F32, CAST_DST_F16, CAST_DST_BF16,
+    CAST_DST_I8, CAST_DST_U8, QUANTIZE_Q4_0, QUANTIZE_Q8_0,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -125,6 +127,9 @@ pub struct VmStats {
     pub prefetch_execs: u64,
     pub reshape_execs: u64,
     pub concat_execs: u64,
+    pub cast_execs: u64,
+    pub quantize_execs: u64,
+    pub dequant_execs: u64,
     pub start_ns: u64,
 }
 
@@ -212,6 +217,15 @@ impl MemBackend {
         match self {
             MemBackend::Cpu(m) => m.write(addr, data),
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.write(addr, data),
+        }
+    }
+    /// Alocação com byte_len explícito (layouts em bloco, RFC-0025).
+    /// GPU veta explícito (sem meta em blocos lá).
+    pub fn alloc_tensor_bytes(&mut self, shape: &[usize], dtype: crate::memory::DType, byte_len: usize) -> anyhow::Result<u128> {
+        match self {
+            MemBackend::Cpu(m) => m.alloc_tensor_bytes(shape, dtype, byte_len),
+            #[cfg(feature = "wgpu")]
+            MemBackend::Gpu(_) => Err(anyhow::anyhow!("alloc em blocos no backend GPU (RFC futura)")),
         }
     }
     pub fn write_f32_tensor(&mut self, addr: u128, data: &[f32]) -> anyhow::Result<()> {
@@ -1118,6 +1132,18 @@ impl Vm {
             }
             OP_CONCAT => {
                 self.exec_concat(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CAST => {
+                self.exec_cast(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_QUANTIZE => {
+                self.exec_quantize(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_DEQUANT => {
+                self.exec_dequant(ctx_id, instr)?;
                 Ok(true)
             }
             OP_FOREST => {
@@ -3980,6 +4006,216 @@ impl Vm {
         Ok(())
     }
 
+    /// CAST rD, rT DST=... — conversão de valor para tensor NOVO (src
+    /// intacto). Enforcement da Precision Rule (§11) no path 32B: par
+    /// explícito ou trap — nunca fallback silencioso. Identidade veta
+    /// (no-op é bug do chamador; use MOV).
+    fn exec_cast(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("CAST precisa de rdest e rTensor com endereços"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let dst_code = instr.cast_dst();
+        let dst_dtype = match dst_code {
+            CAST_DST_F32 => DType::F32,
+            CAST_DST_F16 => DType::F16,
+            CAST_DST_BF16 => DType::BF16,
+            CAST_DST_I8 => DType::I8,
+            CAST_DST_U8 => DType::U8,
+            _ => return Err(anyhow!("CAST: DST={} sem precisão suportada (use F32/F16/BF16/I8/U8)", dst_code)),
+        };
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("CAST: 0x{:x} não é tensor", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("CAST: esparso não suportado (denso nesta RFC)"));
+        }
+        let src_dtype = meta.dtype;
+        let plain = |d: DType| matches!(d, DType::F32 | DType::F16 | DType::BF16 | DType::I8 | DType::U8);
+        if !plain(src_dtype) {
+            return Err(anyhow!("CAST: fonte {:?} quantizada (use DEQUANT)", src_dtype));
+        }
+        if src_dtype == dst_dtype {
+            return Err(anyhow!("CAST: identidade {:?}->mesmo (no-op; use MOV)", src_dtype));
+        }
+        if !(src_dtype == DType::F32 || dst_dtype == DType::F32) {
+            return Err(anyhow!("CAST: só pares com F32 (transitivo via F32; direto é RFC futura)"));
+        }
+        let numel: usize = meta.shape.iter().product();
+        if numel == 0 {
+            return Err(anyhow!("CAST: tensor vazio"));
+        }
+        if meta.byte_len != numel.saturating_mul(src_dtype.byte_width()) {
+            return Err(anyhow!("CAST: layout não-plano na fonte"));
+        }
+        let data = self.memory.read(t_addr, meta.byte_len)?;
+        // Decodifica tudo para f32 (ponto comum honesto), depois codifica.
+        let f32s: Vec<f32> = match src_dtype {
+            DType::F32 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            DType::F16 => data.chunks_exact(2).map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect(),
+            DType::BF16 => data.chunks_exact(2).map(|c| crate::quant::bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+            DType::I8 => data.iter().map(|&b| (b as i8) as f32).collect(),
+            DType::U8 => data.iter().map(|&b| b as f32).collect(),
+            _ => return Err(anyhow!("CAST: fonte {:?} inalcançável", src_dtype)),
+        };
+        if f32s.len() != numel {
+            return Err(anyhow!("CAST: bytes {} != numel {} (layout inconsistente)", data.len(), numel));
+        }
+        let out_bytes: Vec<u8> = match dst_dtype {
+            DType::F32 => f32s.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            DType::F16 => f32s.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect(),
+            DType::BF16 => f32s.iter().flat_map(|v| crate::quant::f32_to_bf16_bits(*v).to_le_bytes()).collect(),
+            DType::I8 => f32s.iter().map(|v| v.round().clamp(-128.0, 127.0) as i8 as u8).collect(),
+            DType::U8 => f32s.iter().map(|v| v.round().clamp(0.0, 255.0) as u8).collect(),
+            _ => return Err(anyhow!("CAST: destino {:?} inalcançável", dst_dtype)),
+        };
+        let out_addr = self.memory.alloc_tensor(&meta.shape, dst_dtype)?;
+        if crate::memory::region_of(out_addr) == crate::memory::Region::Persistent {
+            return Err(anyhow!("CAST: saída colidiu com PERSISTENTE (alias de pesos; recuse alto)"));
+        }
+        self.memory.write(out_addr, &out_bytes)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.cast_execs += 1;
+        log_debug("cast", &format!("ctx {} CAST 0x{:x} {:?} -> {:?} 0x{:x}", ctx_id, t_addr, src_dtype, dst_dtype, out_addr));
+        Ok(())
+    }
+
+    /// QUANTIZE rD, rT Q=... — F32 denso -> blocos Q4_0/Q8_0 em tensor
+    /// NOVO (shape lógica preservada). Entrada não-finita, numel fora de
+    /// múltiplo de 32, ou tipo sem encoder => Err alto. Bound: |err| <=
+    /// d/2 com o d armazenado (ver quant.rs).
+    fn exec_quantize(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("QUANTIZE precisa de rdest e rTensor com endereços"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let q = instr.quantize_type();
+        let (blk_elems, blk_bytes) = crate::quant::quant_block_info(q as u32)
+            .ok_or_else(|| anyhow!("QUANTIZE: tipo {} sem encoder (só Q4_0/Q8_0; Q4_K/Q6_K são RFC futura)", q))?;
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("QUANTIZE: 0x{:x} não é tensor", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("QUANTIZE: esparso não suportado (denso nesta RFC)"));
+        }
+        if meta.dtype != DType::F32 {
+            return Err(anyhow!("QUANTIZE: fonte {:?} precisa ser F32 denso", meta.dtype));
+        }
+        let numel: usize = meta.shape.iter().product();
+        if numel == 0 || numel % blk_elems != 0 {
+            return Err(anyhow!("QUANTIZE: numel {} fora de múltiplo de bloco {}", numel, blk_elems));
+        }
+        if meta.byte_len != numel.saturating_mul(4) {
+            return Err(anyhow!("QUANTIZE: layout não-plano na fonte"));
+        }
+        let data = self.memory.read(t_addr, meta.byte_len)?;
+        let f32s: Vec<f32> = data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        if f32s.iter().any(|v| !v.is_finite()) {
+            return Err(anyhow!("QUANTIZE: entrada não-finita (bound mentiria; sanitize antes)"));
+        }
+        let nblocks = numel / blk_elems;
+        let mut out = vec![0u8; nblocks * blk_bytes];
+        for b in 0..nblocks {
+            let ok = if q == QUANTIZE_Q4_0 {
+                crate::quant::quantize_q4_0(&f32s[b * blk_elems..(b + 1) * blk_elems], &mut out[b * blk_bytes..(b + 1) * blk_bytes])
+            } else {
+                crate::quant::quantize_q8_0(&f32s[b * blk_elems..(b + 1) * blk_elems], &mut out[b * blk_bytes..(b + 1) * blk_bytes])
+            };
+            if !ok {
+                return Err(anyhow!("QUANTIZE: bloco {} rejeitado (interno; já validado acima)", b));
+            }
+        }
+        let dtype = if q == QUANTIZE_Q4_0 { DType::Q4_0 } else { DType::Q8_0 };
+        // Alocação com bytes exatos do layout em blocos (nunca via
+        // alloc_tensor: numel*width mente p/ bloqueado; nunca via GGUF:
+        // saída nova não pode ser alias de pesos).
+        let out_addr = self.memory.alloc_tensor_bytes(&meta.shape, dtype, nblocks * blk_bytes)?;
+        if crate::memory::region_of(out_addr) == crate::memory::Region::Persistent {
+            return Err(anyhow!("QUANTIZE: saída colidiu com PERSISTENTE (alias de pesos; recuse alto)"));
+        }
+        self.memory.write(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.quantize_execs += 1;
+        log_debug("quantize", &format!("ctx {} QUANTIZE 0x{:x} -> {:?} 0x{:x} ({} blocos)", ctx_id, t_addr, dtype, out_addr, nblocks));
+        Ok(())
+    }
+
+    /// DEQUANT rD, rT — blocos -> F32 em tensor NOVO (mesmo shape).
+    /// Tipos servidos pelo dispatcher existente (F32/F16/Q4_0/Q4_K/Q6_K/
+    /// Q8_0); resto => Err. byte_len deve casar com os blocos.
+    fn exec_dequant(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("DEQUANT precisa de rdest e rTensor com endereços"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("DEQUANT: 0x{:x} não é tensor", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("DEQUANT: esparso não suportado (denso nesta RFC)"));
+        }
+        let (blk_elems, blk_bytes) = match meta.dtype {
+            DType::F32 => (1usize, 4usize),
+            DType::F16 => (1usize, 2usize),
+            DType::Q4_0 => (32usize, 18usize),
+            DType::Q8_0 => (32usize, 34usize),
+            DType::Q4_K | DType::Q5_K => (256usize, 144usize),
+            DType::Q6_K => (256usize, 210usize),
+            _ => return Err(anyhow!("DEQUANT: {:?} sem decoder (dispatcher cobre F32/F16/Q4_0/Q4_K/Q6_K/Q8_0)", meta.dtype)),
+        };
+        let numel: usize = meta.shape.iter().product();
+        if numel == 0 || numel % blk_elems != 0 {
+            return Err(anyhow!("DEQUANT: numel {} fora de múltiplo de bloco {}", numel, blk_elems));
+        }
+        if meta.byte_len != (numel / blk_elems).saturating_mul(blk_bytes) {
+            return Err(anyhow!("DEQUANT: byte_len {} inconsistente com blocos (esperado {})", meta.byte_len, (numel / blk_elems).saturating_mul(blk_bytes)));
+        }
+        let data = self.memory.read(t_addr, meta.byte_len)?;
+        let mut out = vec![0.0f32; numel];
+        // Números do dispatcher (GGML-ish), NÃO discriminantes DType
+        // (Q4_0 é 2 lá, 4 aqui) — mapeamento explícito, sem `as u32`.
+        let disp_dtype: u32 = match meta.dtype {
+            DType::F32 => 0,
+            DType::F16 => 1,
+            DType::Q4_0 => 2,
+            DType::Q8_0 => 8,
+            DType::Q4_K => 12,
+            DType::Q5_K => 13,
+            DType::Q6_K => 14,
+            _ => return Err(anyhow!("DEQUANT: {:?} sem número no dispatcher", meta.dtype)),
+        };
+        if !crate::quant::dequantize(&data, disp_dtype, &mut out, numel) {
+            return Err(anyhow!("DEQUANT: dispatcher rejeitou (interno; já validado acima)"));
+        }
+        let out_addr = self.memory.alloc_tensor(&meta.shape, DType::F32)?;
+        if crate::memory::region_of(out_addr) == crate::memory::Region::Persistent {
+            return Err(anyhow!("DEQUANT: saída colidiu com PERSISTENTE (alias de pesos; recuse alto)"));
+        }
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.dequant_execs += 1;
+        log_debug("dequant", &format!("ctx {} DEQUANT 0x{:x} {:?} -> F32 0x{:x}", ctx_id, t_addr, meta.dtype, out_addr));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -5690,6 +5926,175 @@ mod tests {
         vm.load_program(prog);
         let stats = vm.run().unwrap();
         assert_eq!((stats.snapshot_execs, stats.restore_execs, stats.prefetch_execs, stats.reshape_execs, stats.concat_execs), (1, 1, 1, 1, 1));
+    }
+
+    // ---- RFC-0025: conversão ----------------------------------------
+
+    #[test]
+    fn test_rfc0025_cast_pairs() {
+        use crate::opcodes::{instr_cast, CAST_DST_F16, CAST_DST_BF16, CAST_DST_I8, CAST_DST_U8};
+        use crate::memory::DType;
+        assert_eq!(DType::from_u8(64), DType::BF16);
+        assert_eq!(DType::BF16.byte_width(), 2);
+        assert!(!DType::BF16.is_quantized());
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[4], &[1.0, -2.5, 0.5, 100.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0)]);
+        // F16 ida e volta exata (valores representáveis em meia precisão).
+        vm.step_instruction(cid, &instr_cast(1, 0, CAST_DST_F16)).unwrap();
+        let m1 = vm.memory.get_tensor_meta(rfc0005_reg_u64(&vm, cid, 1) as u128).unwrap().clone();
+        assert_eq!((m1.dtype, m1.byte_len), (DType::F16, 8));
+        vm.step_instruction(cid, &instr_cast(2, 1, crate::opcodes::CAST_DST_F32)).unwrap();
+        let b = rfc0005_reg_u64(&vm, cid, 2) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(b, 4).unwrap(), vec![1.0, -2.5, 0.5, 100.0]);
+        // BF16 ida e volta exata (8 bits de mantissa cobrem estes valores).
+        vm.step_instruction(cid, &instr_cast(3, 0, CAST_DST_BF16)).unwrap();
+        let m3 = vm.memory.get_tensor_meta(rfc0005_reg_u64(&vm, cid, 3) as u128).unwrap().clone();
+        assert_eq!((m3.dtype, m3.byte_len), (DType::BF16, 8));
+        vm.step_instruction(cid, &instr_cast(4, 3, crate::opcodes::CAST_DST_F32)).unwrap();
+        let b4 = rfc0005_reg_u64(&vm, cid, 4) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(b4, 4).unwrap(), vec![1.0, -2.5, 0.5, 100.0]);
+        // INT8 com saturação documentada: [1,-3,1,100].
+        vm.step_instruction(cid, &instr_cast(5, 0, CAST_DST_I8)).unwrap();
+        vm.step_instruction(cid, &instr_cast(6, 5, crate::opcodes::CAST_DST_F32)).unwrap();
+        let b6 = rfc0005_reg_u64(&vm, cid, 6) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(b6, 4).unwrap(), vec![1.0, -3.0, 1.0, 100.0]);
+        // U8 com clamp: [1,0,1,100].
+        vm.step_instruction(cid, &instr_cast(7, 0, CAST_DST_U8)).unwrap();
+        vm.step_instruction(cid, &instr_cast(8, 7, crate::opcodes::CAST_DST_F32)).unwrap();
+        let b8 = rfc0005_reg_u64(&vm, cid, 8) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(b8, 4).unwrap(), vec![1.0, 0.0, 1.0, 100.0]);
+        // Erros: identidade, código ruim, fonte quantizada, meta ausente, rdest 0xFF.
+        assert!(vm.step_instruction(cid, &instr_cast(1, 0, crate::opcodes::CAST_DST_F32)).is_err());
+        let mut bad_code = instr_cast(1, 0, CAST_DST_F16);
+        bad_code.set_cast_dst(9);
+        assert!(vm.step_instruction(cid, &bad_code).is_err());
+        let aq = vm.memory.alloc_tensor(&[32], DType::F32).unwrap();
+        vm.memory.as_cpu_mut().unwrap().tensor_meta.insert(aq, crate::memory::TensorMeta {
+            addr: aq, shape: vec![32], dtype: DType::Q4_0, byte_len: 18, is_sparse: false, density: 1.0,
+        });
+        vm.scheduler.get_mut(cid).unwrap().set_reg(9, aq).unwrap();
+        assert!(vm.step_instruction(cid, &instr_cast(1, 9, CAST_DST_F32)).is_err());
+        vm.scheduler.get_mut(cid).unwrap().set_reg(9, 0xdead).unwrap();
+        assert!(vm.step_instruction(cid, &instr_cast(1, 9, CAST_DST_F32)).is_err());
+        assert!(vm.step_instruction(cid, &instr_cast(0xFF, 0, CAST_DST_F16)).is_err());
+        assert_eq!(vm.stats.cast_execs, 8);
+    }
+
+    #[test]
+    fn test_rfc0025_quantize_dequant() {
+        use crate::opcodes::{instr_dequant, instr_quantize, QUANTIZE_Q4_0, QUANTIZE_Q8_0};
+        use crate::memory::DType;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let ramp: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.5).collect();
+        let ar = rfc0004_f32(&mut vm, &[32], &ramp);
+        let ao = rfc0004_f32(&mut vm, &[32], &[1.0; 32]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, ar), (1, ao)]);
+        // Q4_0 golden: bloco de ones => d=f16(1/7), quants 0xFF.
+        vm.step_instruction(cid, &instr_quantize(2, 1, QUANTIZE_Q4_0)).unwrap();
+        let q4 = rfc0005_reg_u64(&vm, cid, 2) as u128;
+        let mq = vm.memory.get_tensor_meta(q4).unwrap().clone();
+        assert_eq!((mq.dtype, mq.byte_len), (DType::Q4_0, 18));
+        let raw = vm.memory.read(q4, 18).unwrap();
+        let d_exp = half::f16::from_f32(1.0 / 7.0).to_bits().to_le_bytes();
+        assert_eq!(&raw[0..2], &d_exp);
+        assert!(raw[2..].iter().all(|&b| b == 0xFF));
+        // Q4_0 roundtrip na rampa com bound do d armazenado.
+        vm.step_instruction(cid, &instr_quantize(3, 0, QUANTIZE_Q4_0)).unwrap();
+        let q4r = rfc0005_reg_u64(&vm, cid, 3) as u128;
+        vm.step_instruction(cid, &instr_dequant(4, 3)).unwrap();
+        let back = rfc0005_reg_u64(&vm, cid, 4) as u128;
+        let got = vm.memory.read_f32_tensor(back, 32).unwrap();
+        let draw = vm.memory.read(q4r, 18).unwrap();
+        let d = half::f16::from_bits(u16::from_le_bytes([draw[0], draw[1]])).to_f32();
+        for (x, y) in ramp.iter().zip(got.iter()) {
+            assert!((x - y).abs() <= d / 2.0 + 1e-4, "x={} y={} d={}", x, y, d);
+        }
+        // Q8_0 ida e volta.
+        vm.step_instruction(cid, &instr_quantize(5, 1, QUANTIZE_Q8_0)).unwrap();
+        let q8 = rfc0005_reg_u64(&vm, cid, 5) as u128;
+        let mq8 = vm.memory.get_tensor_meta(q8).unwrap().clone();
+        assert_eq!((mq8.dtype, mq8.byte_len), (DType::Q8_0, 34));
+        vm.step_instruction(cid, &instr_dequant(6, 5)).unwrap();
+        let back8 = rfc0005_reg_u64(&vm, cid, 6) as u128;
+        let got8 = vm.memory.read_f32_tensor(back8, 32).unwrap();
+        let draw8 = vm.memory.read(q8, 34).unwrap();
+        let d8 = half::f16::from_bits(u16::from_le_bytes([draw8[0], draw8[1]])).to_f32();
+        for y in got8 {
+            assert!((y - 1.0).abs() <= d8 / 2.0 + 1e-6, "y={} d={}", y, d8);
+        }
+        // Erros: fora de múltiplo de 32, não-finito, fonte não-F32,
+        // tipo sem encoder, esparso, meta ausente.
+        let a30 = rfc0004_f32(&mut vm, &[30], &[1.0; 30]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, a30).unwrap();
+        assert!(vm.step_instruction(cid, &instr_quantize(8, 7, QUANTIZE_Q4_0)).is_err());
+        let ai = rfc0004_f32(&mut vm, &[32], &[1.0; 32]);
+        let mut inf = vm.memory.read_f32_tensor(ai, 32).unwrap();
+        inf[0] = f32::INFINITY;
+        vm.memory.write_f32_tensor(ai, &inf).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, ai).unwrap();
+        assert!(vm.step_instruction(cid, &instr_quantize(8, 7, QUANTIZE_Q4_0)).is_err());
+        let af = vm.memory.alloc_tensor(&[32], DType::F16).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, af).unwrap();
+        assert!(vm.step_instruction(cid, &instr_quantize(8, 7, QUANTIZE_Q4_0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_quantize(8, 0, 12)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[4, 8], DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_quantize(8, 7, QUANTIZE_Q4_0)).is_err());
+        // DEQUANT: tipo sem decoder (Q4_1) e byte_len inconsistente.
+        let aq1 = vm.memory.alloc_tensor(&[32], DType::F32).unwrap();
+        vm.memory.as_cpu_mut().unwrap().tensor_meta.insert(aq1, crate::memory::TensorMeta {
+            addr: aq1, shape: vec![32], dtype: DType::Q4_1, byte_len: 18, is_sparse: false, density: 1.0,
+        });
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, aq1).unwrap();
+        assert!(vm.step_instruction(cid, &instr_dequant(8, 7)).is_err());
+        let aq2 = vm.memory.alloc_tensor(&[32], DType::F32).unwrap();
+        vm.memory.as_cpu_mut().unwrap().tensor_meta.insert(aq2, crate::memory::TensorMeta {
+            addr: aq2, shape: vec![32], dtype: DType::Q4_0, byte_len: 20, is_sparse: false, density: 1.0,
+        });
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, aq2).unwrap();
+        assert!(vm.step_instruction(cid, &instr_dequant(8, 7)).is_err());
+        assert_eq!(vm.stats.quantize_execs, 3);
+        assert_eq!(vm.stats.dequant_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0025_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // Pipeline combinado: CAST ida/volta + QUANTIZE + DEQUANT.
+        let src = r#"
+            TENSOR r0 8 4 f32 FILL=0.5
+            CAST r1, r0 DST=F16
+            CAST r2, r1 DST=F32
+            QUANTIZE r3, r0 Q=Q8_0
+            DEQUANT r4, r3
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.cast_execs, 2);
+        assert_eq!(stats.quantize_execs, 1);
+        assert_eq!(stats.dequant_execs, 1);
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let a2 = ctx.reg(2).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a2, 32).unwrap(), vec![0.5; 32]);
+        let a4 = ctx.reg(4).unwrap();
+        for v in vm.memory.read_f32_tensor(a4, 32).unwrap() {
+            assert!((v - 0.5).abs() < 0.01, "v={}", v);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rfc0025_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/cast_quant_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.cast_execs, stats.quantize_execs, stats.dequant_execs), (2, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

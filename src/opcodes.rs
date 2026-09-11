@@ -134,6 +134,22 @@ pub const OP_MEMSET: u8 = 0x2B; // fill de padrão byte
 pub const MEMCPY_DIR_HOST: u8 = 0;
 pub const MEMCPY_DIR_GPU: u8 = 1;
 pub const MEMCPY_DIR_NIC: u8 = 2;
+// RFC-0025: bloco de conversão (0x67/0x68/0x69, v1.7).
+pub const OP_CAST: u8 = 0x67; // conversão de valor FP32<->F16/BF16/I8/U8
+pub const OP_QUANTIZE: u8 = 0x68; // F32 -> blocos Q4_0/Q8_0
+pub const OP_DEQUANT: u8 = 0x69; // blocos -> F32 (dispatcher existente)
+// Destinos — CAST (payload[0]): códigos locais do op (não confundir com
+// discriminantes DType; o mapeamento é explícito no exec).
+pub const CAST_DST_F32: u8 = 0;
+pub const CAST_DST_F16: u8 = 1;
+pub const CAST_DST_BF16: u8 = 2;
+pub const CAST_DST_I8: u8 = 3;
+pub const CAST_DST_U8: u8 = 4;
+// Tipos — QUANTIZE (payload[0]): discriminante DType (4=Q4_0, 8=Q8_0).
+// Só o par simétrico com encoder+decoder parseia (Q4_K/Q6_K vetam no
+// assembler — sem soletrar o inexecutável).
+pub const QUANTIZE_Q4_0: u8 = 4;
+pub const QUANTIZE_Q8_0: u8 = 8;
 // RFC-0024: views & versions (0x28/0x29/0x2C/0x2D/0x2F; fecha 0x26-0x2F, v1.6).
 pub const OP_SNAPSHOT: u8 = 0x28; // snapshot nomeado -> version handle
 pub const OP_RESTORE: u8 = 0x29; // rewind p/ version (memória + mapas)
@@ -488,6 +504,9 @@ impl Instruction {
             OP_PREFETCH => "PREFETCH",
             OP_RESHAPE => "RESHAPE",
             OP_CONCAT => "CONCAT",
+            OP_CAST => "CAST",
+            OP_QUANTIZE => "QUANTIZE",
+            OP_DEQUANT => "DEQUANT",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -1639,6 +1658,51 @@ pub fn instr_concat(rdest: u8, r_a: u8, r_b: u8, axis: u8) -> Instruction {
     let mut instr = Instruction::new(OP_CONCAT, 0, rdest, r_a, r_b, 0xFF);
     instr.set_concat_axis(axis);
     instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0025: CAST (0x67) / QUANTIZE (0x68) / DEQUANT (0x69). Layouts nos
+// 26B congelados (ver RFC). Regra de precisão (§11) no path 32B: par
+// explícito ou trap — nunca fallback silencioso.
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// CAST: payload[0]=dst code (0=F32,1=F16,2=BF16,3=I8,4=U8).
+    pub fn cast_dst(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_cast_dst(&mut self, dst: u8) {
+        self.payload[0] = dst;
+    }
+
+    /// QUANTIZE: payload[0]=quant dtype discriminant (4=Q4_0, 8=Q8_0).
+    pub fn quantize_type(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_quantize_type(&mut self, qtype: u8) {
+        self.payload[0] = qtype;
+    }
+}
+
+/// CAST rD, rT DST=... — rdest <- NOVO tensor convertido (src intacto).
+pub fn instr_cast(rdest: u8, r_src: u8, dst: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_CAST, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_cast_dst(dst);
+    instr
+}
+
+/// QUANTIZE rD, rT Q=... — rdest <- NOVO tensor em blocos.
+pub fn instr_quantize(rdest: u8, r_src: u8, qtype: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_QUANTIZE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_quantize_type(qtype);
+    instr
+}
+
+/// DEQUANT rD, rT — rdest <- NOVO tensor F32 (mesmo shape do src).
+pub fn instr_dequant(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_DEQUANT, 0, rdest, r_src, 0xFF, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -3120,6 +3184,66 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_concat(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, axis))
         }
+        "CAST" => {
+            // CAST rD, rT DST=F32|F16|BF16|I8|U8 (0-4 também aceitos)
+            if parts.len() < 3 {
+                return Err(anyhow!("CAST precisa de rdest, rTensor e DST= — ex: CAST r1, r0 DST=F16"));
+            }
+            let mut dst = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("DST=") {
+                    dst = Some(match v {
+                        "F32" => CAST_DST_F32,
+                        "F16" => CAST_DST_F16,
+                        "BF16" => CAST_DST_BF16,
+                        "I8" => CAST_DST_I8,
+                        "U8" => CAST_DST_U8,
+                        _ => v.parse::<u8>().map_err(|_| anyhow!("CAST DST inválido '{}' (use F32/F16/BF16/I8/U8)", p))?,
+                    });
+                    if dst > Some(4) {
+                        return Err(anyhow!("CAST DST inválido '{}' (use F32/F16/BF16/I8/U8)", p));
+                    }
+                } else {
+                    return Err(anyhow!("CAST token desconhecido '{}' (use DST=)", p));
+                }
+            }
+            match dst {
+                Some(d) => Ok(instr_cast(parse_reg(parts[1])?, parse_reg(parts[2])?, d)),
+                None => Err(anyhow!("CAST precisa de DST= — ex: CAST r1, r0 DST=F16")),
+            }
+        }
+        "QUANTIZE" => {
+            // QUANTIZE rD, rT Q=Q4_0|Q8_0 (só o par simétrico parseia;
+            // Q4_K/Q6_K vetam aqui — sem soletrar o inexecutável)
+            if parts.len() < 3 {
+                return Err(anyhow!("QUANTIZE precisa de rdest, rTensor e Q= — ex: QUANTIZE r3, r0 Q=Q8_0"));
+            }
+            let mut qtype = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("Q=") {
+                    qtype = Some(match v {
+                        "Q4_0" | "4" => QUANTIZE_Q4_0,
+                        "Q8_0" | "8" => QUANTIZE_Q8_0,
+                        _ => return Err(anyhow!("QUANTIZE Q='{}' sem encoder (só Q4_0/Q8_0; Q4_K/Q6_K são RFC futura)", p)),
+                    });
+                } else {
+                    return Err(anyhow!("QUANTIZE token desconhecido '{}' (use Q=)", p));
+                }
+            }
+            match qtype {
+                Some(q) => Ok(instr_quantize(parse_reg(parts[1])?, parse_reg(parts[2])?, q)),
+                None => Err(anyhow!("QUANTIZE precisa de Q= — ex: QUANTIZE r3, r0 Q=Q8_0")),
+            }
+        }
+        "DEQUANT" => {
+            // DEQUANT rD, rT (sem chaves; tipo vem do meta do tensor)
+            if parts.len() != 3 {
+                return Err(anyhow!("DEQUANT precisa de exatamente rdest, rTensor — ex: DEQUANT r4, r3"));
+            }
+            Ok(instr_dequant(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -3506,7 +3630,8 @@ fn parse_dtype(s: &str) -> Result<u8> {
         "f16" | "fp16" | "1" => Ok(1),
         "i8" | "2" => Ok(2),
         "u8" | "3" => Ok(3),
-        _ => Err(anyhow!("dtype desconhecido '{}' (use f32/f16/i8/u8)", s)),
+        "bf16" | "bfloat16" | "64" => Ok(64),
+        _ => Err(anyhow!("dtype desconhecido '{}' (use f32/f16/bf16/i8/u8)", s)),
     }
 }
 
@@ -4485,6 +4610,50 @@ mod tests {
         assert!(assemble("RESHAPE r1, r0 SHAPE=abc").is_err());
         assert!(assemble("CONCAT r2, r0").is_err());
         assert!(assemble("CONCAT r2, r0, r1 FOO=1").is_err());
+    }
+
+    // ---- RFC-0025: conversão ----------------------------------------
+
+    #[test]
+    fn test_rfc0025_ctor_roundtrip() {
+        let c = instr_cast(1, 0, CAST_DST_F16);
+        assert_eq!(c.opcode, OP_CAST);
+        assert_eq!(c.cast_dst(), CAST_DST_F16);
+        let d = Instruction::decode(&c.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "CAST");
+        assert_eq!(d.cast_dst(), CAST_DST_F16);
+        let q = instr_quantize(3, 0, QUANTIZE_Q8_0);
+        assert_eq!(q.opcode, OP_QUANTIZE);
+        assert_eq!(q.quantize_type(), QUANTIZE_Q8_0);
+        let d = Instruction::decode(&q.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "QUANTIZE");
+        let e = instr_dequant(4, 3);
+        assert_eq!(e.opcode, OP_DEQUANT);
+        let d = Instruction::decode(&e.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "DEQUANT");
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("CAST r1, r0 DST=BF16").unwrap();
+        assert_eq!(prog[0].cast_dst(), CAST_DST_BF16);
+        let prog = assemble("CAST r1, r0 DST=2").unwrap();
+        assert_eq!(prog[0].cast_dst(), 2);
+        let prog = assemble("QUANTIZE r3, r0 Q=Q4_0").unwrap();
+        assert_eq!(prog[0].quantize_type(), QUANTIZE_Q4_0);
+        let prog = assemble("DEQUANT r4, r3").unwrap();
+        assert_eq!(prog[0].opcode, OP_DEQUANT);
+        assert!(assemble("CAST r1, r0").is_err());
+        assert!(assemble("CAST r1, r0 DST=F64").is_err());
+        assert!(assemble("CAST r1, r0 DST=9").is_err());
+        assert!(assemble("CAST r1, r0 FOO=1").is_err());
+        assert!(assemble("QUANTIZE r3, r0").is_err());
+        assert!(assemble("QUANTIZE r3, r0 Q=Q4_K").is_err());
+        assert!(assemble("QUANTIZE r3, r0 Q=Q6_K").is_err());
+        assert!(assemble("QUANTIZE r3, r0 FOO=1").is_err());
+        assert!(assemble("DEQUANT r4").is_err());
+        assert!(assemble("DEQUANT r4, r3 EXTRA").is_err());
+        // TENSOR ... bf16 aloca (DType::BF16 = 64, fora das numerações).
+        let prog = assemble("TENSOR r0 2 2 bf16").unwrap();
+        assert_eq!(prog[0].tensor_dtype(), 64);
+        assert!(assemble("TENSOR r0 2 2 bf16x").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

@@ -172,6 +172,108 @@ pub fn dequantize(src: &[u8], dtype: u32, dst: &mut [f32], n: usize) -> bool {
     }
 }
 
+/// Bloco Q4_0: 18 bytes (f16 d + 16×u8 nibbles) para 32 elementos.
+pub const Q4_0_BLOCK_BYTES: usize = 18;
+pub const Q4_0_BLOCK_ELEMS: usize = 32;
+/// Bloco Q8_0: 34 bytes (f16 d + 32×i8) para 32 elementos.
+pub const Q8_0_BLOCK_BYTES: usize = 34;
+pub const Q8_0_BLOCK_ELEMS: usize = 32;
+
+/// f32 -> bits bf16 com round-to-nearest-even. NaN entra, NaN quiet sai
+/// (guarda explícita: sem ela um carry raro apagaria a mantissa);
+/// Inf preservado. Subnormais f32 viram zero (faixa do bf16 cobre o
+/// resto bit a bit — mesma faixa de expoente do f32).
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let rounding_bias = 0x7FFFu32 + ((b >> 16) & 1);
+    let mut bf = (b.wrapping_add(rounding_bias) >> 16) as u16;
+    if x.is_nan() {
+        bf |= 0x0040; // quiet bit: mantissa nunca zero
+    }
+    bf
+}
+
+/// bits bf16 -> f32 (exato; mesma faixa de expoente).
+pub fn bf16_bits_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// Quantiza 32 f32 -> bloco Q4_0 (inverso exato do `dequant_q4_0`:
+/// low nibble = y[0..16], high = y[16..32], bias -8).
+/// Erro por elemento <= d/2 com o d ARMAZENADO (f16); amax=0 =>
+/// bloco zero exato. `false` (sem pânico) se len != 32 ou houver
+/// não-finito — com Inf/NaN o bound mentiria, então veta alto.
+pub fn quantize_q4_0(src: &[f32], dst: &mut [u8]) -> bool {
+    if src.len() != Q4_0_BLOCK_ELEMS || dst.len() < Q4_0_BLOCK_BYTES {
+        return false;
+    }
+    let mut amax = 0.0f32;
+    for &x in src {
+        if !x.is_finite() {
+            return false;
+        }
+        amax = amax.max(x.abs());
+    }
+    // d com que o decoder vai reconstruir (f16 armazenado): quantizar
+    // contra ele mantém o bound |err| <= d/2 exato.
+    let d_bits = f16::from_f32(if amax == 0.0 { 0.0 } else { amax / 7.0 });
+    let d_stored = d_bits.to_f32();
+    dst[0..2].copy_from_slice(&d_bits.to_bits().to_le_bytes());
+    if amax == 0.0 {
+        for b in dst[2..18].iter_mut() {
+            *b = 0x88; // q=0 nos dois nibbles (0+8)
+        }
+        return true;
+    }
+    for i in 0..16 {
+        let ql = ((src[i] / d_stored).round() as i32).clamp(-8, 7) + 8;
+        let qh = ((src[i + 16] / d_stored).round() as i32).clamp(-8, 7) + 8;
+        dst[2 + i] = (ql as u8) | ((qh as u8) << 4);
+    }
+    true
+}
+
+/// Quantiza 32 f32 -> bloco Q8_0 (f16 d + 32×i8, GGML).
+/// d = amax/127, quants em [-127,127]; erro <= d/2 com d armazenado.
+/// `false` se len != 32 ou houver não-finito.
+pub fn quantize_q8_0(src: &[f32], dst: &mut [u8]) -> bool {
+    if src.len() != Q8_0_BLOCK_ELEMS || dst.len() < Q8_0_BLOCK_BYTES {
+        return false;
+    }
+    let mut amax = 0.0f32;
+    for &x in src {
+        if !x.is_finite() {
+            return false;
+        }
+        amax = amax.max(x.abs());
+    }
+    let d_bits = f16::from_f32(if amax == 0.0 { 0.0 } else { amax / 127.0 });
+    let d_stored = d_bits.to_f32();
+    dst[0..2].copy_from_slice(&d_bits.to_bits().to_le_bytes());
+    if amax == 0.0 {
+        for b in dst[2..34].iter_mut() {
+            *b = 0;
+        }
+        return true;
+    }
+    for i in 0..32 {
+        let q = ((src[i] / d_stored).round() as i32).clamp(-127, 127) as i8;
+        dst[2 + i] = q as u8;
+    }
+    true
+}
+
+/// (elementos_por_bloco, bytes_por_bloco) para tipos com encoder e
+/// decoder simétricos aqui. Q4_K/Q6_K têm decoder mas NÃO encoder
+/// (vetores de referência pendentes — RFC-0025 é explícita).
+pub fn quant_block_info(dtype: u32) -> Option<(usize, usize)> {
+    match dtype {
+        4 => Some((Q4_0_BLOCK_ELEMS, Q4_0_BLOCK_BYTES)),
+        8 => Some((Q8_0_BLOCK_ELEMS, Q8_0_BLOCK_BYTES)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +367,83 @@ mod tests {
         // low=2 high=2 => low| (2<<4)=2|32=34 ->34-32=2 não 0. Hmm
         // Verifica apenas finitude
         for &v in &dst2 { assert!(v.is_finite()); }
+    }
+    #[test]
+    fn test_bf16_bits_rne() {
+        assert_eq!(f32_to_bf16_bits(1.0), 0x3F80);
+        assert_eq!(f32_to_bf16_bits(-2.5), 0xC020);
+        assert_eq!(f32_to_bf16_bits(0.0), 0x0000);
+        // Inf preservado (não vira NaN).
+        assert_eq!(f32_to_bf16_bits(f32::INFINITY), 0x7F80);
+        assert_eq!(f32_to_bf16_bits(f32::NEG_INFINITY), 0xFF80);
+        // NaN entra, NaN quiet sai (guarda explícita).
+        assert!(bf16_bits_to_f32(f32_to_bf16_bits(f32::NAN)).is_nan());
+        // Round-to-nearest-even: metade exata com bit par fica,
+        // com bit ímpar sobe; acima/abaixo da metade seguem o lado.
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F808000)), 0x3F80); // par, fica
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F818000)), 0x3F82); // ímpar, sobe
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F808001)), 0x3F81); // acima, sobe
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3F807FFF)), 0x3F80); // abaixo, desce
+        // Ida e volta exata em representáveis.
+        for &v in &[1.0f32, -2.5, 0.5, 100.0, -0.0] {
+            assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(v)), v);
+        }
+    }
+    #[test]
+    fn test_quantize_q4_0_roundtrip_bound() {
+        // Vetor conhecido: 32×1.0 => d=1/7, quants 7 => 0xFF.
+        let src = [1.0f32; 32];
+        let mut blk = [0u8; 18];
+        assert!(quantize_q4_0(&src, &mut blk));
+        let mut back = [0.0f32; 32];
+        dequant_q4_0(&blk, &mut back, 32);
+        let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+        for &v in &back {
+            assert!((v - 1.0).abs() <= d / 2.0 + 1e-6, "v={} d={}", v, d);
+        }
+        // Rampa com negativos: bound vale contra o d ARMAZENADO.
+        let ramp: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.5).collect();
+        let mut blk2 = [0u8; 18];
+        assert!(quantize_q4_0(&ramp, &mut blk2));
+        let mut back2 = [0.0f32; 32];
+        dequant_q4_0(&blk2, &mut back2, 32);
+        let d2 = f16::from_bits(u16::from_le_bytes([blk2[0], blk2[1]])).to_f32();
+        for (x, y) in ramp.iter().zip(back2.iter()) {
+            assert!((x - y).abs() <= d2 / 2.0 + 1e-4, "x={} y={} d={}", x, y, d2);
+        }
+        // Zero exato: bloco codificado tem d=0 => decode dá 0.
+        let mut zb = [0u8; 18];
+        assert!(quantize_q4_0(&[0.0; 32], &mut zb));
+        let mut zd = [9.0f32; 32];
+        dequant_q4_0(&zb, &mut zd, 32);
+        for &v in &zd { assert_eq!(v, 0.0); }
+        assert!(!quantize_q4_0(&[1.0; 31], &mut [0u8; 18]));
+        let mut bad = [1.0f32; 32];
+        bad[3] = f32::INFINITY;
+        assert!(!quantize_q4_0(&bad, &mut [0u8; 18]));
+        bad[3] = f32::NAN;
+        assert!(!quantize_q4_0(&bad, &mut [0u8; 18]));
+    }
+    #[test]
+    fn test_quantize_q8_0_roundtrip_bound() {
+        let src = [0.5f32; 32];
+        let mut blk = [0u8; 34];
+        assert!(quantize_q8_0(&src, &mut blk));
+        assert!(dequantize(&blk, 8, &mut [0.0f32; 32], 32));
+        let mut back = [0.0f32; 32];
+        assert!(dequantize(&blk, 8, &mut back, 32));
+        let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+        for &v in &back {
+            assert!((v - 0.5).abs() <= d / 2.0 + 1e-6, "v={} d={}", v, d);
+        }
+        assert!(!quantize_q8_0(&[0.5; 30], &mut [0u8; 34]));
+        let mut bad = [0.5f32; 32];
+        bad[0] = f32::NEG_INFINITY;
+        assert!(!quantize_q8_0(&bad, &mut [0u8; 34]));
+        // quant_block_info só cobre o par simétrico.
+        assert_eq!(quant_block_info(4), Some((32, 18)));
+        assert_eq!(quant_block_info(8), Some((32, 34)));
+        assert_eq!(quant_block_info(12), None);
+        assert_eq!(quant_block_info(0), None);
     }
 }

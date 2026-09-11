@@ -320,9 +320,9 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x64` | `HASH` | 32 | IMPL | S | FNV-1a/64 (downgrade honesto; RFC-0005) |
 | `0x65` | `CHECKSUM` | 32 | IMPL | S | CRC32-IEEE |
 | `0x66` | `HMAC` | 32 | IMPL | S | Truncated SHA256 |
-| `0x67` | `CAST` | 32 | DRAFT | S | FP32/BF16/FP16/INT8 (§11) |
-| `0x68` | `QUANTIZE` | 32 | DRAFT | S | WEIGHTS; Q4_0/Q4_K/Q6_K/Q8_0 |
-| `0x69` | `DEQUANT` | 32 | DRAFT | S | Inverse |
+| `0x67` | `CAST` | 32 | IMPL | S | Explicit pairs; trap-or-exact (RFC-0025) |
+| `0x68` | `QUANTIZE` | 32 | IMPL | S | Q4_0/Q8_0 encoders; Q4_K/Q6_K trap (RFC-0025) |
+| `0x69` | `DEQUANT` | 32 | IMPL | S | Existing dispatcher as op (RFC-0025) |
 | `0x6A` | `CYCLES_COUNT` | 32 | IMPL | S | RDTSC-like |
 | `0x6B` | `TRACE_EVENT` | 32 | IMPL | S | Structured tracing |
 | `0x6C` | `SANITY_CHECK` | 32 | IMPL | S | Absorbs NaN/Inf per actor |
@@ -590,7 +590,10 @@ Silent fallback to another precision is FORBIDDEN and voids any
 numerical bound (this answers [B]'s charge honestly: agnosticism is a
 routing contract + trap rule, not a compute claim). Effective today:
 FP32 compute; quantized weight paths (Q4_0/Q4_K/Q6_K/Q8_0) as in
-ESPEC Section 10.
+ESPEC Section 10. On the 32B path (legacy flags, no PRECISION bits)
+the rule is enforced by `CAST`/`QUANTIZE`/`DEQUANT` (RFC-0025): every
+conversion names an explicitly supported precision or traps — identity,
+partial blocks, non-finite quantize input and unencoded types all trap.
 
 ## 12. Cluster: Basic Forms, X-Forms, WAL Naming
 
