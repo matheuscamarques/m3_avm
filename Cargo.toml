@@ -72,6 +72,10 @@ harness = false
 name = "attention_bench"
 harness = false
 
+[[bench]]
+name = "audio_dsp_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

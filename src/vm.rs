@@ -42,6 +42,9 @@ use crate::opcodes::{
     REDUCE_MIN, REDUCE_PROD,
     OP_KV_COMPRESS, OP_FLASH_ATTN, OP_ATTN_SPARSE, KVCOMP_MODE_SINK_WINDOW,
     SPARSE_METRIC_DOT,
+    OP_STREAM_MERGE, OP_VAD_DETECT, OP_AUDIO_RESAMPLE, OP_AUDIO_FILTER,
+    OP_AUDIO_WINDOW, VAD_MODE_ENERGY, VAD_MODE_ZCR, VAD_MODE_ML,
+    FILTER_MODE_FIR, FILTER_MODE_IIR, WINDOW_HANN, WINDOW_HAMMING,
     OP_SOFTMAX, OP_GELU, OP_SIGMOID, OP_TANH, OP_RELU, OP_EXP, OP_LOG, OP_CLIP,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
@@ -159,6 +162,11 @@ pub struct VmStats {
     pub kv_compress_execs: u64,
     pub flash_attn_execs: u64,
     pub attn_sparse_execs: u64,
+    pub stream_merge_execs: u64,
+    pub vad_detect_execs: u64,
+    pub audio_resample_execs: u64,
+    pub audio_filter_execs: u64,
+    pub audio_window_execs: u64,
     pub start_ns: u64,
 }
 
@@ -1277,6 +1285,26 @@ impl Vm {
             }
             OP_ATTN_SPARSE => {
                 self.exec_attn_sparse(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_STREAM_MERGE => {
+                self.exec_stream_merge(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_VAD_DETECT => {
+                self.exec_vad_detect(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_AUDIO_RESAMPLE => {
+                self.exec_audio_resample(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_AUDIO_FILTER => {
+                self.exec_audio_filter(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_AUDIO_WINDOW => {
+                self.exec_audio_window(ctx_id, instr)?;
                 Ok(true)
             }
             _ => Err(anyhow!("opcode não implementado: 0x{:02x}", instr.opcode)),
@@ -5173,6 +5201,223 @@ impl Vm {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // RFC-0031: DSP de áudio (0x45-0x49). Tensores densos F32, saídas novas.
+    // -----------------------------------------------------------------------
+
+    /// VAD_DETECT rD, rT [MODE] — score [1,1]: RMS cru (ENERGY, >= 0) ou
+    /// taxa de cruzamento de zero (ZCR, [0,1], troca estrita de sinal).
+    /// ML parseia e veta (sem modelo). n < 2 com ZCR veta.
+    fn exec_vad_detect(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("VAD_DETECT precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let mode = instr.vad_mode();
+        if mode != VAD_MODE_ENERGY && mode != VAD_MODE_ZCR && mode != VAD_MODE_ML {
+            return Err(anyhow!("VAD_DETECT: MODE={} inválido (0/1/2)", mode));
+        }
+        if mode == VAD_MODE_ML {
+            return Err(anyhow!("VAD_DETECT: MODE=ML sem modelo (RFC futura)"));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "VAD_DETECT")?;
+        let n = data.len();
+        let score = if mode == VAD_MODE_ENERGY {
+            let sum_sq: f32 = data.iter().map(|&x| x * x).sum();
+            (sum_sq / n as f32).sqrt()
+        } else {
+            if n < 2 {
+                return Err(anyhow!("VAD_DETECT: ZCR precisa de >= 2 amostras"));
+            }
+            let mut cross = 0usize;
+            for w in data.windows(2) {
+                if w[0] * w[1] < 0.0 {
+                    cross += 1;
+                }
+            }
+            cross as f32 / (n - 1) as f32
+        };
+        let out_addr = self.memory.alloc_tensor(&[1, 1], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &[score])?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.vad_detect_execs += 1;
+        log_debug("vad", &format!("ctx {} VAD_DETECT 0x{:x}{:?} MODE={} -> {}", ctx_id, t_addr, shape, mode, score));
+        Ok(())
+    }
+
+    /// STREAM_MERGE rD, rA, rB — out = GAIN*A + (1-GAIN)*B, shapes
+    /// idênticas (sem broadcast silencioso). Ganho finito; N_STREAMS
+    /// 0=default 2, < 2 veta; modo reservado nonzero veta.
+    fn exec_stream_merge(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("STREAM_MERGE precisa de rdest, rA, rB (0xFF não é registrador)"));
+        }
+        let (a_addr, b_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let (gain, n_p, mode) = instr.merge_params();
+        if !gain.is_finite() {
+            return Err(anyhow!("STREAM_MERGE: GAIN={} não-finito", gain));
+        }
+        if mode != 0 {
+            return Err(anyhow!("STREAM_MERGE: modo {} reservado", mode));
+        }
+        let n_streams = if n_p == 0 { 2 } else { n_p };
+        if n_streams < 2 {
+            return Err(anyhow!("STREAM_MERGE: N_STREAMS={} contradiz mix de 2 (mínimo 2)", n_p));
+        }
+        let (sa, a) = self.read_dense_f32(a_addr, "STREAM_MERGE")?;
+        let (sb, b) = self.read_dense_f32(b_addr, "STREAM_MERGE")?;
+        if sa != sb {
+            return Err(anyhow!("STREAM_MERGE: shapes {:?} vs {:?} (idênticos, sem broadcast)", sa, sb));
+        }
+        let g = 1.0 - gain;
+        let out: Vec<f32> = a.iter().zip(b.iter()).map(|(&x, &y)| gain * x + g * y).collect();
+        let out_addr = self.memory.alloc_tensor(&sa, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.stream_merge_execs += 1;
+        log_debug("merge", &format!("ctx {} STREAM_MERGE 0x{:x}+0x{:x}{:?} GAIN={} -> 0x{:x}", ctx_id, a_addr, b_addr, sa, gain, out_addr));
+        Ok(())
+    }
+
+    /// AUDIO_RESAMPLE rD, rT — interpolação linear p/ nova taxa.
+    /// out_len = floor(in*dst/src) >= 1; cauda clampada (documentado).
+    fn exec_audio_resample(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("AUDIO_RESAMPLE precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (src_rate, dst_rate) = instr.resample_rates();
+        if src_rate == 0 || dst_rate == 0 {
+            return Err(anyhow!("AUDIO_RESAMPLE: taxas {}->{} inválidas (> 0)", src_rate, dst_rate));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "AUDIO_RESAMPLE")?;
+        let n_in = data.len();
+        let n_out = (n_in as u64 * dst_rate as u64 / src_rate as u64) as usize;
+        if n_out == 0 {
+            return Err(anyhow!("AUDIO_RESAMPLE: saída vazia ({} @{}->@{})", n_in, src_rate, dst_rate));
+        }
+        let mut out = Vec::with_capacity(n_out);
+        for i in 0..n_out {
+            let pos = i as f32 * src_rate as f32 / dst_rate as f32;
+            // min() blinda erro de arredondamento do f32 (pos < n_in por
+            // construção, mas floor() pode devolver n_in no limite).
+            let i0 = (pos.floor() as usize).min(n_in - 1);
+            let frac = (pos - i0 as f32).clamp(0.0, 1.0);
+            let i1 = (i0 + 1).min(n_in - 1);
+            out.push(data[i0] * (1.0 - frac) + data[i1] * frac);
+        }
+        let out_shape = vec![n_out];
+        let out_addr = self.memory.alloc_tensor(&out_shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.audio_resample_execs += 1;
+        log_debug("resample", &format!("ctx {} RESAMPLE 0x{:x}[{}] @{}->@{} [{}] -> 0x{:x}", ctx_id, t_addr, n_in, src_rate, dst_rate, n_out, out_addr));
+        Ok(())
+    }
+
+    /// AUDIO_FILTER rD, rX, rB — FIR same-size centrado, zero-pad nas
+    /// bordas: tap j alinha em x[n-(j-(M-1)/2)] (divisão inteira).
+    fn exec_audio_filter(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("AUDIO_FILTER precisa de rdest, rX, rB (0xFF não é registrador)"));
+        }
+        let (x_addr, b_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let mode = instr.filter_mode();
+        if mode != FILTER_MODE_FIR {
+            return Err(anyhow!("AUDIO_FILTER: MODE={} sem implementação (só FIR; IIR precisa projeto de coefs A)", mode));
+        }
+        let (sx, x) = self.read_dense_f32(x_addr, "AUDIO_FILTER")?;
+        let (_, b) = self.read_dense_f32(b_addr, "AUDIO_FILTER")?;
+        let m = b.len();
+        if m == 0 {
+            return Err(anyhow!("AUDIO_FILTER: taps vazios"));
+        }
+        let n = x.len();
+        let off = (m - 1) / 2;
+        let mut out = vec![0.0f32; n];
+        for nn in 0..n {
+            let mut acc = 0.0f32;
+            for (j, &bj) in b.iter().enumerate() {
+                let k = nn as isize - (j as isize - off as isize);
+                if k >= 0 && (k as usize) < n {
+                    acc += bj * x[k as usize];
+                }
+            }
+            out[nn] = acc;
+        }
+        let out_addr = self.memory.alloc_tensor(&sx, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.audio_filter_execs += 1;
+        log_debug("filter", &format!("ctx {} FILTER FIR M={} 0x{:x}{:?} -> 0x{:x}", ctx_id, m, x_addr, sx, out_addr));
+        Ok(())
+    }
+
+    /// AUDIO_WINDOW rD, rT — Hann/Hamming periódica flat (N = numel).
+    /// N=1 dá 0.0 (fórmula honesta, documentado).
+    fn exec_audio_window(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("AUDIO_WINDOW precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let wtype = instr.window_type();
+        if wtype != WINDOW_HANN && wtype != WINDOW_HAMMING {
+            return Err(anyhow!("AUDIO_WINDOW: TYPE={} inválido (0=HANN,1=HAMMING)", wtype));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "AUDIO_WINDOW")?;
+        let n = data.len();
+        let out: Vec<f32> = data
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let c = (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos();
+                let w = if wtype == WINDOW_HANN { 0.5 * (1.0 - c) } else { 0.54 - 0.46 * c };
+                x * w
+            })
+            .collect();
+        let out_addr = self.memory.alloc_tensor(&shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.audio_window_execs += 1;
+        log_debug("window", &format!("ctx {} WINDOW 0x{:x}{:?} TYPE={} -> 0x{:x}", ctx_id, t_addr, shape, wtype, out_addr));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -7686,6 +7931,186 @@ mod tests {
         assert_eq!(vm2.memory.read_f32_tensor(a4, 1).unwrap(), vec![0.0]);
         let a7 = ctx2.reg(7).unwrap();
         assert_eq!(vm2.memory.read_f32_tensor(a7, 1).unwrap(), vec![1.0]);
+    }
+
+    // ---- RFC-0031: DSP de áudio -----------------------------------------
+
+    #[test]
+    fn test_rfc0031_vad() {
+        use crate::opcodes::{instr_vad_detect, VAD_MODE_ENERGY, VAD_MODE_ML, VAD_MODE_ZCR};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let adc = rfc0004_f32(&mut vm, &[8], &[0.5; 8]);
+        let azero = rfc0004_f32(&mut vm, &[8], &[0.0; 8]);
+        let aalt = rfc0004_f32(&mut vm, &[4], &[1.0, -1.0, 1.0, -1.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, adc), (1, azero), (2, aalt)]);
+        let rd1 = |vm: &Vm, r: u8| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, 1).unwrap()[0];
+        // DC 0.5: ENERGY = RMS = 0.5 exato; ZCR = 0 (sem troca de sinal).
+        vm.step_instruction(cid, &instr_vad_detect(3, 0, VAD_MODE_ENERGY)).unwrap();
+        assert_eq!(rd1(&vm, 3), 0.5);
+        vm.step_instruction(cid, &instr_vad_detect(3, 0, VAD_MODE_ZCR)).unwrap();
+        assert_eq!(rd1(&vm, 3), 0.0);
+        // Silêncio: 0 e 0.
+        vm.step_instruction(cid, &instr_vad_detect(3, 1, VAD_MODE_ENERGY)).unwrap();
+        assert_eq!(rd1(&vm, 3), 0.0);
+        vm.step_instruction(cid, &instr_vad_detect(3, 1, VAD_MODE_ZCR)).unwrap();
+        assert_eq!(rd1(&vm, 3), 0.0);
+        // Alternado: ENERGY = 1.0, ZCR = 3/3 = 1.0.
+        vm.step_instruction(cid, &instr_vad_detect(3, 2, VAD_MODE_ENERGY)).unwrap();
+        assert_eq!(rd1(&vm, 3), 1.0);
+        vm.step_instruction(cid, &instr_vad_detect(3, 2, VAD_MODE_ZCR)).unwrap();
+        assert_eq!(rd1(&vm, 3), 1.0);
+        // Senoide 440Hz real: RMS ≈ 0.5/√2; ZCR na faixa teórica.
+        let frame = crate::mimi::synth_frame_440hz();
+        let n = frame.len();
+        let asine = vm.memory.alloc_tensor(&[n], crate::memory::DType::F32).unwrap();
+        vm.memory.write_f32_tensor(asine, &frame).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, asine).unwrap();
+        vm.step_instruction(cid, &instr_vad_detect(3, 4, VAD_MODE_ENERGY)).unwrap();
+        assert!((rd1(&vm, 3) - 0.3536).abs() < 5e-3, "rms={}", rd1(&vm, 3));
+        vm.step_instruction(cid, &instr_vad_detect(3, 4, VAD_MODE_ZCR)).unwrap();
+        let z = rd1(&vm, 3);
+        assert!(z > 0.03 && z < 0.05, "zcr={}", z);
+        // Erros: ML (parseia, veta), modo ruim, esparso, meta ausente, n=1 p/ ZCR.
+        assert!(vm.step_instruction(cid, &instr_vad_detect(3, 0, VAD_MODE_ML)).is_err());
+        let mut bad = instr_vad_detect(3, 0, VAD_MODE_ENERGY);
+        bad.set_vad_mode(9);
+        assert!(vm.step_instruction(cid, &bad).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[2, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_vad_detect(3, 4, VAD_MODE_ENERGY)).is_err());
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, 0xdead).unwrap();
+        assert!(vm.step_instruction(cid, &instr_vad_detect(3, 4, VAD_MODE_ENERGY)).is_err());
+        let a1 = rfc0004_f32(&mut vm, &[1], &[0.5]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, a1).unwrap();
+        assert!(vm.step_instruction(cid, &instr_vad_detect(3, 4, VAD_MODE_ZCR)).is_err());
+        assert_eq!(vm.stats.vad_detect_execs, 8);
+    }
+
+    #[test]
+    fn test_rfc0031_merge_resample() {
+        use crate::opcodes::{instr_audio_resample, instr_stream_merge};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let a = rfc0004_f32(&mut vm, &[2], &[1.0, 2.0]);
+        let b = rfc0004_f32(&mut vm, &[2], &[10.0, 20.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a), (1, b)]);
+        let rd = |vm: &Vm, r: u8| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, 2).unwrap();
+        // GAIN=0.25: [7.75, 15.5] exatos.
+        vm.step_instruction(cid, &instr_stream_merge(2, 0, 1, 0.25, 0)).unwrap();
+        assert_eq!(rd(&vm, 2), vec![7.75, 15.5]);
+        // N_STREAMS explícito aceito (metadado).
+        vm.step_instruction(cid, &instr_stream_merge(2, 0, 1, 0.5, 17)).unwrap();
+        assert_eq!(rd(&vm, 2), vec![5.5, 11.0]);
+        // Downsample [0,1,2,3] 4->2: [0,2]. Upsample [0,10] 1->2: [0,5,10,10].
+        let r4 = rfc0004_f32(&mut vm, &[4], &[0.0, 1.0, 2.0, 3.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, r4).unwrap();
+        vm.step_instruction(cid, &instr_audio_resample(4, 3, 4, 2)).unwrap();
+        let rd4 = rfc0005_reg_u64(&vm, cid, 4) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(rd4, 2).unwrap(), vec![0.0, 2.0]);
+        let r2v = rfc0004_f32(&mut vm, &[2], &[0.0, 10.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, r2v).unwrap();
+        vm.step_instruction(cid, &instr_audio_resample(4, 3, 1, 2)).unwrap();
+        let rd4b = rfc0005_reg_u64(&vm, cid, 4) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(rd4b, 4).unwrap(), vec![0.0, 5.0, 10.0, 10.0]);
+        // Erros: shapes, ganho NaN, N_STREAMS=1, modo, taxas, saída vazia.
+        let c3 = rfc0004_f32(&mut vm, &[3], &[0.0; 3]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, c3).unwrap();
+        assert!(vm.step_instruction(cid, &instr_stream_merge(2, 0, 5, 0.5, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_stream_merge(2, 0, 1, f32::NAN, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_stream_merge(2, 0, 1, 0.5, 1)).is_err());
+        let mut badm = instr_stream_merge(2, 0, 1, 0.5, 0);
+        badm.set_merge_params(0.5, 0, 7);
+        assert!(vm.step_instruction(cid, &badm).is_err());
+        assert!(vm.step_instruction(cid, &instr_audio_resample(4, 3, 0, 2)).is_err());
+        let r1v = rfc0004_f32(&mut vm, &[1], &[5.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, r1v).unwrap();
+        assert!(vm.step_instruction(cid, &instr_audio_resample(4, 3, 2, 1)).is_err());
+        assert_eq!(vm.stats.stream_merge_execs, 2);
+        assert_eq!(vm.stats.audio_resample_execs, 2);
+    }
+
+    #[test]
+    fn test_rfc0031_filter_window() {
+        use crate::opcodes::{instr_audio_filter, instr_audio_window, FILTER_MODE_FIR, FILTER_MODE_IIR, WINDOW_HANN, WINDOW_HAMMING};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let ax = rfc0004_f32(&mut vm, &[4], &[1.0, 2.0, 3.0, 4.0]);
+        let ab = rfc0004_f32(&mut vm, &[2], &[0.5, 0.5]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, ax), (1, ab)]);
+        let rd = |vm: &Vm, r: u8| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, 4).unwrap();
+        // Média móvel 2, same centrado: [0.5,1.5,2.5,3.5] exato.
+        vm.step_instruction(cid, &instr_audio_filter(2, 0, 1, FILTER_MODE_FIR)).unwrap();
+        assert_eq!(rd(&vm, 2), vec![0.5, 1.5, 2.5, 3.5]);
+        // Taps [1]: identidade.
+        let ab1 = rfc0004_f32(&mut vm, &[1], &[1.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, ab1).unwrap();
+        vm.step_instruction(cid, &instr_audio_filter(2, 0, 3, FILTER_MODE_FIR)).unwrap();
+        assert_eq!(rd(&vm, 2), vec![1.0, 2.0, 3.0, 4.0]);
+        // IIR veta; eixo... (filter não tem eixo); taps esparso veta.
+        assert!(vm.step_instruction(cid, &instr_audio_filter(2, 0, 1, FILTER_MODE_IIR)).is_err());
+        let asp = vm.memory.alloc_sparse_tensor(&[2, 2], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_audio_filter(2, 0, 3, FILTER_MODE_FIR)).is_err());
+        // Hann N=4: [0,0.5,1,0.5]; Hamming: [0.08,0.54,1,0.54].
+        // Janela × entrada [1,2,3,4]: Hann dá [0,1,3,2].
+        vm.step_instruction(cid, &instr_audio_window(4, 0, WINDOW_HANN)).unwrap();
+        for (g, e) in rd(&vm, 4).iter().zip([0.0, 1.0, 3.0, 2.0].iter()) {
+            assert!((g - e).abs() < 1e-5, "hann {:?}", rd(&vm, 4));
+        }
+        // Hamming × entrada: [0.08,1.08,3.0,2.16].
+        vm.step_instruction(cid, &instr_audio_window(4, 0, WINDOW_HAMMING)).unwrap();
+        for (g, e) in rd(&vm, 4).iter().zip([0.08, 1.08, 3.0, 2.16].iter()) {
+            assert!((g - e).abs() < 1e-5, "hamming {:?}", rd(&vm, 4));
+        }
+        let mut badw = instr_audio_window(4, 0, WINDOW_HANN);
+        badw.set_window_type(7);
+        assert!(vm.step_instruction(cid, &badw).is_err());
+        assert_eq!(vm.stats.audio_filter_execs, 2);
+        assert_eq!(vm.stats.audio_window_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0031_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            TENSOR r0 1 1920 f32 FILL=0.5
+            VAD_DETECT r1, r0 MODE=ENERGY
+            VAD_DETECT r7, r0 MODE=ZCR
+            AUDIO_RESAMPLE r2, r0 SRC=24000 DST=16000
+            AUDIO_WINDOW r3, r2 TYPE=HANN
+            TENSOR r4 1 8 f32 FILL=0.125
+            AUDIO_FILTER r5, r3, r4 MODE=FIR
+            STREAM_MERGE r6, r5, r5 GAIN=0.5
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.vad_detect_execs, 2);
+        assert_eq!((stats.audio_resample_execs, stats.audio_window_execs, stats.audio_filter_execs, stats.stream_merge_execs), (1, 1, 1, 1));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let a1 = ctx.reg(1).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a1, 1).unwrap(), vec![0.5]);
+        let a7 = ctx.reg(7).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a7, 1).unwrap(), vec![0.0]);
+        // r2 tem 1280 elems (1920@24k -> @16k); r6 == r5 (mix 0.5+0.5).
+        let a2 = ctx.reg(2).unwrap();
+        let m2 = vm.memory.get_tensor_meta(a2).unwrap().clone();
+        assert_eq!(m2.byte_len, 1280 * 4);
+        let a5 = ctx.reg(5).unwrap();
+        let a6 = ctx.reg(6).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a6, 1280).unwrap(), vm.memory.read_f32_tensor(a5, 1280).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_rfc0031_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/audio_dsp_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.vad_detect_execs, 2);
+        assert_eq!((stats.audio_resample_execs, stats.audio_window_execs, stats.audio_filter_execs, stats.stream_merge_execs), (1, 1, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

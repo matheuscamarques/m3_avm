@@ -1,0 +1,12 @@
+; programs/audio_dsp_demo.m3asm — RFC-0031: DSP de áudio (0x45-0x49).
+; DC 0.5 -> VAD (energy/zcr) -> resample -> Hann -> FIR -> mix.
+; Contadores verificados em test_rfc0031_demo_runs: vad=2, resto 1.
+TENSOR r0 1 1920 f32 FILL=0.5
+VAD_DETECT r1, r0 MODE=ENERGY
+VAD_DETECT r7, r0 MODE=ZCR
+AUDIO_RESAMPLE r2, r0 SRC=24000 DST=16000
+AUDIO_WINDOW r3, r2 TYPE=HANN
+TENSOR r4 1 8 f32 FILL=0.125
+AUDIO_FILTER r5, r3, r4 MODE=FIR
+STREAM_MERGE r6, r5, r5 GAIN=0.5
+HALT

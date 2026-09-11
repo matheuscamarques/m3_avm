@@ -157,6 +157,22 @@ pub const QUANTIZE_Q8_0: u8 = 8;
 // RFC-0027: forma (0x30-0x37, v1.9; resto de 0x30-0x43 nas partes 2-3).
 // RFC-0028: ativações (0x3C-0x43, v1.10; 0x39-0x3B na parte 3).
 // RFC-0029: KV/attention (0x39/0x3A/0x3B, v1.11; fecha 0x30-0x43).
+// RFC-0031: DSP de áudio (0x45-0x49, v1.12; 0x44 na parte 2).
+pub const OP_STREAM_MERGE: u8 = 0x45; // mix com ganho explícito
+pub const OP_VAD_DETECT: u8 = 0x46; // score de voz (energy/zcr)
+pub const OP_AUDIO_RESAMPLE: u8 = 0x47; // interpolação linear
+pub const OP_AUDIO_FILTER: u8 = 0x48; // FIR same-size centrado
+pub const OP_AUDIO_WINDOW: u8 = 0x49; // Hann/Hamming periódica
+// Modos — VAD (payload[0]): 0=ENERGY, 1=ZCR, 2=ML (veta no exec).
+pub const VAD_MODE_ENERGY: u8 = 0;
+pub const VAD_MODE_ZCR: u8 = 1;
+pub const VAD_MODE_ML: u8 = 2;
+// Modo — FILTER (payload[0]): 0=FIR (IIR veta no exec).
+pub const FILTER_MODE_FIR: u8 = 0;
+pub const FILTER_MODE_IIR: u8 = 1;
+// Tipo — WINDOW (payload[0]): 0=HANN, 1=HAMMING.
+pub const WINDOW_HANN: u8 = 0;
+pub const WINDOW_HAMMING: u8 = 1;
 pub const OP_KV_COMPRESS: u8 = 0x39; // evicção sink+janela no KV_CACHE
 pub const OP_FLASH_ATTN: u8 = 0x3A; // atenção em blocos, online-softmax
 pub const OP_ATTN_SPARSE: u8 = 0x3B; // top-k fundido por DOT + atenção
@@ -568,6 +584,11 @@ impl Instruction {
             OP_KV_COMPRESS => "KV_COMPRESS",
             OP_FLASH_ATTN => "FLASH_ATTN",
             OP_ATTN_SPARSE => "ATTN_SPARSE",
+            OP_STREAM_MERGE => "STREAM_MERGE",
+            OP_VAD_DETECT => "VAD_DETECT",
+            OP_AUDIO_RESAMPLE => "AUDIO_RESAMPLE",
+            OP_AUDIO_FILTER => "AUDIO_FILTER",
+            OP_AUDIO_WINDOW => "AUDIO_WINDOW",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -2112,6 +2133,104 @@ pub fn instr_flash_attn(rdest: u8, r_q: u8, r_k: u8, r_v: u8, block: u16) -> Ins
 pub fn instr_attn_sparse(rdest: u8, r_q: u8, r_k: u8, r_v: u8, metric: u8, topk: u16) -> Instruction {
     let mut instr = Instruction::new(OP_ATTN_SPARSE, 0, rdest, r_q, r_k, r_v);
     instr.set_sparse_params(metric, topk);
+    instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0031: STREAM_MERGE (0x45) / VAD_DETECT (0x46) / AUDIO_RESAMPLE (0x47)
+// / AUDIO_FILTER (0x48) / AUDIO_WINDOW (0x49).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// VAD_DETECT: payload[0]=mode (0=ENERGY,1=ZCR,2=ML-veta).
+    pub fn vad_mode(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_vad_mode(&mut self, mode: u8) {
+        self.payload[0] = mode;
+    }
+
+    /// STREAM_MERGE: payload[0..4]=gain f32 LE, [4..6]=n_streams u16 LE
+    /// (0=default 2), [6]=mode (reservado 0).
+    pub fn merge_params(&self) -> (f32, u16, u8) {
+        let mut bg = [0u8; 4];
+        bg.copy_from_slice(&self.payload[0..4]);
+        let n = u16::from_le_bytes([self.payload[4], self.payload[5]]);
+        (f32::from_le_bytes(bg), n, self.payload[6])
+    }
+
+    pub fn set_merge_params(&mut self, gain: f32, n_streams: u16, mode: u8) {
+        self.payload[0..4].copy_from_slice(&gain.to_le_bytes());
+        self.payload[4..6].copy_from_slice(&n_streams.to_le_bytes());
+        self.payload[6] = mode;
+    }
+
+    /// AUDIO_RESAMPLE: payload[0..4]=src_rate u32 LE, [4..8]=dst_rate u32.
+    pub fn resample_rates(&self) -> (u32, u32) {
+        let mut bs = [0u8; 4];
+        bs.copy_from_slice(&self.payload[0..4]);
+        let mut bd = [0u8; 4];
+        bd.copy_from_slice(&self.payload[4..8]);
+        (u32::from_le_bytes(bs), u32::from_le_bytes(bd))
+    }
+
+    pub fn set_resample_rates(&mut self, src_rate: u32, dst_rate: u32) {
+        self.payload[0..4].copy_from_slice(&src_rate.to_le_bytes());
+        self.payload[4..8].copy_from_slice(&dst_rate.to_le_bytes());
+    }
+
+    /// AUDIO_FILTER: payload[0]=mode (0=FIR,1=IIR-veta).
+    pub fn filter_mode(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_filter_mode(&mut self, mode: u8) {
+        self.payload[0] = mode;
+    }
+
+    /// AUDIO_WINDOW: payload[0]=type (0=HANN,1=HAMMING).
+    pub fn window_type(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_window_type(&mut self, wtype: u8) {
+        self.payload[0] = wtype;
+    }
+}
+
+/// VAD_DETECT rD, rT [MODE=ENERGY|ZCR] — rdest <- score [1,1].
+pub fn instr_vad_detect(rdest: u8, r_src: u8, mode: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_VAD_DETECT, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_vad_mode(mode);
+    instr
+}
+
+/// STREAM_MERGE rD, rA, rB GAIN=x [N_STREAMS=n].
+pub fn instr_stream_merge(rdest: u8, r_a: u8, r_b: u8, gain: f32, n_streams: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_STREAM_MERGE, 0, rdest, r_a, r_b, 0xFF);
+    instr.set_merge_params(gain, n_streams, 0);
+    instr
+}
+
+/// AUDIO_RESAMPLE rD, rT SRC=n DST=n.
+pub fn instr_audio_resample(rdest: u8, r_src: u8, src_rate: u32, dst_rate: u32) -> Instruction {
+    let mut instr = Instruction::new(OP_AUDIO_RESAMPLE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_resample_rates(src_rate, dst_rate);
+    instr
+}
+
+/// AUDIO_FILTER rD, rX, rB [MODE=FIR].
+pub fn instr_audio_filter(rdest: u8, r_x: u8, r_b: u8, mode: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_AUDIO_FILTER, 0, rdest, r_x, r_b, 0xFF);
+    instr.set_filter_mode(mode);
+    instr
+}
+
+/// AUDIO_WINDOW rD, rT [TYPE=HANN|HAMMING].
+pub fn instr_audio_window(rdest: u8, r_src: u8, wtype: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_AUDIO_WINDOW, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_window_type(wtype);
     instr
 }
 
@@ -4052,6 +4171,112 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_attn_sparse(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, parse_reg(parts[4])?, metric, topk))
         }
+        "VAD_DETECT" => {
+            // VAD_DETECT rD, rT [MODE=ENERGY|ZCR] (ML parseia, exec veta)
+            if parts.len() < 3 {
+                return Err(anyhow!("VAD_DETECT precisa de rdest, rTensor — ex: VAD_DETECT r1, r0 MODE=ENERGY"));
+            }
+            let mut mode = VAD_MODE_ENERGY;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("MODE=") {
+                    mode = match v {
+                        "ENERGY" | "0" => VAD_MODE_ENERGY,
+                        "ZCR" | "1" => VAD_MODE_ZCR,
+                        "ML" | "2" => VAD_MODE_ML,
+                        _ => return Err(anyhow!("VAD_DETECT MODE '{}' inválido (use ENERGY/ZCR)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("VAD_DETECT token desconhecido '{}' (use MODE=)", p));
+                }
+            }
+            Ok(instr_vad_detect(parse_reg(parts[1])?, parse_reg(parts[2])?, mode))
+        }
+        "STREAM_MERGE" => {
+            // STREAM_MERGE rD, rA, rB GAIN=x [N_STREAMS=n]
+            if parts.len() < 4 {
+                return Err(anyhow!("STREAM_MERGE precisa de rdest, rA, rB e GAIN= — ex: STREAM_MERGE r6, r5, r5 GAIN=0.5"));
+            }
+            let (mut gain, mut has_gain, mut n_streams) = (0.0f32, false, 0u16);
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("GAIN=") {
+                    gain = v.parse::<f32>().map_err(|_| anyhow!("STREAM_MERGE GAIN inválido '{}'", p))?;
+                    has_gain = true;
+                } else if let Some(v) = up.strip_prefix("N_STREAMS=") {
+                    n_streams = v.parse::<u16>().map_err(|_| anyhow!("STREAM_MERGE N_STREAMS inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("STREAM_MERGE token desconhecido '{}' (use GAIN=/N_STREAMS=)", p));
+                }
+            }
+            if !has_gain {
+                return Err(anyhow!("STREAM_MERGE precisa de GAIN= — ex: STREAM_MERGE r6, r5, r5 GAIN=0.5"));
+            }
+            Ok(instr_stream_merge(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, gain, n_streams))
+        }
+        "AUDIO_RESAMPLE" => {
+            // AUDIO_RESAMPLE rD, rT SRC=n DST=n (ambos exigidos)
+            if parts.len() < 3 {
+                return Err(anyhow!("AUDIO_RESAMPLE precisa de rdest, rTensor, SRC= e DST= — ex: AUDIO_RESAMPLE r2, r0 SRC=24000 DST=16000"));
+            }
+            let (mut src, mut dst, mut has_src, mut has_dst) = (0u32, 0u32, false, false);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("SRC=") {
+                    src = v.parse::<u32>().map_err(|_| anyhow!("AUDIO_RESAMPLE SRC inválido '{}'", p))?;
+                    has_src = true;
+                } else if let Some(v) = up.strip_prefix("DST=") {
+                    dst = v.parse::<u32>().map_err(|_| anyhow!("AUDIO_RESAMPLE DST inválido '{}'", p))?;
+                    has_dst = true;
+                } else {
+                    return Err(anyhow!("AUDIO_RESAMPLE token desconhecido '{}' (use SRC=/DST=)", p));
+                }
+            }
+            if !has_src || !has_dst {
+                return Err(anyhow!("AUDIO_RESAMPLE precisa de SRC= e DST= — ex: AUDIO_RESAMPLE r2, r0 SRC=24000 DST=16000"));
+            }
+            Ok(instr_audio_resample(parse_reg(parts[1])?, parse_reg(parts[2])?, src, dst))
+        }
+        "AUDIO_FILTER" => {
+            // AUDIO_FILTER rD, rX, rB [MODE=FIR] (IIR parseia, exec veta)
+            if parts.len() < 4 {
+                return Err(anyhow!("AUDIO_FILTER precisa de rdest, rX, rB — ex: AUDIO_FILTER r5, r3, r4 MODE=FIR"));
+            }
+            let mut mode = FILTER_MODE_FIR;
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("MODE=") {
+                    mode = match v {
+                        "FIR" | "0" => FILTER_MODE_FIR,
+                        "IIR" | "1" => FILTER_MODE_IIR,
+                        _ => return Err(anyhow!("AUDIO_FILTER MODE '{}' inválido (use FIR)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("AUDIO_FILTER token desconhecido '{}' (use MODE=)", p));
+                }
+            }
+            Ok(instr_audio_filter(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, mode))
+        }
+        "AUDIO_WINDOW" => {
+            // AUDIO_WINDOW rD, rT [TYPE=HANN|HAMMING]
+            if parts.len() < 3 {
+                return Err(anyhow!("AUDIO_WINDOW precisa de rdest, rTensor — ex: AUDIO_WINDOW r3, r2 TYPE=HANN"));
+            }
+            let mut wtype = WINDOW_HANN;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("TYPE=") {
+                    wtype = match v {
+                        "HANN" | "0" => WINDOW_HANN,
+                        "HAMMING" | "1" => WINDOW_HAMMING,
+                        _ => return Err(anyhow!("AUDIO_WINDOW TYPE '{}' inválido (use HANN/HAMMING)", p)),
+                    };
+                } else {
+                    return Err(anyhow!("AUDIO_WINDOW token desconhecido '{}' (use TYPE=)", p));
+                }
+            }
+            Ok(instr_audio_window(parse_reg(parts[1])?, parse_reg(parts[2])?, wtype))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -5661,6 +5886,59 @@ mod tests {
         assert!(assemble("ATTN_SPARSE r3, r0, r1").is_err());
         assert!(assemble("ATTN_SPARSE r3, r0, r1, r2 METRIC=COSINE").is_err());
         assert!(assemble("ATTN_SPARSE r3, r0, r1, r2 FOO=1").is_err());
+    }
+
+    // ---- RFC-0031: DSP de áudio -----------------------------------------
+
+    #[test]
+    fn test_rfc0031_ctor_roundtrip() {
+        let v = instr_vad_detect(1, 0, VAD_MODE_ZCR);
+        assert_eq!(v.opcode, OP_VAD_DETECT);
+        assert_eq!(v.vad_mode(), VAD_MODE_ZCR);
+        let d = Instruction::decode(&v.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "VAD_DETECT");
+        let m = instr_stream_merge(6, 5, 5, 0.5, 0);
+        assert_eq!(m.opcode, OP_STREAM_MERGE);
+        assert_eq!(m.merge_params(), (0.5, 0, 0));
+        let d = Instruction::decode(&m.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "STREAM_MERGE");
+        let r = instr_audio_resample(2, 0, 24000, 16000);
+        assert_eq!(r.opcode, OP_AUDIO_RESAMPLE);
+        assert_eq!(r.resample_rates(), (24000, 16000));
+        let d = Instruction::decode(&r.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "AUDIO_RESAMPLE");
+        let f = instr_audio_filter(5, 3, 4, FILTER_MODE_FIR);
+        assert_eq!(f.opcode, OP_AUDIO_FILTER);
+        assert_eq!(f.filter_mode(), FILTER_MODE_FIR);
+        let d = Instruction::decode(&f.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "AUDIO_FILTER");
+        let w = instr_audio_window(3, 2, WINDOW_HAMMING);
+        assert_eq!(w.opcode, OP_AUDIO_WINDOW);
+        assert_eq!(w.window_type(), WINDOW_HAMMING);
+        let d = Instruction::decode(&w.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "AUDIO_WINDOW");
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("VAD_DETECT r1, r0 MODE=ZCR").unwrap();
+        assert_eq!(prog[0].vad_mode(), VAD_MODE_ZCR);
+        let prog = assemble("VAD_DETECT r1, r0").unwrap();
+        assert_eq!(prog[0].vad_mode(), VAD_MODE_ENERGY);
+        let prog = assemble("STREAM_MERGE r6, r5, r5 GAIN=0.5 N_STREAMS=17").unwrap();
+        assert_eq!(prog[0].merge_params(), (0.5, 17, 0));
+        let prog = assemble("AUDIO_RESAMPLE r2, r0 SRC=24000 DST=16000").unwrap();
+        assert_eq!(prog[0].resample_rates(), (24000, 16000));
+        let prog = assemble("AUDIO_FILTER r5, r3, r4 MODE=FIR").unwrap();
+        assert_eq!(prog[0].filter_mode(), FILTER_MODE_FIR);
+        let prog = assemble("AUDIO_WINDOW r3, r2 TYPE=HAMMING").unwrap();
+        assert_eq!(prog[0].window_type(), WINDOW_HAMMING);
+        assert!(assemble("VAD_DETECT r1").is_err());
+        assert!(assemble("VAD_DETECT r1, r0 MODE=FOO").is_err());
+        assert!(assemble("STREAM_MERGE r6, r5, r5").is_err());
+        assert!(assemble("STREAM_MERGE r6, r5, r5 GAIN=0.5 FOO=1").is_err());
+        assert!(assemble("AUDIO_RESAMPLE r2, r0 SRC=24000").is_err());
+        assert!(assemble("AUDIO_FILTER r5, r3").is_err());
+        assert!(assemble("AUDIO_FILTER r5, r3, r4 MODE=FOO").is_err());
+        assert!(assemble("AUDIO_WINDOW r3").is_err());
+        assert!(assemble("AUDIO_WINDOW r3, r2 TYPE=FOO").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------
