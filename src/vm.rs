@@ -40,6 +40,7 @@ use crate::opcodes::{
     OP_SORT, OP_TOPK, OP_ARGMAX, OP_REDUCE, OP_BROADCAST, OP_PAD, OP_TILE,
     OP_TRANSPOSE, SORT_ASC, SORT_DESC, REDUCE_SUM, REDUCE_MEAN, REDUCE_MAX,
     REDUCE_MIN, REDUCE_PROD,
+    OP_SOFTMAX, OP_GELU, OP_SIGMOID, OP_TANH, OP_RELU, OP_EXP, OP_LOG, OP_CLIP,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -145,6 +146,14 @@ pub struct VmStats {
     pub pad_execs: u64,
     pub tile_execs: u64,
     pub transpose_execs: u64,
+    pub softmax_execs: u64,
+    pub gelu_execs: u64,
+    pub sigmoid_execs: u64,
+    pub tanh_execs: u64,
+    pub relu_execs: u64,
+    pub exp_execs: u64,
+    pub log_execs: u64,
+    pub clip_execs: u64,
     pub start_ns: u64,
 }
 
@@ -1203,6 +1212,44 @@ impl Vm {
             }
             OP_TRANSPOSE => {
                 self.exec_transpose(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SOFTMAX => {
+                self.exec_softmax(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_GELU => {
+                self.exec_unary(ctx_id, instr, crate::activations::gelu, "GELU")?;
+                self.stats.gelu_execs += 1;
+                Ok(true)
+            }
+            OP_SIGMOID => {
+                self.exec_unary(ctx_id, instr, crate::activations::sigmoid, "SIGMOID")?;
+                self.stats.sigmoid_execs += 1;
+                Ok(true)
+            }
+            OP_TANH => {
+                self.exec_unary(ctx_id, instr, f32::tanh, "TANH")?;
+                self.stats.tanh_execs += 1;
+                Ok(true)
+            }
+            OP_RELU => {
+                self.exec_unary(ctx_id, instr, |x: f32| x.max(0.0), "RELU")?;
+                self.stats.relu_execs += 1;
+                Ok(true)
+            }
+            OP_EXP => {
+                self.exec_unary(ctx_id, instr, f32::exp, "EXP")?;
+                self.stats.exp_execs += 1;
+                Ok(true)
+            }
+            OP_LOG => {
+                self.exec_unary(ctx_id, instr, f32::ln, "LOG")?;
+                self.stats.log_execs += 1;
+                Ok(true)
+            }
+            OP_CLIP => {
+                self.exec_clip(ctx_id, instr)?;
                 Ok(true)
             }
             OP_FOREST => {
@@ -4825,6 +4872,110 @@ impl Vm {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // RFC-0028: ativações (0x3C-0x43). Núcleo em activations.rs; aqui só
+    // leitura/escrita de tensores (guards uniformes) e dispatch.
+    // -----------------------------------------------------------------------
+
+    /// Op elementar unário rD, rT em tensor NOVO (f: total sobre f32).
+    fn exec_unary(&mut self, ctx_id: u64, instr: &Instruction, f: fn(f32) -> f32, name: &str) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("{} precisa de rdest e rTensor (0xFF não é registrador)", name));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (shape, data) = self.read_dense_f32(t_addr, name)?;
+        let out: Vec<f32> = data.iter().map(|&x| f(x)).collect();
+        let out_addr = self.memory.alloc_tensor(&shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        log_debug("unary", &format!("ctx {} {} 0x{:x}{:?} -> 0x{:x}", ctx_id, name, t_addr, shape, out_addr));
+        Ok(())
+    }
+
+    /// SOFTMAX rD, rT [AXIS] [TEMP] — normalização estável por lane em
+    /// tensor NOVO. TEMP NaN/<=0 veta (+inf = uniforme, documentado).
+    fn exec_softmax(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("SOFTMAX precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (axis_p, temp) = instr.softmax_params();
+        if temp.is_nan() || temp <= 0.0 {
+            return Err(anyhow!("SOFTMAX: TEMP={} inválido (> 0 ou +inf)", temp));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "SOFTMAX")?;
+        if shape.is_empty() {
+            return Err(anyhow!("SOFTMAX: escalar não tem eixo"));
+        }
+        let axis = if axis_p == 0xFF { shape.len() - 1 } else { axis_p as usize };
+        let (outer, dim, inner) = Self::axis_decomp(&shape, axis)
+            .ok_or_else(|| anyhow!("SOFTMAX: AXIS {} fora do rank {}", axis, shape.len()))?;
+        let mut out = data.clone();
+        for o in 0..outer {
+            for i in 0..inner {
+                let mut lane = vec![0.0f32; dim];
+                for k in 0..dim {
+                    lane[k] = out[o * dim * inner + k * inner + i];
+                }
+                crate::activations::softmax_lane(&mut lane, temp);
+                for (k, v) in lane.iter().enumerate() {
+                    out[o * dim * inner + k * inner + i] = *v;
+                }
+            }
+        }
+        let out_addr = self.memory.alloc_tensor(&shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.softmax_execs += 1;
+        log_debug("softmax", &format!("ctx {} SOFTMAX 0x{:x}{:?} AXIS={} TEMP={} -> 0x{:x}", ctx_id, t_addr, shape, axis, temp, out_addr));
+        Ok(())
+    }
+
+    /// CLIP rD, rT MIN=x MAX=x — clamp em tensor NOVO. Bounds finitos e
+    /// min<=max, senão Err (`clamp` entraria em pânico com NaN).
+    fn exec_clip(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("CLIP precisa de rdest e rTensor (0xFF não é registrador)"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (min, max) = instr.clip_params();
+        if !min.is_finite() || !max.is_finite() {
+            return Err(anyhow!("CLIP: bounds não-finitos (min={}, max={})", min, max));
+        }
+        if min > max {
+            return Err(anyhow!("CLIP: MIN={} > MAX={} (janela invertida)", min, max));
+        }
+        let (shape, data) = self.read_dense_f32(t_addr, "CLIP")?;
+        let out: Vec<f32> = data.iter().map(|&x| x.clamp(min, max)).collect();
+        let out_addr = self.memory.alloc_tensor(&shape, crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.clip_execs += 1;
+        log_debug("clip", &format!("ctx {} CLIP 0x{:x}{:?} [{},{}] -> 0x{:x}", ctx_id, t_addr, shape, min, max, out_addr));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -6978,6 +7129,182 @@ mod tests {
         let stats = vm.run().unwrap();
         assert_eq!((stats.sort_execs, stats.topk_execs, stats.argmax_execs, stats.reduce_execs), (1, 1, 1, 1));
         assert_eq!((stats.broadcast_execs, stats.pad_execs, stats.tile_execs, stats.transpose_execs), (1, 1, 1, 1));
+    }
+
+    // ---- RFC-0028: ativações ------------------------------------------
+
+    #[test]
+    fn test_rfc0028_unary_goldens() {
+        use crate::opcodes::{instr_clip, instr_exp, instr_gelu, instr_log, instr_relu, instr_sigmoid, instr_tanh};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(80), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[4], &[0.0, 1.0, -1.0, 2.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0)]);
+        let rd = |vm: &Vm, r: u8| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, 4).unwrap();
+        let close = |got: &[f32], exp: &[f32], eps: f32| {
+            for (g, e) in got.iter().zip(exp.iter()) {
+                assert!((g - e).abs() <= eps, "got {:?} exp {:?} eps {}", got, exp, eps);
+            }
+        };
+        vm.step_instruction(cid, &instr_gelu(1, 0)).unwrap();
+        close(&rd(&vm, 1), &[0.0, 0.8413447, -0.1586553, 1.9544997], 1e-5);
+        vm.step_instruction(cid, &instr_sigmoid(2, 0)).unwrap();
+        close(&rd(&vm, 2), &[0.5, 0.7310586, 0.2689414, 0.8807971], 1e-6);
+        vm.step_instruction(cid, &instr_tanh(3, 0)).unwrap();
+        close(&rd(&vm, 3), &[0.0, 0.7615942, -0.7615942, 0.9640276], 1e-6);
+        vm.step_instruction(cid, &instr_relu(4, 0)).unwrap();
+        assert_eq!(rd(&vm, 4), vec![0.0, 1.0, 0.0, 2.0]);
+        // -0.0 normaliza para +0.0 (bits zero).
+        let an = rfc0004_f32(&mut vm, &[1], &[-0.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, an).unwrap();
+        vm.step_instruction(cid, &instr_relu(6, 5)).unwrap();
+        let r6 = rfc0005_reg_u64(&vm, cid, 6) as u128;
+        assert_eq!(vm.memory.read(r6, 4).unwrap(), vec![0u8; 4]);
+        vm.step_instruction(cid, &instr_exp(7, 0)).unwrap();
+        close(&rd(&vm, 7), &[1.0, 2.7182818, 0.3678795, 7.389056], 1e-5);
+        let al = rfc0004_f32(&mut vm, &[3], &[1.0, 2.7182818, 0.5]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, al).unwrap();
+        vm.step_instruction(cid, &instr_log(8, 5)).unwrap();
+        let r8 = rfc0005_reg_u64(&vm, cid, 8) as u128;
+        close(&vm.memory.read_f32_tensor(r8, 3).unwrap(), &[0.0, 1.0, -0.6931472], 1e-5);
+        vm.step_instruction(cid, &instr_clip(9, 0, -0.5, 1.5)).unwrap();
+        assert_eq!(rd(&vm, 9), vec![0.0, 1.0, -0.5, 1.5]);
+        // NaN: GELU/SIGMOID/TANH/EXP/LOG propagam; RELU => +0.0; CLIP => max.
+        let anan = rfc0004_f32(&mut vm, &[1], &[f32::NAN]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, anan).unwrap();
+        vm.step_instruction(cid, &instr_gelu(1, 5)).unwrap();
+        assert!(rd(&vm, 1)[0].is_nan());
+        vm.step_instruction(cid, &instr_sigmoid(1, 5)).unwrap();
+        assert!(rd(&vm, 1)[0].is_nan());
+        vm.step_instruction(cid, &instr_tanh(1, 5)).unwrap();
+        assert!(rd(&vm, 1)[0].is_nan());
+        vm.step_instruction(cid, &instr_relu(1, 5)).unwrap();
+        assert_eq!(vm.memory.read(rfc0005_reg_u64(&vm, cid, 1) as u128, 4).unwrap(), vec![0u8; 4]);
+        vm.step_instruction(cid, &instr_exp(1, 5)).unwrap();
+        assert!(rd(&vm, 1)[0].is_nan());
+        vm.step_instruction(cid, &instr_log(1, 5)).unwrap();
+        assert!(rd(&vm, 1)[0].is_nan());
+        vm.step_instruction(cid, &instr_clip(1, 5, 0.0, 1.0)).unwrap();
+        let rc = rfc0005_reg_u64(&vm, cid, 1) as u128;
+        assert!(vm.memory.read_f32_tensor(rc, 1).unwrap()[0].is_nan());
+        // Erros: esparso, meta ausente, não-F32, rdest 0xFF, bounds.
+        let asp = vm.memory.alloc_sparse_tensor(&[2, 2], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, asp).unwrap();
+        assert!(vm.step_instruction(cid, &instr_gelu(1, 5)).is_err());
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, 0xdead).unwrap();
+        assert!(vm.step_instruction(cid, &instr_exp(1, 5)).is_err());
+        let af = vm.memory.alloc_tensor(&[4], crate::memory::DType::F16).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(5, af).unwrap();
+        assert!(vm.step_instruction(cid, &instr_tanh(1, 5)).is_err());
+        assert!(vm.step_instruction(cid, &instr_relu(0xFF, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_clip(1, 0, 2.0, 1.0)).is_err());
+        let mut bad = instr_clip(1, 0, 0.0, 1.0);
+        bad.set_clip_params(f32::NAN, 1.0);
+        assert!(vm.step_instruction(cid, &bad).is_err());
+        assert_eq!(vm.stats.gelu_execs, 2);
+        assert_eq!(vm.stats.sigmoid_execs, 2);
+        assert_eq!(vm.stats.tanh_execs, 2);
+        assert_eq!(vm.stats.relu_execs, 3);
+        assert_eq!(vm.stats.exp_execs, 2);
+        assert_eq!(vm.stats.log_execs, 2);
+        assert_eq!(vm.stats.clip_execs, 2);
+    }
+
+    #[test]
+    fn test_rfc0028_softmax() {
+        use crate::opcodes::instr_softmax;
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[3], &[1.0, 2.0, 3.0]);
+        let au = rfc0004_f32(&mut vm, &[4], &[0.0; 4]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0), (1, au)]);
+        let rd = |vm: &Vm, r: u8, n: usize| vm.memory.read_f32_tensor(rfc0005_reg_u64(vm, cid, r) as u128, n).unwrap();
+        // Vetor conhecido + uniforme exato.
+        vm.step_instruction(cid, &instr_softmax(2, 0, 0xFF, 1.0)).unwrap();
+        let got = rd(&vm, 2, 3);
+        assert!((got[0] - 0.0900306).abs() < 1e-5, "{:?}", got);
+        assert!((got[1] - 0.2447285).abs() < 1e-5, "{:?}", got);
+        assert!((got[2] - 0.6652410).abs() < 1e-5, "{:?}", got);
+        vm.step_instruction(cid, &instr_softmax(3, 1, 0xFF, 1.0)).unwrap();
+        assert_eq!(rd(&vm, 3, 4), vec![0.25; 4]);
+        // Temperatura: afia e achata.
+        vm.step_instruction(cid, &instr_softmax(4, 0, 0xFF, 0.1)).unwrap();
+        assert!(rd(&vm, 4, 3)[2] > 0.999);
+        vm.step_instruction(cid, &instr_softmax(5, 0, 0xFF, 100.0)).unwrap();
+        for v in rd(&vm, 5, 3) {
+            assert!((v - 1.0 / 3.0).abs() < 0.01);
+        }
+        // Por eixo: [2,2] AXIS=0 normaliza colunas.
+        let a2 = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, a2).unwrap();
+        vm.step_instruction(cid, &instr_softmax(7, 6, 0, 1.0)).unwrap();
+        let got7 = rd(&vm, 7, 4);
+        assert!((got7[0] - 0.1192029).abs() < 1e-5, "{:?}", got7);
+        assert!((got7[1] - 0.1192029).abs() < 1e-5, "{:?}", got7);
+        assert!((got7[2] - 0.8807971).abs() < 1e-5, "{:?}", got7);
+        assert!((got7[3] - 0.8807971).abs() < 1e-5, "{:?}", got7);
+        // NaN envenena a lane (documentado).
+        let an = rfc0004_f32(&mut vm, &[2], &[1.0, f32::NAN]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, an).unwrap();
+        vm.step_instruction(cid, &instr_softmax(7, 6, 0xFF, 1.0)).unwrap();
+        assert!(rd(&vm, 7, 2).iter().all(|x| x.is_nan()));
+        // Erros: TEMP 0/neg/NaN, eixo fora, esparso.
+        assert!(vm.step_instruction(cid, &instr_softmax(2, 0, 0xFF, 0.0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_softmax(2, 0, 0xFF, -1.0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_softmax(2, 0, 0xFF, f32::NAN)).is_err());
+        assert!(vm.step_instruction(cid, &instr_softmax(2, 0, 5, 1.0)).is_err());
+        assert_eq!(vm.stats.softmax_execs, 6);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0028_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        let src = r#"
+            TENSOR r0 2 2 f32 FILL=0.5
+            SIGMOID r1, r0
+            TANH r2, r0
+            RELU r3, r0
+            GELU r4, r0
+            EXP r5, r0
+            LOG r6, r5
+            SOFTMAX r7, r0 AXIS=1
+            CLIP r8, r0 MIN=0.0 MAX=0.4
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.sigmoid_execs, stats.tanh_execs, stats.relu_execs, stats.gelu_execs), (1, 1, 1, 1));
+        assert_eq!((stats.exp_execs, stats.log_execs, stats.softmax_execs, stats.clip_execs), (1, 1, 1, 1));
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let rd = |r: u8| vm.memory.read_f32_tensor(ctx.reg(r).unwrap(), 4).unwrap();
+        for v in rd(1) {
+            assert!((v - 0.6224594).abs() < 1e-6, "sigmoid(0.5)");
+        }
+        for v in rd(2) {
+            assert!((v - 0.4621172).abs() < 1e-6, "tanh(0.5)");
+        }
+        assert_eq!(rd(3), vec![0.5; 4]);
+        for v in rd(4) {
+            assert!((v - 0.3457312).abs() < 1e-5, "gelu(0.5)");
+        }
+        for v in rd(6) {
+            assert!((v - 0.5).abs() < 1e-6, "ln(exp(0.5))");
+        }
+        // Lanes de 2 (eixo 1 de [2,2]): softmax([0.5,0.5]) = [0.5,0.5].
+        assert_eq!(rd(7), vec![0.5; 4]);
+        assert_eq!(rd(8), vec![0.4; 4]);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0028_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/activation_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.sigmoid_execs, stats.tanh_execs, stats.relu_execs, stats.gelu_execs), (1, 1, 1, 1));
+        assert_eq!((stats.exp_execs, stats.log_execs, stats.softmax_execs, stats.clip_execs), (1, 1, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

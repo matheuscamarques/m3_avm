@@ -241,7 +241,7 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x2E` | `SLICE` | 32 | IMPL | S | Flat [start,len) => [1,len] (RFC-0019) |
 | `0x2F` | `CONCAT` | 32 | IMPL | S | N-D axis assembly (RFC-0024) |
 
-### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — PARTIAL (0x30-0x37 IMPL, resto DRAFT), 32B
+### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — PARTIAL (0x30-0x38 + 0x3C-0x43 IMPL; 0x39-0x3B DRAFT), 32B
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
@@ -257,14 +257,14 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x39` | `KV_COMPRESS` | 32 | DRAFT | F2 | KV_CACHE |
 | `0x3A` | `FLASH_ATTN` | 32 | DRAFT | F2 | KV_CACHE; IO-aware |
 | `0x3B` | `ATTN_SPARSE` | 32 | DRAFT | F2 | KV_CACHE; top-k via DISTANCE (T4) |
-| `0x3C` | `SOFTMAX` | 32 | DRAFT | S | Axis+temperature |
-| `0x3D` | `GELU` | 32 | DRAFT | S | Elementwise |
-| `0x3E` | `SIGMOID` | 32 | DRAFT | S | Elementwise |
-| `0x3F` | `TANH` | 32 | DRAFT | S | Elementwise |
-| `0x40` | `RELU` | 32 | DRAFT | S | Elementwise |
-| `0x41` | `EXP` | 32 | DRAFT | S | Elementwise |
-| `0x42` | `LOG` | 32 | DRAFT | S | Elementwise |
-| `0x43` | `CLIP` | 32 | DRAFT | S | min/max |
+| `0x3C` | `SOFTMAX` | 32 | IMPL | S | Stable, temp-explicit (RFC-0028) |
+| `0x3D` | `GELU` | 32 | IMPL | S | Exact erf (RFC-0028) |
+| `0x3E` | `SIGMOID` | 32 | IMPL | S | Elementwise (RFC-0028) |
+| `0x3F` | `TANH` | 32 | IMPL | S | Elementwise (RFC-0028) |
+| `0x40` | `RELU` | 32 | IMPL | S | max(x,+0) (RFC-0028) |
+| `0x41` | `EXP` | 32 | IMPL | S | Elementwise (RFC-0028) |
+| `0x42` | `LOG` | 32 | IMPL | S | IEEE, no trap (RFC-0028) |
+| `0x43` | `CLIP` | 32 | IMPL | S | Finite bounds (RFC-0028) |
 
 ### 3.6 Full-duplex audio (`0x44-0x49`) — DRAFT, 32B
 

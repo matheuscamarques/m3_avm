@@ -155,6 +155,15 @@ pub const CAST_DST_U8: u8 = 4;
 pub const QUANTIZE_Q4_0: u8 = 4;
 pub const QUANTIZE_Q8_0: u8 = 8;
 // RFC-0027: forma (0x30-0x37, v1.9; resto de 0x30-0x43 nas partes 2-3).
+// RFC-0028: ativações (0x3C-0x43, v1.10; 0x39-0x3B na parte 3).
+pub const OP_SOFTMAX: u8 = 0x3C; // softmax estável por eixo + temperatura
+pub const OP_GELU: u8 = 0x3D; // gelu exato (erf A&S)
+pub const OP_SIGMOID: u8 = 0x3E; // 1/(1+e^-x)
+pub const OP_TANH: u8 = 0x3F; // tangente hiperbólica
+pub const OP_RELU: u8 = 0x40; // max(x,+0)
+pub const OP_EXP: u8 = 0x41; // exponencial
+pub const OP_LOG: u8 = 0x42; // logaritmo natural (IEEE)
+pub const OP_CLIP: u8 = 0x43; // clamp [min,max]
 pub const OP_SORT: u8 = 0x30; // ordenação por eixo (NaN=+inf, empate=menor idx)
 pub const OP_TOPK: u8 = 0x31; // top-k fundido [vals|idx] (pack DISTANCE)
 pub const OP_ARGMAX: u8 = 0x32; // índices como f32 (ignora NaN, cf. maxNum)
@@ -540,6 +549,14 @@ impl Instruction {
             OP_PAD => "PAD",
             OP_TILE => "TILE",
             OP_TRANSPOSE => "TRANSPOSE",
+            OP_SOFTMAX => "SOFTMAX",
+            OP_GELU => "GELU",
+            OP_SIGMOID => "SIGMOID",
+            OP_TANH => "TANH",
+            OP_RELU => "RELU",
+            OP_EXP => "EXP",
+            OP_LOG => "LOG",
+            OP_CLIP => "CLIP",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -1944,6 +1961,83 @@ pub fn instr_transpose(rdest: u8, r_src: u8, perm: &[u8]) -> Instruction {
     let mut instr = Instruction::new(OP_TRANSPOSE, 0, rdest, r_src, 0xFF, 0xFF);
     instr.set_transpose_perm(perm.len().min(255) as u8, arr);
     instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0028: SOFTMAX (0x3C) + ativações (0x3D-0x43). Semântica IEEE total
+// em activations.rs; aqui só codificação.
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// SOFTMAX: payload[0]=axis (0xFF=último), [1..5]=temp f32 LE.
+    pub fn softmax_params(&self) -> (u8, f32) {
+        let mut bt = [0u8; 4];
+        bt.copy_from_slice(&self.payload[1..5]);
+        (self.payload[0], f32::from_le_bytes(bt))
+    }
+
+    pub fn set_softmax_params(&mut self, axis: u8, temp: f32) {
+        self.payload[0] = axis;
+        self.payload[1..5].copy_from_slice(&temp.to_le_bytes());
+    }
+
+    /// CLIP: payload[0..4]=min f32 LE, [4..8]=max f32 LE (ambos exigidos).
+    pub fn clip_params(&self) -> (f32, f32) {
+        let mut bn = [0u8; 4];
+        bn.copy_from_slice(&self.payload[0..4]);
+        let mut bx = [0u8; 4];
+        bx.copy_from_slice(&self.payload[4..8]);
+        (f32::from_le_bytes(bn), f32::from_le_bytes(bx))
+    }
+
+    pub fn set_clip_params(&mut self, min: f32, max: f32) {
+        self.payload[0..4].copy_from_slice(&min.to_le_bytes());
+        self.payload[4..8].copy_from_slice(&max.to_le_bytes());
+    }
+}
+
+/// SOFTMAX rD, rT [AXIS=n] [TEMP=x] (assembler escreve defaults).
+pub fn instr_softmax(rdest: u8, r_src: u8, axis: u8, temp: f32) -> Instruction {
+    let mut instr = Instruction::new(OP_SOFTMAX, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_softmax_params(axis, temp);
+    instr
+}
+
+/// CLIP rD, rT MIN=x MAX=x.
+pub fn instr_clip(rdest: u8, r_src: u8, min: f32, max: f32) -> Instruction {
+    let mut instr = Instruction::new(OP_CLIP, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_clip_params(min, max);
+    instr
+}
+
+/// GELU rD, rT (sem payload).
+pub fn instr_gelu(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_GELU, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+/// SIGMOID rD, rT (sem payload).
+pub fn instr_sigmoid(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_SIGMOID, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+/// TANH rD, rT (sem payload).
+pub fn instr_tanh(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_TANH, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+/// RELU rD, rT (sem payload).
+pub fn instr_relu(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_RELU, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+/// EXP rD, rT (sem payload).
+pub fn instr_exp(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_EXP, 0, rdest, r_src, 0xFF, 0xFF)
+}
+
+/// LOG rD, rT (sem payload).
+pub fn instr_log(rdest: u8, r_src: u8) -> Instruction {
+    Instruction::new(OP_LOG, 0, rdest, r_src, 0xFF, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -3739,6 +3833,83 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
                 None => Err(anyhow!("TRANSPOSE precisa de AXES= — ex: TRANSPOSE r8, r0 AXES=1x0")),
             }
         }
+        "SOFTMAX" => {
+            // SOFTMAX rD, rT [AXIS=n] [TEMP=x] (defaults: último eixo, 1.0)
+            if parts.len() < 3 {
+                return Err(anyhow!("SOFTMAX precisa de rdest, rTensor — ex: SOFTMAX r7, r0 AXIS=1"));
+            }
+            let (mut axis, mut temp) = (0xFFu8, 1.0f32);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("SOFTMAX AXIS inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("TEMP=") {
+                    temp = v.parse::<f32>().map_err(|_| anyhow!("SOFTMAX TEMP inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("SOFTMAX token desconhecido '{}' (use AXIS=/TEMP=)", p));
+                }
+            }
+            Ok(instr_softmax(parse_reg(parts[1])?, parse_reg(parts[2])?, axis, temp))
+        }
+        "GELU" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("GELU precisa de exatamente rdest, rTensor — ex: GELU r4, r0"));
+            }
+            Ok(instr_gelu(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
+        "SIGMOID" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("SIGMOID precisa de exatamente rdest, rTensor — ex: SIGMOID r1, r0"));
+            }
+            Ok(instr_sigmoid(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
+        "TANH" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("TANH precisa de exatamente rdest, rTensor — ex: TANH r2, r0"));
+            }
+            Ok(instr_tanh(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
+        "RELU" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("RELU precisa de exatamente rdest, rTensor — ex: RELU r3, r0"));
+            }
+            Ok(instr_relu(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
+        "EXP" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("EXP precisa de exatamente rdest, rTensor — ex: EXP r5, r0"));
+            }
+            Ok(instr_exp(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
+        "LOG" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("LOG precisa de exatamente rdest, rTensor — ex: LOG r6, r5"));
+            }
+            Ok(instr_log(parse_reg(parts[1])?, parse_reg(parts[2])?))
+        }
+        "CLIP" => {
+            // CLIP rD, rT MIN=x MAX=x (ambos exigidos: sem default mudo)
+            if parts.len() < 3 {
+                return Err(anyhow!("CLIP precisa de rdest, rTensor, MIN= e MAX= — ex: CLIP r8, r0 MIN=0 MAX=0.4"));
+            }
+            let (mut min, mut max, mut has_min, mut has_max) = (0.0f32, 0.0f32, false, false);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("MIN=") {
+                    min = v.parse::<f32>().map_err(|_| anyhow!("CLIP MIN inválido '{}'", p))?;
+                    has_min = true;
+                } else if let Some(v) = up.strip_prefix("MAX=") {
+                    max = v.parse::<f32>().map_err(|_| anyhow!("CLIP MAX inválido '{}'", p))?;
+                    has_max = true;
+                } else {
+                    return Err(anyhow!("CLIP token desconhecido '{}' (use MIN=/MAX=)", p));
+                }
+            }
+            if !has_min || !has_max {
+                return Err(anyhow!("CLIP precisa de MIN= e MAX= — ex: CLIP r8, r0 MIN=0 MAX=0.4"));
+            }
+            Ok(instr_clip(parse_reg(parts[1])?, parse_reg(parts[2])?, min, max))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -5265,6 +5436,52 @@ mod tests {
         assert!(assemble("TILE r7, r0").is_err());
         assert!(assemble("TRANSPOSE r8, r0").is_err());
         assert!(assemble("TRANSPOSE r8, r0 AXES=1,0").is_err());
+    }
+
+    // ---- RFC-0028: ativações ------------------------------------------------
+
+    #[test]
+    fn test_rfc0028_ctor_roundtrip() {
+        let s = instr_softmax(7, 0, 1, 0.5);
+        assert_eq!(s.opcode, OP_SOFTMAX);
+        assert_eq!(s.softmax_params(), (1, 0.5));
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "SOFTMAX");
+        assert_eq!(d.softmax_params(), (1, 0.5));
+        let g = instr_gelu(4, 0);
+        assert_eq!(g.opcode, OP_GELU);
+        let d = Instruction::decode(&g.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "GELU");
+        for (ctor, name) in [
+            (instr_sigmoid(1, 0), "SIGMOID"),
+            (instr_tanh(2, 0), "TANH"),
+            (instr_relu(3, 0), "RELU"),
+            (instr_exp(5, 0), "EXP"),
+            (instr_log(6, 0), "LOG"),
+        ] {
+            let d = Instruction::decode(&ctor.encode()).unwrap();
+            assert_eq!(d.mnemonic(), name);
+            assert_eq!((d.rdest, d.rsrc1), (ctor.rdest, ctor.rsrc1));
+        }
+        let c = instr_clip(8, 0, 0.0, 0.4);
+        assert_eq!(c.opcode, OP_CLIP);
+        assert_eq!(c.clip_params(), (0.0, 0.4));
+        let d = Instruction::decode(&c.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "CLIP");
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("SOFTMAX r7, r0 AXIS=1 TEMP=0.5").unwrap();
+        assert_eq!(prog[0].softmax_params(), (1, 0.5));
+        let prog = assemble("SOFTMAX r7, r0").unwrap();
+        assert_eq!(prog[0].softmax_params(), (0xFF, 1.0));
+        let prog = assemble("CLIP r8, r0 MIN=0 MAX=0.4").unwrap();
+        assert_eq!(prog[0].clip_params(), (0.0, 0.4));
+        assert!(assemble("SOFTMAX r7").is_err());
+        assert!(assemble("SOFTMAX r7, r0 FOO=1").is_err());
+        assert!(assemble("GELU r4").is_err());
+        assert!(assemble("GELU r4, r0 EXTRA").is_err());
+        assert!(assemble("CLIP r8, r0").is_err());
+        assert!(assemble("CLIP r8, r0 MIN=0").is_err());
+        assert!(assemble("CLIP r8, r0 MIN=0 MAX=0.4 FOO=1").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

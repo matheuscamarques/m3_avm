@@ -64,6 +64,10 @@ harness = false
 name = "shape_bench"
 harness = false
 
+[[bench]]
+name = "activation_bench"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

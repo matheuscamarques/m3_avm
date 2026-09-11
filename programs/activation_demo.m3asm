@@ -1,0 +1,13 @@
+; programs/activation_demo.m3asm — RFC-0028: ativações (0x3C-0x43).
+; Sobre rampa 2x2 de 0.5: unários + SOFTMAX uniforme + CLIP.
+; Contadores verificados em test_rfc0028_demo_runs: 1 cada.
+TENSOR r0 2 2 f32 FILL=0.5
+SIGMOID r1, r0
+TANH r2, r0
+RELU r3, r0
+GELU r4, r0
+EXP r5, r0
+LOG r6, r5
+SOFTMAX r7, r0 AXIS=1
+CLIP r8, r0 MIN=0.0 MAX=0.4
+HALT

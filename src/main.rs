@@ -39,6 +39,7 @@ pub mod memory_wgpu;
 pub mod asm_emitter;
 pub mod m3bc;
 pub mod arena;
+pub mod activations;
 
 use opcodes::{assemble, Instruction, INSTR_SIZE, OP_HALT, OP_NOP};
 use vm::{Vm, VmConfig};
