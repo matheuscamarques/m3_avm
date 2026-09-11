@@ -296,7 +296,7 @@ O XGBoost classifica a emoção e o tipo da pergunta em ~20ms [META — `FOREST`
 
 | Item | Status real |
 |:---|:---|
-| Biblioteca de fillers PT-BR (30–50 frases) | 🔵 criar conteúdo + armazenamento precisa init multivalor (follow-up RFC-0019, §5.3) |
+| Biblioteca de fillers (30 frases EN nativas) | 🟡 conteúdo redigido (§8); falta assar como tabela (§5.3-1). PT-BR volta após fine-tuning |
 | Classificador de tipo de pergunta | ✅ `FOREST` existe; 🟡 tabelas XGBoost 500×8 (construção: §5.3) + bench de 20ms nunca medido |
 | Sinais FILLER_START/STOP | 🟡 "trivial" com mecanismo certo: `PING` + palavra de controle (§5.1) — **sem kinds novos** |
 | Crossfade de 200ms | ✅ construção com `FILL`+`MUL`+`ADD` (§5.2) — `AUDIO_ALIGN` é alinhamento, não mixagem |
@@ -404,10 +404,274 @@ sobre tons/PCM sintético (`SENSE AUDIO_PCM` ✅ gera frame determinístico)
 | Capacidade | Desbloqueia em |
 |:---|:---|
 | Demo sintética (transição+duração) | Hoje (ISA v1.5) |
-| Filler com voz real | Fase 5 (`DEPFORMER`) + biblioteca (§5.3) |
+| Filler com voz real | Fase 5 (`DEPFORMER`) + biblioteca (§5.3, conteúdo §8) |
 | Sorteio limpo + tabelas fáceis | Fase 4 (`CAST`) + Fase 10 (init multivalor) |
 | Filler no deep path especulativo | Marco 3 (VISÃO Anexo B) |
 | Filler cross-GPU sem contenção | Fase 9 (placement) |
+
+---
+
+## §8. Biblioteca de fillers — English nativo
+
+**Decisão registrada:** PersonaPlex é treinado em inglês; gerar filler em
+PT-BR no Depformer inglês sairia com sotaque carregado ou errado.
+Qualquer teste de voz é **em inglês** até o fine-tuning PT-BR (limitação
+"sotaque" em `EXPERIENCIA_PREMIUM.md`). PT-BR volta como segunda
+biblioteca após o fine-tuning — a arquitetura é agnóstica a idioma, só
+a tabela assada troca (§5.3, caminho 1).
+
+**Correção de contagem:** o rascunho diz `FILLER_COUNT .equ 32`, mas a
+biblioteca tem **30 frases** (5+5+4+4+4+4+4). Os offsets do seletor
+conferem com 30 (tech 0–4, personal 5–9, math 10–13, phil 14–17,
+emo 18–21, long 22–25, trans 26–29). Valor correto: **30**.
+
+```asm
+.data                                                     ; 🔴 assembler (tabela assada offline, §5.3)
+    ; ============================================================
+    ; FILLER LIBRARY — English (native PersonaPlex)
+    ; Organized by question type and emotional context
+    ; ============================================================
+
+    ; --- Type 0: TECHNICAL / COMPLEX (IDs 0-4) ---
+    FILLER_TECH_01   .str "Hmm, let me think about that..."
+    FILLER_TECH_02   .str "Okay, that's a good one..."
+    FILLER_TECH_03   .str "Alright, let me organize this..."
+    FILLER_TECH_04   .str "Good question... hold on..."
+    FILLER_TECH_05   .str "Let me work through this..."
+
+    ; --- Type 1: PERSONAL / CASUAL (IDs 5-9) ---
+    FILLER_PERS_01   .str "Oh, interesting..."
+    FILLER_PERS_02   .str "Hmm, let me think..."
+    FILLER_PERS_03   .str "Ah, good question..."
+    FILLER_PERS_04   .str "Yeah, I get what you mean..."
+    FILLER_PERS_05   .str "Right, right..."
+
+    ; --- Type 2: MATH / CALCULATION (IDs 10-13) ---
+    FILLER_MATH_01   .str "Hold on, let me calculate..."
+    FILLER_MATH_02   .str "Okay, let me work this out..."
+    FILLER_MATH_03   .str "Hmm, let me check the numbers..."
+    FILLER_MATH_04   .str "Alright, give me a sec..."
+
+    ; --- Type 3: PHILOSOPHICAL / OPEN-ENDED (IDs 14-17) ---
+    FILLER_PHIL_01   .str "Hmm, that's a deep one..."
+    FILLER_PHIL_02   .str "Interesting... let me think carefully..."
+    FILLER_PHIL_03   .str "That deserves a thoughtful answer..."
+    FILLER_PHIL_04   .str "Wow, okay... let me gather my thoughts..."
+
+    ; --- Type 4: EMOTIONAL / SENSITIVE (IDs 18-21) ---
+    FILLER_EMO_01    .str "Hmm... that's a delicate one..."
+    FILLER_EMO_02    .str "I see... let me think about this..."
+    FILLER_EMO_03    .str "Okay... that's important..."
+    FILLER_EMO_04    .str "Hmm, let me take this seriously..."
+
+    ; --- Type 5: LONG PROCESSING >2s (IDs 22-25) ---
+    FILLER_LONG_01   .str "Alright... this is complex..."
+    FILLER_LONG_02   .str "Okay, let me break this down..."
+    FILLER_LONG_03   .str "Hmm, there's a lot here..."
+    FILLER_LONG_04   .str "Let me go step by step..."
+
+    ; --- Type 6: TRANSITION / CONTINUATION (IDs 26-29) ---
+    FILLER_TRANS_01  .str "Okay, so..."
+    FILLER_TRANS_02  .str "Alright, here's the thing..."
+    FILLER_TRANS_03  .str "So, the way I see it..."
+    FILLER_TRANS_04  .str "Right, so basically..."
+
+    FILLER_COUNT     .equ 30   ; corrigido (era 32; §8)
+    FILLER_DURATION  .equ 1500000000    ; 1.5s average
+```
+
+### §8.1 Como o sistema escolhe o filler (alvo)
+
+```asm
+; ============================================================
+; CLASSIFY QUESTION — ~20ms via XGBoost [META — nunca bencheado]
+; ============================================================
+classify_question_type:
+    .param rTranscript, rType                             ; 🔴 assembler
+
+    ; Extract features
+    EMBED rQueryEmb, rTranscript, rBge                    ; ✅-opcode (DIM= 🔴)
+    CONCAT rFeatures, rQueryEmb, rTurnMeta                ; 🟡 0x2F
+
+    ; XGBoost predicts (type, confidence, complexity)
+    FOREST rClassify, rFeatures, rXgb                     ; ✅ (MODE=PROBABILITY 🔴 — usar MEAN/VOTE)
+        TREES=500
+        DEPTH=8
+        MODE=PROBABILITY
+
+    SLICE rType, rClassify, 0, 1        ; 0-6 (type)      ; ✅ (layout de saída: convenção a confirmar na RFC)
+    SLICE rConfidence, rClassify, 1, 2                    ; ✅ (idem)
+    SLICE rComplexity, rClassify, 2, 3                    ; ✅ (idem)
+
+    RET                                                   ; 🔴
+
+; ============================================================
+; SELECT FILLER — Based on type + complexity
+; ============================================================
+select_filler:
+    .param rType, rComplexity, rFillerID                   ; 🔴
+
+    ; If complexity > 0.7, use LONG fillers
+    COMPARE rComplexity, 0.7                              ; 🔴 (inteiro escalado, ex. 7 em escala ×10)
+    IF_GREATER rComplexity, use_long                       ; 🔴 (expansão PRED=GT + IF_EQUAL)
+
+    ; Otherwise, map type to filler group
+    COMPARE rType, 0                    ; TECHNICAL       ; ✅
+    IF_EQUAL rType, use_tech                               ; ✅
+    COMPARE rType, 1                    ; PERSONAL        ; ✅
+    IF_EQUAL rType, use_personal                           ; ✅
+    COMPARE rType, 2                    ; MATH            ; ✅
+    IF_EQUAL rType, use_math                               ; ✅
+    COMPARE rType, 3                    ; PHILOSOPHICAL   ; ✅
+    IF_EQUAL rType, use_phil                               ; ✅
+    COMPARE rType, 4                    ; EMOTIONAL       ; ✅
+    IF_EQUAL rType, use_emotional                          ; ✅
+    JUMP use_transition                 ; default         ; ✅
+
+use_tech:
+    LOADI rFillerID, random(1, 5) + 0                     ; 🔴 expressão (sorteio real: RNG + escada §5.4)
+    RET                                                   ; 🔴
+use_personal:
+    LOADI rFillerID, random(1, 5) + 5                     ; 🔴 (idem)
+    RET                                                   ; 🔴
+use_math:
+    LOADI rFillerID, random(1, 4) + 10                    ; 🔴 (idem)
+    RET                                                   ; 🔴
+use_phil:
+    LOADI rFillerID, random(1, 4) + 14                    ; 🔴 (idem)
+    RET                                                   ; 🔴
+use_emotional:
+    LOADI rFillerID, random(1, 4) + 18                    ; 🔴 (idem)
+    RET                                                   ; 🔴
+use_long:
+    LOADI rFillerID, random(1, 4) + 22                    ; 🔴 (idem)
+    RET                                                   ; 🔴
+use_transition:
+    LOADI rFillerID, random(1, 4) + 26                    ; 🔴 (idem)
+    RET                                                   ; 🔴
+```
+
+> A estrutura de despacho (tabela tipo→faixa de IDs + override por
+> complexidade) é válida e monta com ISA de hoje menos `CONCAT` e o
+> sorteio. O conteúdo (30 frases EN) é o dado de entrada do caminho
+> §5.3-1: assar como tabela offline.
+
+### §8.2 Exemplos de conversa (English, nativo — metas)
+
+**Pergunta técnica complexa:**
+
+```text
+User:  "Can you explain quantum decoherence?"
+
+AI:    "Hmm, let me think about that..."
+       [700ms — Llama-405B processing in parallel]
+
+       "...Okay, so decoherence is the process by which a quantum
+        system loses its quantum properties — superposition and
+        entanglement — through interaction with the environment.
+        Imagine an electron that's in two places at once. The moment
+        it touches anything — an air molecule, a photon of light —
+        that 'which-way' information leaks into the environment.
+        The electron is forced to 'choose' one place. The
+        superposition collapses. That's why quantum computers need
+        extreme isolation: any vibration, any light, any heat
+        destroys the computation. Decoherence is the biggest enemy
+        of quantum computing. Want me to go deeper into any
+        specific aspect?"
+```
+
+**Pergunta filosófica:**
+
+```text
+User:  "What's the meaning of life?"
+
+AI:    "Hmm... that's a deep one..."
+       [1.2s — philosophical question, longer processing]
+
+       "...Let me think carefully. There's no single answer that
+        works for everyone. Some find meaning in relationships,
+        some in creation, some in understanding. The philosopher
+        Susan Wolf argues meaning comes from active engagement
+        with projects of worth. The psychologist Viktor Frankl
+        found meaning through suffering, love, and work.
+        Honestly? I think the question itself is part of the
+        answer — the fact that you're asking means you're already
+        searching, and that search is meaningful. What prompted
+        the question?"
+```
+
+**Pergunta emocional:**
+
+```text
+User:  "I think I might be depressed."
+
+AI:    "Hmm... that's a delicate one..."
+       [800ms]
+
+       "...I see. Thank you for telling me. That takes courage.
+        I'm not a therapist, so I won't pretend to diagnose you —
+        but I hear you. What you're feeling is real, and it's
+        worth taking seriously. Can you tell me more about
+        what's been going on? And if you're in crisis, please
+        reach out to a professional — I can share resources if
+        you want."
+```
+
+> Nota de segurança (trabalho futuro): o comportamento de *resposta*
+> em crise (não-diagnóstico, oferta de recursos, escalação) precisa de
+> política própria — documento de safety futuro, fora do escopo deste
+> desenho. A camada de filler (frases EMO 18–21, tom de-escalador) já
+> segue esse princípio e independe da política.
+
+**Processamento longo (pergunta multipartes):**
+
+```text
+User:  "Explain the difference between Mamba, Transformer, and
+        SSM, when to use each, and how they relate to linear
+        attention."
+
+AI:    "Alright... this is complex..."
+       [500ms]
+       "Okay, let me break this down..."
+       [500ms]
+       "Hmm, there's a lot here..."
+       [500ms]
+       "...Right. So let's go step by step. First, SSM stands for
+        State Space Model — it's a mathematical framework. Mamba
+        is a specific SSM implementation with selective scan.
+        Transformer is a different architecture based on attention.
+        Linear attention is an approximation of Transformer
+        attention that makes it O(N) instead of O(N²)..."
+```
+
+Total filler time: 1.5s. Total processing: 2s. User perception: natural thought.
+
+### §8.3 Ajuste no assembly original
+
+A troca de idioma **não muda a arquitetura** — muda a tabela assada
+(`FILLER_LIBRARY_PT` → `FILLER_LIBRARY_EN`, mesmo formato §5.3-1).
+No assembly-alvo, o ponto de troca é o carregamento da frase:
+
+```asm
+start_filler:
+    ; Antes (rascunho PT-BR):
+    ; LOADSTR rFillerText, FILLER_LIBRARY_PT[rSignal.phrase_id]   ; 🔴 (LOADSTR/indexação inexistentes)
+
+    ; Depois (correto — mesmo ponto, tabela EN):
+    LOADSTR rFillerText, FILLER_LIBRARY_EN[rSignal.phrase_id]     ; 🔴 (idem; mecanismo real: tabela assada §5.3-1)
+
+    EMBED rFillerEmb, rFillerText, rPersona.emb            ; 🔴 modo (opcode ✅)
+    DEPFORMER rFillerCodes, rFillerEmb, rAudioEmb, rKVDep  ; 🟡 0x44
+    CODEC_DEC rFillerAudio, rFillerCodes                   ; ✅
+    STREAM rFillerAudio, CHANNEL=4 BLOCKING                ; 🔴 modo (opcode ✅)
+
+    HOLD_CONTEXT rAudioState, STATE=FILLER     ; 🔵 (ou LOADI de enum, §5.1)
+    JUMP audio_output_loop                                ; ✅
+```
+
+Nada mais muda. Toda a arquitetura permanece igual — e o teste em
+inglês ainda *simplifica* a validação (distribuição nativa do
+Depformer, sem risco de sotaque).
 
 ---
 
