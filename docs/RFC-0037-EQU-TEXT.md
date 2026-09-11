@@ -195,6 +195,16 @@ bit 49 liga de verdade) e, depois de V-1b, `src/mimi.rs` antes de V-2
 (RAG é bump de ISA; Mimi é implementação sobre `0x15`/`0x16` já
 existentes).
 
+## Regra harness_table (V-3/G6; congela precedente `rfc0032_table`)
+
+Dados que exigem ENDEREÇO (não valor) — ex. a tabela DEPFORMER de
+8×u64 — NÃO são montáveis de texto puro (exigiria `STORE`, que precisa
+de dossiê R12). Nascem no harness Rust e entram no `.m3asm` via
+`.equ <NOME> <addr>` (substituição no teste). `.m3asm` dirige fluxo.
+Programa-contrato: `programs/voice_loop_demo.m3asm` +
+`vm::test_planoV3_voice_loop` (5 invariantes: estados, barge-in,
+filler isolado, rollback, deadline).
+
 ## Changelog
 
 | Version | Date | Changes |

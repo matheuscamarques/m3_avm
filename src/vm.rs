@@ -8925,6 +8925,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_planoV3_voice_loop() {
+        use crate::opcodes::assemble;
+        // V-3/G6 (MVP voice-loop, emulador): SENSE->VAD->CODEC->DEPFORMER->
+        // CODEC->STREAM + filler isolado + estados + barge + deadline.
+        // Tabela DEPFORMER nasce no harness (nota harness_table no .m3asm).
+        let template = include_str!("../programs/voice_loop_demo.m3asm");
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(4000), ..Default::default() });
+        let (_x, t) = rfc0032_table(&mut vm, 16, 2, 2, 1.0);
+        let src = template.replace(".equ W_TAB 0", &format!(".equ W_TAB {}", t));
+        let prog = assemble(&src).unwrap();
+        vm.load_program(prog);
+        // 1 evento => 1 barge no frame 1; frames 2-3 limpos; COMPLETE.
+        vm.push_input("oi".to_string());
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        // (1) Estados: todos os 5 visitados; final COMPLETE; 2 frames limpos.
+        assert_eq!(ctx.reg(0).unwrap(), 4, "rState=COMPLETE");
+        assert_eq!(ctx.reg(1).unwrap(), 2, "rFrames=2 limpos");
+        assert_eq!(ctx.reg(11).unwrap(), 1, "rBarged: RESUMED aconteceu");
+        // (2) Barge-in: interrompeu e voltou a INCOMPLETE (completou depois).
+        // (coberto por rBarged==1 + COMPLETE acima; canário abaixo prova restore.)
+        // (3) Filler isolado: rY = 2*(7.777^2) exato; output sem marcador.
+        let x = 7.777f32;
+        let expect_fill = x * x + x * x;
+        let y = ctx.reg(6).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(y, 8).unwrap(), vec![expect_fill; 8]);
+        let out = ctx.reg(7).unwrap();
+        let pcm = vm.memory.read_f32_tensor(out, 1920).unwrap();
+        assert_eq!(pcm.len(), 1920);
+        assert!(!pcm.iter().any(|&v| v == 7.777f32 || v == expect_fill), "filler vazou p/ output");
+        // (4) Rollback: canário pré-snapshot intacto pós-RESTORE + coerência
+        // funcional após restore (COMPLETE acima). Rewind de mapa/ssm/KV é
+        // propriedade unitária (RFC-0011/RFC-0003); aqui: não-corrupção + direta.
+        let can = ctx.reg(14).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(can, 4).unwrap(), vec![1.0; 4]);
+        assert!(ctx.reg(8).unwrap() > 0, "rSnap: versão válida");
+        // VAD determinístico sobre rCan ([1;4] => energia 1.0).
+        let vad = ctx.reg(5).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(vad, 1).unwrap(), vec![1.0]);
+        // (5) Deadline: nenhum frame estourou o orçamento STEPS.
+        assert_eq!(ctx.reg(12).unwrap(), 0, "rOver: budget estourado");
+        // Cobertura dos estágios (exatos: 1 barge + 2 limpos).
+        assert_eq!(vm.stats.vad_detect_execs, 2);
+        assert_eq!(vm.stats.codec_encs, 2);
+        assert_eq!(vm.stats.codec_decs, 2);
+        assert_eq!(vm.stats.streams, 2);
+    }
+
+    #[tokio::test]
     async fn test_planoV1b_data_loader() {
         use crate::opcodes::assemble_with_data;
         // V-1b dia 3 (Opção A): `@nome` resolve em assemble para o layout

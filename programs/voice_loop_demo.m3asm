@@ -1,0 +1,102 @@
+; programs/voice_loop_demo.m3asm — V-3/G6 (MVP voice-loop, emulador).
+; Contrato do MVP (Refinamento 3): esta é a estrutura que o MVP real usa;
+; só os handles de harness mudam (stub -> m3-audio / modelo real / Mimi real).
+;
+; Fluxo por frame (todos os opcodes já IMPL; zero opcode novo):
+;   SENSE AUDIO_PCM -> VAD_DETECT -> CODEC_ENC (Mimi stub) -> DEPFORMER
+;   -> CODEC_DEC -> STREAM OUTPUT + filler sintético isolado.
+; Estados (rState): 0 IDLE / 1 INCOMPLETE / 2 THINKING / 3 RESUMED / 4 COMPLETE.
+; Barge-in: fila USER_INPUT (harness) + IF_INTERRUPT -> RESTORE + INCOMPLETE
+;   (no MVP real: VAD do mic -> SIGNAL; aqui: evento enfileirado -> mesmo
+;   caminho GOT_SPEECH; SIGNAL ABORT mata contexto — não serve p/ self).
+; Deadline: STEPS por frame contra BUDGET (mapeamento emulador; NÃO wall-clock).
+;
+; ============================================================
+; NOTA harness_table (Refinamento 2 — congela a decisão):
+; DEPFORMER exige tabela de 8×u64 apontando para matrizes [D,D].
+; Essa tabela NÃO é montável de texto puro (escrever endereço em
+; tensor exigiria STORE, que precisa de dossiê R12). Ela nasce no
+; harness Rust (precedente: rfc0032_table) e entra aqui via
+; `.equ W_TAB <addr>` (substituição de string no teste).
+; O placeholder `0` abaixo monta, mas só o harness faz rodar.
+; Regra geral: dados que exigem ENDEREÇO (não valor) nascem no
+; harness. `.m3asm` dirige fluxo.
+; (TENSOR rScr por frame: aloca APÓS o SNAPSHOT de propósito — o
+;  RESTORE do barge rewinding algo real, não vazio. Rewound map é
+;  propriedade unitária de RFC-0011; aqui se prova coerência
+;  pós-restore + canário intacto.)
+; (Stub-wiring honesto do loop: VAD lê rCan, filler cruza rFil —
+;  no MVP real, VAD lê frames PCM e filler lê sua biblioteca.)
+; ============================================================
+;
+; Regs (16/16 GPR — teto arquitetural, sem folga):
+;   r0=rState r1=rFrames r2=rT(deadline) r3=rPcm r4=rCodes r5=rVad
+;   r6=rY r7=rPcmOut r8=rSnap r9=rIn r10=rScr(scratch->time) r11=rBarged
+;   r12=rOver r13=rW r14=rCan r15=rFil
+.text
+.equ ST_IDLE 0
+.equ ST_INCOMPLETE 1
+.equ ST_THINKING 2
+.equ ST_RESUMED 3
+.equ ST_COMPLETE 4
+.equ BUDGET 400
+.equ MAXFRAMES 2
+.equ W_TAB 0  ; <-- harness substitui pelo endereço da tabela DEPFORMER
+.reg rState r0
+.reg rFrames r1
+.reg rT r2
+.reg rPcm r3
+.reg rCodes r4
+.reg rVad r5
+.reg rY r6
+.reg rPcmOut r7
+.reg rSnap r8
+.reg rIn r9
+.reg rScr r10
+.reg rBarged r11
+.reg rOver r12
+.reg rW r13
+.reg rCan r14
+.reg rFil r15
+LOADI rState, ST_IDLE
+LOADI rFrames, 0
+LOADI rBarged, 0
+LOADI rOver, 0
+TENSOR rCan 1 4 f32 FILL=1.0
+TENSOR rFil 1 8 f32 FILL=7.777
+LOADI rW, W_TAB
+SNAPSHOT rSnap
+FRAME:
+    TENSOR rScr, 1 4 f32
+    STEPS rT
+    ADD_IMM rT, rT IMM=BUDGET
+    LOADI rState, ST_INCOMPLETE
+    SENSE rIn, USER_INPUT
+    IF_INTERRUPT GOT_SPEECH
+    JUMP NO_BARGE
+GOT_SPEECH:
+    LOADI rState, ST_RESUMED
+    LOADI rBarged, 1
+    RESTORE rSnap
+    LOADI rState, ST_INCOMPLETE
+    JUMP FRAME
+NO_BARGE:
+    LOADI rState, ST_THINKING
+    SENSE rPcm, AUDIO_PCM
+    VAD_DETECT rVad, rCan
+    CODEC_ENC rCodes, rPcm TENSOR
+    DEPFORMER rY, rCodes, rW NCB=2 NHEADS=2 LEVELS=2 CONTEXT=2
+    CODEC_DEC rPcmOut, rY TENSOR
+    MUL rY, rFil, rFil
+    ADD rY, rY, rY
+    STREAM rPcmOut, OUTPUT BLOCKING
+    STEPS rScr
+    COMPARE rScr, rT PRED=LT
+    IF_EQUAL WITHIN
+    LOADI rOver, 1
+WITHIN:
+    ADD_IMM rFrames, rFrames IMM=1
+    COMPARE rFrames, MAXFRAMES PRED=LT
+    IF_EQUAL FRAME
+    LOADI rState, ST_COMPLETE
+    HALT
