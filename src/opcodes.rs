@@ -139,6 +139,9 @@ pub const MEMCPY_DIR_NIC: u8 = 2;
 pub const OP_ADD_IMM: u8 = 0x7A; // rD = rS wrapping_add imm
 pub const OP_SUB_IMM: u8 = 0x7B; // rD = rS wrapping_sub imm (único SUB do ISA)
 pub const OP_STEPS: u8 = 0x7C; // rD <- instruções retiradas (determinístico)
+// RFC-0038: retrieval (0x50-0x53/0x56-0x57, v1.15; turno 1: ADD/DEL).
+pub const OP_RAG_INDEX_ADD: u8 = 0x50; // anexa vetor (rDb=0 cria; rD <- id/contagem)
+pub const OP_RAG_INDEX_DEL: u8 = 0x51; // remove por id (rD <- restante)
 // RFC-0025: bloco de conversão (0x67/0x68/0x69, v1.7).
 pub const OP_CAST: u8 = 0x67; // conversão de valor FP32<->F16/BF16/I8/U8
 pub const OP_QUANTIZE: u8 = 0x68; // F32 -> blocos Q4_0/Q8_0
@@ -603,6 +606,8 @@ impl Instruction {
             OP_SPIKE_STEP => "SPIKE_STEP",
             OP_CONV => "CONV",
             OP_FOREST => "FOREST",
+            OP_RAG_INDEX_ADD => "RAG_INDEX_ADD",
+            OP_RAG_INDEX_DEL => "RAG_INDEX_DEL",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -2508,6 +2513,27 @@ pub fn instr_forest(rdest: u8, r_feat: u8, r_table: u8, r_leaves: u8, n_trees: u
     let mut instr = Instruction::new(OP_FOREST, 0, rdest, r_feat, r_table, r_leaves);
     instr.set_forest_params(n_trees, max_depth, mode);
     instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0038: retrieval (turno 1: ADD/DEL). Sem payload próprio (dim/id
+// vivem no IndexStore / regs); rId ausente = 0xFF = sequencial.
+// ---------------------------------------------------------------------------
+
+/// RAG_INDEX_ADD rD, rDb, rVec [, rId] — rDb=0 cria (rD <- id do store).
+pub fn instr_rag_index_add(rdest: u8, r_db: u8, r_vec: u8, r_id: u8) -> Instruction {
+    Instruction::new(OP_RAG_INDEX_ADD, 0, rdest, r_db, r_vec, r_id)
+}
+
+/// RAG_INDEX_DEL rD, rDb, rId — rD <- contagem restante.
+pub fn instr_rag_index_del(rdest: u8, r_db: u8, r_id: u8) -> Instruction {
+    Instruction::new(OP_RAG_INDEX_DEL, 0, rdest, r_db, r_id, 0xFF)
+}
+
+/// Detecta uso da faixa V-2 (`0x50-0x53/0x56-0x57`) p/ o bit REQUIRED
+/// do container (RFC-0038; valor do bit em `m3bc.rs`, sem ciclo).
+pub fn uses_v2_retrieval(prog: &[Instruction]) -> bool {
+    prog.iter().any(|i| matches!(i.opcode, 0x50..=0x53 | 0x56..=0x57))
 }
 
 // ---------------------------------------------------------------------------
@@ -5467,6 +5493,38 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                 n_trees,
                 depth,
                 mode,
+            ))
+        }
+        "RAG_INDEX_ADD" => {
+            // RAG_INDEX_ADD rD, rDb, rVec [, rId] (rDb=0 cria; rId ausente=seq).
+            if parts.len() < 4 {
+                return Err(anyhow!("RAG_INDEX_ADD precisa de rdest, rDb, rVec — ex: RAG_INDEX_ADD r4, r0, r1"));
+            }
+            // 4º token, se presente, DEVE ser registrador (nada silencioso).
+            let rid = if parts.len() > 4 {
+                Some(parse_reg(parts[4], syms).map_err(|_| anyhow!("RAG_INDEX_ADD 4º operando '{}' inválido (use registrador rId)", parts[4]))?)
+            } else {
+                None
+            };
+            if parts.len() > 5 {
+                reject_unknown("RAG_INDEX_ADD", &parts[5..], &[])?;
+            }
+            Ok(instr_rag_index_add(
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
+                rid.unwrap_or(0xFF),
+            ))
+        }
+        "RAG_INDEX_DEL" => {
+            // RAG_INDEX_DEL rD, rDb, rId (id exigido; ausente não deleta).
+            if parts.len() != 4 {
+                return Err(anyhow!("RAG_INDEX_DEL precisa de rdest, rDb, rId — ex: RAG_INDEX_DEL r4, r0, r1"));
+            }
+            Ok(instr_rag_index_del(
+                parse_reg(parts[1], syms)?,
+                parse_reg(parts[2], syms)?,
+                parse_reg(parts[3], syms)?,
             ))
         }
         "HALT" => {

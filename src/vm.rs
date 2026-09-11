@@ -24,7 +24,7 @@ use pollster;
 use crate::opcodes::{
     Instruction, ProgramInstr, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
     OP_COMPARE, OP_CTX_SWITCH, OP_DISTANCE, OP_EMBED, OP_FFN, OP_FORK, OP_GATHER, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
-    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
+    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RAG_INDEX_ADD, OP_RAG_INDEX_DEL, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
     OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_AUDIO_PCM, SENSE_CODEC_FRAME, SENSE_TOKEN, SENSE_USER_INPUT,
     SENSE_VAD, STREAM_FLAG_BLOCKING, OP_RNG_SEED, OP_RNG_NEXT, OP_RNG_UNIFORM, OP_RNG_NORMAL,
     OP_HASH, OP_CHECKSUM, OP_HMAC, OP_CYCLES_COUNT, OP_TRACE_EVENT, OP_SANITY_CHECK,
@@ -169,6 +169,8 @@ pub struct VmStats {
     pub audio_filter_execs: u64,
     pub audio_window_execs: u64,
     pub depformer_execs: u64,
+    pub rag_index_add_execs: u64,
+    pub rag_index_del_execs: u64,
     pub call_execs: u64,
     pub ret_execs: u64,
     pub start_ns: u64,
@@ -502,6 +504,12 @@ pub struct Vm {
     /// ABORT + RESTORE — as quatro casas, sem exceção.
     pub dep_kv: HashMap<(u8, u8), crate::depformer::DepKV>,
     dep_snapshots: Vec<(u64, HashMap<(u8, u8), crate::depformer::DepKV>)>,
+    /// IndexStore retrieval (RAG 0x50+, RFC-0038): Arc compartilhado,
+    /// CoW na primeira escrita com snapshot vivo (opção B). Push de
+    /// `Arc::clone` no FORK + SNAPSHOT, troca versionada no ABORT +
+    /// RESTORE — as quatro casas, sem exceção.
+    pub rag_store: std::sync::Arc<std::sync::RwLock<crate::rag::IndexStore>>,
+    pub(crate) rag_snapshots: Vec<(u64, std::sync::Arc<std::sync::RwLock<crate::rag::IndexStore>>)>,
     /// Barreiras locais (BARRIER 0x1D, RFC-0018): id -> estado one-shot.
     /// Removida no RELEASE e no timeout (sem reuso silencioso de geração).
     pub barriers: HashMap<u32, BarrierState>,
@@ -576,6 +584,8 @@ impl Vm {
             arena_snapshots: Vec::new(),
             dep_kv: HashMap::new(),
             dep_snapshots: Vec::new(),
+            rag_store: std::sync::Arc::new(std::sync::RwLock::new(crate::rag::IndexStore::new())),
+            rag_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -611,6 +621,8 @@ impl Vm {
             arena_snapshots: Vec::new(),
             dep_kv: HashMap::new(),
             dep_snapshots: Vec::new(),
+            rag_store: std::sync::Arc::new(std::sync::RwLock::new(crate::rag::IndexStore::new())),
+            rag_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -643,6 +655,8 @@ impl Vm {
             arena_snapshots: Vec::new(),
             dep_kv: HashMap::new(),
             dep_snapshots: Vec::new(),
+            rag_store: std::sync::Arc::new(std::sync::RwLock::new(crate::rag::IndexStore::new())),
+            rag_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -1392,6 +1406,14 @@ impl Vm {
                 self.exec_depformer(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_RAG_INDEX_ADD => {
+                self.exec_rag_index_add(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RAG_INDEX_DEL => {
+                self.exec_rag_index_del(ctx_id, instr)?;
+                Ok(true)
+            }
             OP_CALL => {
                 self.exec_call(ctx_id, instr)?;
                 // CALL define PC diretamente — sem avanço automático
@@ -1939,6 +1961,9 @@ impl Vm {
         self.arena_snapshots.push((snap_version, self.arenas.clone()));
         // Snapshot do KV depformer (RFC-0032; mesma disciplina).
         self.dep_snapshots.push((snap_version, self.dep_kv.clone()));
+        // Snapshot do IndexStore RAG (RFC-0038, opção B): Arc::clone O(1);
+        // a primeira escrita com snapshot vivo duplica (ver rag_store_mut).
+        self.rag_snapshots.push((snap_version, std::sync::Arc::clone(&self.rag_store)));
         self.stats.forks += 1;
         log_info("fork", &format!("ctx {} FORK -> child {} prio {} (snap v{})", ctx_id, new_id, child_prio, snap_version));
         Ok(())
@@ -2257,6 +2282,19 @@ impl Vm {
             }
         } else if let Some((_, snap)) = self.dep_snapshots.pop() {
             self.dep_kv = snap;
+        }
+        // Rollback RAG: idem (RFC-0038, opção B — troca o Arc).
+        if ts_version != 0 {
+            while self.rag_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.rag_snapshots.pop();
+            }
+            if self.rag_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.rag_snapshots.pop() {
+                    self.rag_store = snap;
+                }
+            }
+        } else if let Some((_, snap)) = self.rag_snapshots.pop() {
+            self.rag_store = snap;
         }
 
         self.stats.aborts += 1;
@@ -4037,6 +4075,91 @@ impl Vm {
     /// engine (mesmas 4 linhas de push do FORK; dedup é follow-up, os
     /// caminhos auditados ficam intocados). rdest <- version u64.
     /// Só MASK=0b111 executa (maquinário é tudo-ou-nada).
+    /// Guarda de escrita do IndexStore (RFC-0038, opção B): se algum
+    /// snapshot retém um clone do `Arc`, duplica o interior antes de
+    /// mutar (isolamento fork; custo O(índice) só no fork+write).
+    /// Poison de RwLock vira erro alto (nunca panic).
+    fn rag_store_mut(&mut self) -> Result<std::sync::RwLockWriteGuard<'_, crate::rag::IndexStore>> {
+        if std::sync::Arc::strong_count(&self.rag_store) > 1 {
+            let cloned = self.rag_store.read().map_err(|_| anyhow!("RAG: RwLock envenenado (leitura)"))?.clone();
+            self.rag_store = std::sync::Arc::new(std::sync::RwLock::new(cloned));
+        }
+        self.rag_store.write().map_err(|_| anyhow!("RAG: RwLock envenenado (escrita)"))
+    }
+
+    /// Lê vetor F32 denso de um registrador (tensor; achata qualquer rank;
+    /// numel>0). Dtype≠F32, esparso ou vazio => erro alto.
+    fn read_dense_vec(&self, addr: u128, op: &str) -> Result<Vec<f32>> {
+        let meta = self.memory.get_tensor_meta(addr).cloned()
+            .ok_or_else(|| anyhow!("{}: tensor 0x{:x} não encontrado", op, addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("{}: esparso não suportado", op));
+        }
+        if meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("{}: dtype {:?} (só F32)", op, meta.dtype));
+        }
+        let n: usize = meta.shape.iter().product();
+        if n == 0 {
+            return Err(anyhow!("{}: tensor vazio", op));
+        }
+        Ok(self.memory.read_f32_tensor(addr, n)?)
+    }
+
+    fn exec_rag_index_add(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("RAG_INDEX_ADD precisa de rD, rDb, rVec (0xFF não é registrador)"));
+        }
+        let (db_val, vec_addr, id_val) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?, if instr.rsrc3 != 0xFF { Some(ctx.reg(instr.rsrc3)?) } else { None })
+        };
+        let vec = self.read_dense_vec(vec_addr, "RAG_INDEX_ADD")?;
+        let explicit = match id_val {
+            Some(v) => Some(u64::try_from(v).map_err(|_| anyhow!("RAG_INDEX_ADD: id {} fora da faixa u64", v))?),
+            None => None,
+        };
+        let out = if db_val == 0 {
+            // Cria store com dim do vetor; rD <- id do store.
+            let mut store = self.rag_store_mut()?;
+            let db = store.create(vec.len())?;
+            store.add(db, &vec, explicit)?;
+            db as u128
+        } else {
+            let db = u64::try_from(db_val).map_err(|_| anyhow!("RAG_INDEX_ADD: rDb {} fora da faixa u64", db_val))?;
+            let mut store = self.rag_store_mut()?;
+            store.add(db, &vec, explicit)?;
+            store.len(db)? as u128
+        };
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out)?;
+        }
+        self.stats.rag_index_add_execs += 1;
+        log_debug("rag", &format!("ctx {} RAG_INDEX_ADD db={} -> {}", ctx_id, db_val, out));
+        Ok(())
+    }
+
+    fn exec_rag_index_del(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("RAG_INDEX_DEL precisa de rD, rDb, rId (0xFF não é registrador)"));
+        }
+        let (db_val, id_val) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let db = u64::try_from(db_val).map_err(|_| anyhow!("RAG_INDEX_DEL: rDb {} fora da faixa u64", db_val))?;
+        if db == 0 {
+            return Err(anyhow!("RAG_INDEX_DEL: rDb 0 (índice inexistente; crie com RAG_INDEX_ADD)"));
+        }
+        let id = u64::try_from(id_val).map_err(|_| anyhow!("RAG_INDEX_DEL: id {} fora da faixa u64", id_val))?;
+        let remaining = self.rag_store_mut()?.del(db, id)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, remaining as u128)?;
+        }
+        self.stats.rag_index_del_execs += 1;
+        log_debug("rag", &format!("ctx {} RAG_INDEX_DEL db={} id={} -> restantes {}", ctx_id, db, id, remaining));
+        Ok(())
+    }
+
     fn exec_snapshot(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
         let mask = instr.snapshot_mask();
         if mask != SNAP_MASK_ALL {
@@ -4048,6 +4171,7 @@ impl Vm {
         self.snn_snapshots.push((v, self.snn_layers.clone()));
         self.arena_snapshots.push((v, self.arenas.clone()));
         self.dep_snapshots.push((v, self.dep_kv.clone()));
+        self.rag_snapshots.push((v, std::sync::Arc::clone(&self.rag_store)));
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
             if instr.rdest != 0xFF {
                 ctx.set_reg(instr.rdest, v as u128)?;
@@ -4110,6 +4234,15 @@ impl Vm {
         if self.dep_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
             if let Some((_, snap)) = self.dep_snapshots.pop() {
                 self.dep_kv = snap;
+            }
+        }
+        // Rollback RAG: troca o Arc (O(1); snapshots retêm o conteúdo velho).
+        while self.rag_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.rag_snapshots.pop();
+        }
+        if self.rag_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.rag_snapshots.pop() {
+                self.rag_store = snap;
             }
         }
         self.stats.restore_execs += 1;
@@ -9064,11 +9197,11 @@ mod tests {
                 let vad = tutor_reg(&vm, 5);
                 assert_eq!(vm.memory.read_f32_tensor(vad, 1).unwrap(), vec![1.0]);
                 // Cobertura exata por run.
-                assert_eq!(vm.stats.vad_detect_execs, 1);
-                assert_eq!(vm.stats.codec_encs, 1);
-                assert_eq!(vm.stats.codec_decs, 1);
-                assert_eq!(vm.stats.streams, if phase == 0 { 2 } else { 3 });
-            }
+        assert_eq!(vm.stats.vad_detect_execs, 1);
+        assert_eq!(vm.stats.codec_encs, 1);
+        assert_eq!(vm.stats.codec_decs, 1);
+        assert_eq!(vm.stats.streams, if phase == 0 { 2 } else { 3 });
+    }
         }
         // (5) Abort no role-play: volta a INCOMPLETE, nada emitido.
         let (vm, _addrs) = tutor_run(1, 0, true);
@@ -9077,6 +9210,80 @@ mod tests {
         let can = tutor_reg(&vm, 13);
         assert_eq!(vm.memory.read_f32_tensor(can, 4).unwrap(), vec![1.0; 4]);
         assert!(tutor_reg(&vm, 11) > 0, "rSnap válido");
+    }
+
+    // ---- V-2 turno 1: índice (RFC-0038) --------------------------------
+
+    #[tokio::test]
+    async fn test_rag_index_lifecycle() {
+        use crate::opcodes::assemble;
+        // create -> append -> snapshot -> append -> del -> restore => 2.
+        let src = "TENSOR r0 1 4 f32 FILL=0.5\nTENSOR r1 1 4 f32 FILL=1.5\nLOADI r5, 0\nRAG_INDEX_ADD r2, r5, r0\nRAG_INDEX_ADD r3, r2, r1\nSNAPSHOT r6\nTENSOR r4 1 4 f32 FILL=2.5\nRAG_INDEX_ADD r7, r2, r4\nLOADI r9, 1\nRAG_INDEX_DEL r8, r2, r9\nRESTORE r6\nHALT";
+        let prog = assemble(src).unwrap();
+        assert_eq!(prog[3].mnemonic(), "RAG_INDEX_ADD");
+        assert_eq!(prog[9].mnemonic(), "RAG_INDEX_DEL");
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(100), ..Default::default() });
+        vm.load_program(prog);
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let db = ctx.reg(2).unwrap() as u64;
+        assert!(db > 0, "create retorna id");
+        assert_eq!(ctx.reg(3).unwrap(), 2, "append => contagem 2");
+        assert_eq!(ctx.reg(7).unwrap(), 3, "pré-restore: 3");
+        assert_eq!(ctx.reg(8).unwrap(), 2, "del => restantes 2");
+        // Rollback rewinding o 3º add (disciplina Arc, opção B).
+        let store = vm.rag_store.read().unwrap();
+        assert_eq!(store.len(db).unwrap(), 2);
+        drop(store);
+        assert_eq!(vm.stats.rag_index_add_execs, 3);
+        assert_eq!(vm.stats.rag_index_del_execs, 1);
+        // CoW-B direto: snapshot retém conteúdo velho após escrita.
+        let snap = std::sync::Arc::clone(&vm.rag_store);
+        assert_eq!(snap.read().unwrap().len(db).unwrap(), 2);
+        {
+            let mut w = vm.rag_store_mut().unwrap();
+            w.add(db, &[9.0, 9.0, 9.0, 9.0], None).unwrap();
+        }
+        assert_eq!(snap.read().unwrap().len(db).unwrap(), 2, "snapshot imutável");
+        assert_eq!(vm.rag_store.read().unwrap().len(db).unwrap(), 3, "atual avançou");
+        // Erros de montagem (nada silencioso).
+        assert!(assemble("RAG_INDEX_ADD r2, r0").is_err());
+        assert!(assemble("RAG_INDEX_ADD r2, r0, r1 FOO").is_err());
+        assert!(assemble("RAG_INDEX_ADD r2, r0, r1, r3 EXTRA").is_err());
+        assert!(assemble("RAG_INDEX_DEL r2, r0").is_err());
+        assert!(assemble("RAG_INDEX_DEL r2, r0, r1, r3").is_err());
+        // Erros de execução (casa: step_instruction direto — run() isola
+        // falha no contexto e retorna Ok; erro alto se prova por step).
+        {
+            use crate::opcodes::{instr_rag_index_add, instr_rag_index_del};
+            // Store inexistente.
+            let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+            let t = rfc0004_f32(&mut vm, &[1, 4], &[1.0, 0.0, 0.0, 0.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 99), (2, t)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(4, 1, 2, 0xFF)).is_err());
+            // Cria ok; dim divergente erra; NaN erra; id duplicado erra.
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 0), (2, t)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(4, 1, 2, 0xFF)).is_ok());
+            let t2 = rfc0004_f32(&mut vm, &[1, 2], &[1.0, 0.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 1), (2, t2)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(4, 1, 2, 0xFF)).is_err());
+            let tn = rfc0004_f32(&mut vm, &[1, 4], &[f32::NAN, 0.0, 0.0, 0.0]);
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 1), (2, tn)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(4, 1, 2, 0xFF)).is_err());
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 1), (2, t), (3, 7)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(4, 1, 2, 3)).is_ok());
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 1), (2, t), (3, 7)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(4, 1, 2, 3)).is_err());
+            // DEL: id ausente erra; rDb=0 erra; 0xFF erra; ok remove.
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 1), (2, 77)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_del(4, 1, 2)).is_err());
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 0), (2, 0)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_del(4, 1, 2)).is_err());
+            assert!(vm.step_instruction(cid, &instr_rag_index_add(0xFF, 1, 2, 0xFF)).is_err());
+            let cid = rfc0004_ctx_with(&mut vm, &[(1, 1), (2, 0)]);
+            assert!(vm.step_instruction(cid, &instr_rag_index_del(4, 1, 2)).is_ok());
+            assert_eq!(vm.scheduler.get(cid).unwrap().reg(4).unwrap(), 1);
+        }
     }
 
     #[tokio::test]

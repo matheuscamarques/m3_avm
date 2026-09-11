@@ -43,7 +43,10 @@ pub const M3BC_HEADER_LEN: usize = 34;
 /// Versão corrente do container (= linha ISA implementada).
 pub const M3BC_VERSION: (u16, u16, u16) = (1, 5, 0);
 /// Bits REQUIRED suportados: nenhum além do baseline (que não usa bit).
-pub const M3BC_SUPPORTED_REQUIRED: u64 = 0;
+/// V-2 liga o bit 50 abaixo (turno 1 implementa ADD/DEL; membros ainda
+/// não implementados falham alto no decode — UnknownOpcode, nunca
+/// misdecode — até seu turno).
+pub const M3BC_SUPPORTED_REQUIRED: u64 = M3BC_REQUIRED_HAS_V2_RETRIEVAL;
 /// Bit OPTIONAL 49: seção `.data` no container (V-1b dia 3).
 /// NÚMERO CONGELADO, semântica pendente: o container ainda não carrega
 /// payload de dados (CLI `assemble` rejeita `.data`; só o path API
@@ -51,6 +54,11 @@ pub const M3BC_SUPPORTED_REQUIRED: u64 = 0;
 /// o layout de container seria mentira documentada — wiring quando o
 /// layout existir. Teste abaixo trava o valor.
 pub const M3BC_OPTIONAL_HAS_DATA_SECTION: u64 = 1 << 49;
+/// Bit REQUIRED 50: retrieval V-2 (RFC-0038, `0x50-0x53/0x56-0x57`).
+/// Ligado na emissão quando o programa usa a faixa; o loader rejeita
+/// em runtime sem suporte (firewall antes do fetch — nunca misdecode).
+/// Número livre confirmado (nenhum bit atribuído até hoje).
+pub const M3BC_REQUIRED_HAS_V2_RETRIEVAL: u64 = 1 << 50;
 
 /// Formato detectado por sniffing (R10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +505,18 @@ mod tests {
         // Número congelado (RFC-0037 0037-04); wiring só com o layout.
         assert_eq!(M3BC_OPTIONAL_HAS_DATA_SECTION, 1 << 49);
         assert_eq!(M3BC_OPTIONAL_HAS_DATA_SECTION & M3BC_SUPPORTED_REQUIRED, 0);
+    }
+
+    #[test]
+    fn v2_retrieval_bit_wired() {
+        // RFC-0038 turno 1: bit 50 REQUIRED, suportado (ADD/DEL no decoder).
+        assert_eq!(M3BC_REQUIRED_HAS_V2_RETRIEVAL, 1 << 50);
+        assert_eq!(M3BC_SUPPORTED_REQUIRED, M3BC_REQUIRED_HAS_V2_RETRIEVAL);
+        // Arquivo com o bit carrega (antes: UnsupportedFeature).
+        let payload = instr_nop().encode();
+        let bytes = encode_m3bc(&header(M3BC_REQUIRED_HAS_V2_RETRIEVAL, 0, 0), &payload);
+        let prog = load(&bytes).unwrap();
+        assert_eq!(prog.frames.len(), 1);
     }
 
     #[test]

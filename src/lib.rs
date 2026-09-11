@@ -30,6 +30,7 @@ pub mod m3bc;
 pub mod arena;
 pub mod activations;
 pub mod depformer;
+pub mod rag;
 
 // Módulo de QA — testes de física abstrata (Nível 1-4)
 #[cfg(test)]

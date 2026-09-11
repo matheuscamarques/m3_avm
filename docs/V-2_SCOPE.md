@@ -81,3 +81,19 @@ Corpus gate passa a 42/43 + 2 API-only (regra vigente).
 
 HNSW/IVF aproximado (flat/entanumerado basta p/ V-2), índice
 persistente em disco, `0x54`/`0x55`, streaming-add, multi-tenant.
+
+## 9. Locked constants (travado antes do turno 1; goldens não mudam de forma)
+
+| # | Decisão | Valor |
+|:--:|:---|:---|
+| 1 | Dimensão de embedding | `1024` (BGE-M3; goldens usam ramp `[1,1024]`/banco pequeno) |
+| 2 | Tipo dos embeddings | `f32` (tolerância: bit-exato p/ índices/ids; f32 bit-exato p/ distâncias em CPU; PQ roundtrip ≤ 1 LSB/nível — §5) |
+| 3 | Métrica default | `cosine` (`RAG_SEARCH` aceita `EUCLID`/`DOT`; assinatura congela no turno 2) |
+| 4 | IndexStore | campo de `Vm`: `Arc<RwLock<IndexStore>>`; snapshots `Vec<(u64, Arc<..>)>` na disciplina FORK/SNAPSHOT/RESTORE/ABORT |
+| 5 | Corpus do `rag_demo` | 10–20 docs hardcoded no harness (turno 4) |
+
+FORK/ABORT (opção B, CoW): snapshot = `Arc::clone` O(1) (compartilha);
+primeira escrita com `strong_count>1` duplica o interior (`make_mut`
+manual) — isolamento correto, custo O(índice) só no fork+write.
+`RESTORE`/ABORT trocam o `Arc` (O(1)). Rollback cobre o índice como
+cobre `ssm_states` (mesma disciplina, mesmos testes deLifecycle).

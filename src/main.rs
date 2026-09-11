@@ -41,6 +41,7 @@ pub mod m3bc;
 pub mod arena;
 pub mod activations;
 pub mod depformer;
+pub mod rag;
 
 use opcodes::{assemble, Instruction, INSTR_SIZE, OP_HALT, OP_NOP};
 use vm::{Vm, VmConfig};
@@ -1138,11 +1139,14 @@ fn assemble_file(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
     // §8). ENTRY_PC=0: o assembler só emite 32B a partir da base, e todos
     // os labels já são PCs absolutos — nada a relocar.
     let bytes = if out_path.extension().and_then(|s| s.to_str()) == Some("m3bc") {
+        // Bit REQUIRED V-2 (RFC-0038): ligado se a faixa aparece; o loader
+        // sem suporte rejeita antes do fetch (firewall, nunca misdecode).
+        let required = if opcodes::uses_v2_retrieval(&prog) { m3bc::M3BC_REQUIRED_HAS_V2_RETRIEVAL } else { 0 };
         let header = m3bc::M3bcHeader {
             major: m3bc::M3BC_VERSION.0,
             minor: m3bc::M3BC_VERSION.1,
             patch: m3bc::M3BC_VERSION.2,
-            required: 0,
+            required,
             optional: 0,
             entry_pc: 0,
         };
