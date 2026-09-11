@@ -406,6 +406,10 @@ impl WgpuMemoryManager {
     pub fn kv_cache_seq_len(&self) -> usize { self.cpu_fallback.kv_cache_seq_len() }
     pub fn kv_cache_n_layers(&self) -> usize { self.cpu_fallback.kv_cache_n_layers() }
     pub fn kv_cache_truncate(&mut self, seq: usize) { self.cpu_fallback.kv_cache_truncate(seq) }
+    pub fn kv_cache_truncate_stream(&mut self, sid: u16, seq: usize) { self.cpu_fallback.kv_cache_truncate_stream(sid, seq) }
+    pub fn kv_cache_compress_sink_window_stream(&mut self, sid: u16, sink: usize, window: usize) { self.cpu_fallback.kv_cache_compress_sink_window_stream(sid, sink, window) }
+    pub fn kv_cache_append_stream(&mut self, sid: u16, layer: usize, k: &[f32], v: &[f32]) -> anyhow::Result<()> { self.cpu_fallback.kv_cache_append_stream(sid, layer, k, v) }
+    pub fn kv_cache_seq_len_stream(&self, sid: u16) -> usize { self.cpu_fallback.kv_cache_seq_len_stream(sid) }
     pub fn kv_cache_compress_sink_window(&mut self, sink: usize, window: usize) { self.cpu_fallback.kv_cache_compress_sink_window(sink, window) }
     pub fn kv_cache_clear(&mut self) { self.cpu_fallback.kv_cache_clear() }
     pub fn kv_cache_attention(&self, layer: usize, q: &[f32]) -> anyhow::Result<Vec<f32>> { self.cpu_fallback.kv_cache_attention(layer, q) }

@@ -1,0 +1,7 @@
+; programs/kv_stream_demo.m3asm — RFC-0033: KV por stream (roteamento).
+; Cache vazio => TRUNCATE/COMPRESS no-op Ok em stream 1 (semântica
+; profunda coberta em test_rfc0033_*). Contadores: 1 cada.
+LOADI r0, 0
+KV_TRUNCATE r0 STREAM=1
+KV_COMPRESS SINK=2 WINDOW=2 STREAM=1
+HALT

@@ -614,6 +614,7 @@ outruns the Status column above.
 | `0x39/0x3A/0x3B KV_COMPRESS/FLASH_ATTN/ATTN_SPARSE` (KV/attention) | IMPL | RFC-0029; sink+window values, tolerance-vs-ATTN goldens, fused top-k, demo `sparse_attn_demo` (exec verified); v1.11 |
 | `0x45-0x49 STREAM_MERGE/VAD_DETECT/AUDIO_RESAMPLE/AUDIO_FILTER/AUDIO_WINDOW` (audio DSP) | IMPL | RFC-0031; VAD/RMS/ZCR goldens, exact DSP vectors, demo `audio_dsp_demo` (exec verified); v1.12 |
 | `0x44 DEPFORMER` (depformer step) | IMPL | RFC-0032; all-ones golden, KV window/rollback, seeded sampling, Rust-level combined test (tables need `.data`/STORE — Fase 9); v1.13 |
+| KV per-stream stores 0-16 (stream-aware cache) | IMPL | RFC-0033; isolation/geometry/rollback goldens, TRUNCATE/COMPRESS routing, DEPFORMER foresight proof; no bump (no opcode) |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
 `cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,

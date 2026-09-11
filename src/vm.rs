@@ -376,6 +376,30 @@ impl MemBackend {
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_truncate(seq),
         }
     }
+    pub fn kv_cache_truncate_stream(&mut self, sid: u16, seq: usize) {
+        match self {
+            MemBackend::Cpu(m) => m.kv_cache_truncate_stream(sid, seq),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_truncate_stream(sid, seq),
+        }
+    }
+    pub fn kv_cache_compress_sink_window_stream(&mut self, sid: u16, sink: usize, window: usize) {
+        match self {
+            MemBackend::Cpu(m) => m.kv_cache_compress_sink_window_stream(sid, sink, window),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_compress_sink_window_stream(sid, sink, window),
+        }
+    }
+    pub fn kv_cache_append_stream(&mut self, sid: u16, layer: usize, k: &[f32], v: &[f32]) -> anyhow::Result<()> {
+        match self {
+            MemBackend::Cpu(m) => m.kv_cache_append_stream(sid, layer, k, v),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_append_stream(sid, layer, k, v),
+        }
+    }
+    pub fn kv_cache_seq_len_stream(&self, sid: u16) -> usize {
+        match self {
+            MemBackend::Cpu(m) => m.kv_cache_seq_len_stream(sid),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.kv_cache_seq_len_stream(sid),
+        }
+    }
     pub fn kv_cache_compress_sink_window(&mut self, sink: usize, window: usize) {
         match self {
             MemBackend::Cpu(m) => m.kv_cache_compress_sink_window(sink, window),
@@ -3607,16 +3631,16 @@ impl Vm {
     /// explícito (17 streams é follow-up; sem truncamento parcial fantasma).
     fn exec_kv_truncate(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
         let stream = instr.kv_stream();
-        if stream != 0 {
-            return Err(anyhow!("KV_TRUNCATE: STREAM={} não suportado (single-stream; 17 streams é follow-up)", stream));
+        if stream > crate::memory::KV_MAX_STREAM {
+            return Err(anyhow!("KV_TRUNCATE: STREAM={} fora de 0-16 (17 streams)", stream));
         }
         let len = {
             let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
             ctx.reg(instr.rsrc1)? as usize
         };
-        self.memory.kv_cache_truncate(len);
+        self.memory.kv_cache_truncate_stream(stream, len);
         self.stats.kv_truncate_execs += 1;
-        log_debug("kv", &format!("ctx {} KV_TRUNCATE len={} seq={}", ctx_id, len, self.memory.kv_cache_seq_len()));
+        log_debug("kv", &format!("ctx {} KV_TRUNCATE stream={} len={} seq={}", ctx_id, stream, len, self.memory.kv_cache_seq_len_stream(stream)));
         Ok(())
     }
 
@@ -5083,17 +5107,17 @@ impl Vm {
         if mode != KVCOMP_MODE_SINK_WINDOW {
             return Err(anyhow!("KV_COMPRESS: MODE={} inválido (só SINK_WINDOW)", mode));
         }
-        if stream != 0 {
-            return Err(anyhow!("KV_COMPRESS: STREAM={} não suportado (single-stream; 17 streams é follow-up)", stream));
+        if stream > crate::memory::KV_MAX_STREAM {
+            return Err(anyhow!("KV_COMPRESS: STREAM={} fora de 0-16 (17 streams)", stream));
         }
         if sink_p == 0 && window_p == 0 {
             return Err(anyhow!("KV_COMPRESS: SINK=WINDOW=0 esvaziaria o cache (degenerado)"));
         }
-        let before = self.memory.kv_cache_seq_len();
-        self.memory.kv_cache_compress_sink_window(sink_p as usize, window_p as usize);
-        let after = self.memory.kv_cache_seq_len();
+        let before = self.memory.kv_cache_seq_len_stream(stream);
+        self.memory.kv_cache_compress_sink_window_stream(stream, sink_p as usize, window_p as usize);
+        let after = self.memory.kv_cache_seq_len_stream(stream);
         self.stats.kv_compress_execs += 1;
-        log_debug("kv", &format!("ctx {} KV_COMPRESS sink={} window={} seq {} -> {}", ctx_id, sink_p, window_p, before, after));
+        log_debug("kv", &format!("ctx {} KV_COMPRESS stream={} sink={} window={} seq {} -> {}", ctx_id, stream, sink_p, window_p, before, after));
         Ok(())
     }
 
@@ -8002,10 +8026,15 @@ mod tests {
         // No-op quando já cabe (chamada por passo não deve falhar).
         vm.step_instruction(cid, &instr_kv_compress(5, 5, 0, 0)).unwrap();
         assert_eq!(vm.memory.kv_cache_seq_len(), 5);
-        // Erros: degenerado, stream, modo.
+        // Erros: degenerado, modo; stream roteia (RFC-0033).
         assert!(vm.step_instruction(cid, &instr_kv_compress(0, 0, 0, 0)).is_err());
-        assert!(vm.step_instruction(cid, &instr_kv_compress(2, 3, 0, 1)).is_err());
         assert!(vm.step_instruction(cid, &instr_kv_compress(2, 3, 9, 0)).is_err());
+        // STREAM=1 roteia p/ stream inexistente: no-op Ok (RFC-0033).
+        vm.step_instruction(cid, &instr_kv_compress(2, 3, 0, 1)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(1), 0);
+        // sid > 16 veta alto.
+        assert!(vm.step_instruction(cid, &instr_kv_compress(2, 3, 0, 99)).is_err());
+        // +1 sucesso (no-op roteado acima).
         // Rollback: snapshot -> append -> compress -> restore volta tudo.
         let snap = vm.memory.snapshot();
         for layer in 0..2usize {
@@ -8018,7 +8047,7 @@ mod tests {
         vm.memory.restore(snap).unwrap();
         assert_eq!(vm.memory.kv_cache_seq_len(), 5);
         assert_eq!(row(&mut vm, 0, 2).0, vec![7.0; 4]);
-        assert_eq!(vm.stats.kv_compress_execs, 3);
+        assert_eq!(vm.stats.kv_compress_execs, 4);
     }
 
     #[test]
@@ -8505,6 +8534,155 @@ mod tests {
         assert_eq!(vm.memory.read_f32_tensor(p, 6).unwrap(), vec![16.0, 16.0, 16.0, 16.0, 0.0, 0.0]);
     }
 
+    // ---- RFC-0033: KV por stream ----------------------------------------
+
+    #[test]
+    fn test_rfc0033_stream_isolation() {
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.memory.kv_cache_init(2, 4);
+        // Stream 0: 3 linhas [t;4]. Stream 1: 5 linhas [100+t;4].
+        for t in 0..3u32 {
+            for layer in 0..2usize {
+                vm.memory.kv_cache_append(layer, &vec![t as f32; 4], &vec![t as f32; 4]).unwrap();
+            }
+        }
+        for t in 0..5u32 {
+            for layer in 0..2usize {
+                vm.memory.kv_cache_append_stream(1, layer, &vec![(100 + t) as f32; 4], &vec![(200 + t) as f32; 4]).unwrap();
+            }
+        }
+        assert_eq!(vm.memory.kv_cache_seq_len(), 3);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(1), 5);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(2), 0); // inexistente
+        // Valores isolados por stream.
+        let cpu = vm.memory.as_cpu_mut().unwrap();
+        assert_eq!(cpu.kv_cache_row_stream(0, 0, 2).unwrap().0, vec![2.0; 4]);
+        assert_eq!(cpu.kv_cache_row_stream(1, 0, 4).unwrap().0, vec![104.0; 4]);
+        assert_eq!(cpu.kv_cache_row_stream(1, 1, 0).unwrap().1, vec![200.0; 4]);
+        assert!(cpu.kv_cache_row_stream(2, 0, 0).is_none());
+        // Stream 0 intocado pelas escritas do stream 1.
+        assert_eq!(cpu.kv_cache_row_stream(0, 1, 0).unwrap().1, vec![0.0; 4]);
+        // Geometria herdada: mesma (n_layers, hidden); layer OOB veta.
+        assert!(vm.memory.kv_cache_append_stream(1, 9, &[0.0; 4], &[0.0; 4]).is_err());
+        assert!(vm.memory.kv_cache_append_stream(1, 0, &[0.0; 3], &[0.0; 4]).is_err());
+    }
+
+    #[test]
+    fn test_rfc0033_stream_uninit_and_noop() {
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(20), ..Default::default() });
+        // Sem init: append em extra veta (stream 0 sem geometria).
+        assert!(vm.memory.kv_cache_append_stream(1, 0, &[0.0; 4], &[0.0; 4]).is_err());
+        // Truncate/compress em stream inexistente: no-op Ok, nada materializa.
+        vm.memory.kv_cache_truncate_stream(4, 0);
+        vm.memory.kv_cache_compress_sink_window_stream(4, 2, 2);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(4), 0);
+        assert!(vm.memory.as_cpu_mut().unwrap().kv_cache_row_stream(4, 0, 0).is_none());
+    }
+
+    #[test]
+    fn test_rfc0033_exec_routing() {
+        use crate::opcodes::{instr_kv_compress, instr_kv_truncate};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.memory.kv_cache_init(2, 4);
+        for t in 0..6u32 {
+            for layer in 0..2usize {
+                vm.memory.kv_cache_append(layer, &[t as f32; 4], &[t as f32; 4]).unwrap();
+                vm.memory.kv_cache_append_stream(1, layer, &[(50 + t) as f32; 4], &[(60 + t) as f32; 4]).unwrap();
+            }
+        }
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, 4u128)]);
+        // TRUNCATE STREAM=1 não toca o stream 0.
+        let mut tr1 = instr_kv_truncate(0, 0);
+        tr1.set_kv_stream(1);
+        vm.step_instruction(cid, &tr1).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 6);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(1), 4);
+        // COMPRESS STREAM=1: SINK=1 WINDOW=1 em seq 4 => [50,53].
+        vm.step_instruction(cid, &instr_kv_compress(1, 1, 0, 1)).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(1), 2);
+        assert_eq!(vm.memory.kv_cache_seq_len(), 6);
+        let cpu = vm.memory.as_cpu_mut().unwrap();
+        assert_eq!(cpu.kv_cache_row_stream(1, 0, 0).unwrap().0, vec![50.0; 4]);
+        assert_eq!(cpu.kv_cache_row_stream(1, 0, 1).unwrap().0, vec![53.0; 4]);
+        // sid > 16 veta alto nos dois ops.
+        let mut tr99 = instr_kv_truncate(0, 0);
+        tr99.set_kv_stream(99);
+        assert!(vm.step_instruction(cid, &tr99).is_err());
+        assert!(vm.step_instruction(cid, &instr_kv_compress(1, 1, 0, 17)).is_err());
+        assert_eq!(vm.stats.kv_truncate_execs, 1);
+        assert_eq!(vm.stats.kv_compress_execs, 1);
+    }
+
+    #[test]
+    fn test_rfc0033_snapshot_restore_streams() {
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        vm.memory.kv_cache_init(1, 2);
+        for t in 0..3u32 {
+            vm.memory.kv_cache_append(0, &[t as f32; 2], &[t as f32; 2]).unwrap();
+            vm.memory.kv_cache_append_stream(1, 0, &[(10 + t) as f32; 2], &[0.0; 2]).unwrap();
+        }
+        let snap = vm.memory.snapshot();
+        // Muta tudo: append + compress no extra.
+        vm.memory.kv_cache_append(0, &[99.0; 2], &[99.0; 2]).unwrap();
+        vm.memory.kv_cache_append_stream(1, 0, &[99.0; 2], &[99.0; 2]).unwrap();
+        vm.memory.kv_cache_compress_sink_window_stream(1, 1, 1);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(1), 2);
+        vm.memory.restore(snap).unwrap();
+        assert_eq!(vm.memory.kv_cache_seq_len(), 3);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(1), 3);
+        let cpu = vm.memory.as_cpu_mut().unwrap();
+        assert_eq!(cpu.kv_cache_row_stream(1, 0, 2).unwrap().0, vec![12.0; 2]);
+        // Retenção ainda limitada com streams (janela conta versões).
+        vm.memory.as_cpu_mut().unwrap().set_snapshot_window(2);
+        let _ = vm.memory.snapshot();
+        let _ = vm.memory.snapshot();
+        let _ = vm.memory.snapshot();
+        assert!(vm.memory.snapshot_count() <= 2);
+        // Versão expirada falha alto (incl. p/ streams).
+        assert!(vm.memory.restore(snap).is_err());
+    }
+
+    #[test]
+    fn test_rfc0033_depformer_stream_foresight() {
+        use crate::opcodes::instr_depformer;
+        // DEPFORMER (RFC-0032) já chaveava por stream: stream 1 não toca (0,0).
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let mk = |vm: &mut Vm, rows: usize, cols: usize| {
+            let a = vm.memory.alloc_tensor(&[rows, cols], crate::memory::DType::F32).unwrap();
+            vm.memory.write_f32_tensor(a, &vec![1.0; rows * cols]).unwrap();
+            a
+        };
+        let x = mk(&mut vm, 1, 4);
+        let wq = mk(&mut vm, 4, 4);
+        let wk = mk(&mut vm, 4, 4);
+        let wv = mk(&mut vm, 4, 4);
+        let wo = mk(&mut vm, 4, 4);
+        let wh = mk(&mut vm, 4, 4);
+        let t = vm.memory.alloc_tensor(&[64], crate::memory::DType::U8).unwrap();
+        let mut tb = Vec::new();
+        for a in [wq, wk, wv, wo, wh] {
+            tb.extend_from_slice(&u64::try_from(a).unwrap().to_le_bytes());
+        }
+        tb.extend_from_slice(&[0u8; 24]);
+        vm.memory.write(t, &tb).unwrap();
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, x), (1, t)]);
+        vm.step_instruction(cid, &instr_depformer(9, 0, 1, 1, 0, 2, 2, 2, 8, 1.0, 0)).unwrap();
+        assert!(vm.dep_kv.contains_key(&(1, 0)));
+        assert!(!vm.dep_kv.contains_key(&(0, 0)));
+        assert_eq!(vm.stats.depformer_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0033_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/kv_stream_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.kv_truncate_execs, stats.kv_compress_execs), (1, 1));
+    }
+
     // ---- RFC-0005: determinismo -------------------------------------
 
     fn rfc0005_reg_u64(vm: &Vm, cid: u64, r: u8) -> u64 {
@@ -8768,12 +8946,18 @@ mod tests {
         assert_eq!(vm.memory.kv_cache_seq_len(), 1);
         vm.memory.restore(snap).unwrap();
         assert_eq!(vm.memory.kv_cache_seq_len(), 2);
-        // Stream != 0: erro explícito, sem truncar.
-        let mut bad = instr_kv_truncate(0, 0);
-        bad.set_kv_stream(3);
-        assert!(vm.step_instruction(cid, &bad).is_err());
+        // Stream != 0 roteia (RFC-0033): stream 3 inexistente => no-op
+        // Ok, stream 0 intocado.
+        let mut s3 = instr_kv_truncate(0, 0);
+        s3.set_kv_stream(3);
+        vm.step_instruction(cid, &s3).unwrap();
         assert_eq!(vm.memory.kv_cache_seq_len(), 2);
-        assert_eq!(vm.stats.kv_truncate_execs, 3);
+        assert_eq!(vm.memory.kv_cache_seq_len_stream(3), 0);
+        // sid > 16 veta alto (17 streams).
+        let mut bad = instr_kv_truncate(0, 0);
+        bad.set_kv_stream(99);
+        assert!(vm.step_instruction(cid, &bad).is_err());
+        assert_eq!(vm.stats.kv_truncate_execs, 4);
     }
 
     #[tokio::test]

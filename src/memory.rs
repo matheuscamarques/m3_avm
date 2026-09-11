@@ -45,6 +45,9 @@ pub const KV_CACHE_LOGICAL_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB lógico
 pub const KV_CACHE_PHYSICAL_SIZE: usize = 64 * 1024 * 1024; // 64 MiB físico dev (suficiente para testes 22 camadas)
 /// Máximo de tokens (seq_len) suportado no cache lógico
 pub const KV_CACHE_MAX_SEQ: usize = 2048;
+/// Maior stream id válido (streams 0-16 = 17, cf. `MOSHI_N_STREAMS`;
+/// constante local p/ evitar ciclo moshi->memory).
+pub const KV_MAX_STREAM: u16 = 16;
 
 /// Janela padrão de retenção de snapshots (RFC-0003, ESPEC §6.3 item 3).
 /// Limita o crescimento a O(k·|Σ|) por sessão, preservando as profundidades
@@ -244,8 +247,12 @@ pub struct MemoryManager {
     pub(crate) model_mmap: Option<Arc<Mmap>>, // mmap readonly do modelo, zero-copy
     pub(crate) model_path: Option<String>,
 
-    // KV_CACHE (0x30...) — 22 camadas
+    // KV_CACHE (0x30...) — 22 camadas (stream 0; comportamento legado).
     kv_cache_layers: Vec<KvCacheLayer>,
+    /// Streams extras 1-16 (RFC-0033): sid -> camadas. Stream 0 fica no
+    /// campo legado acima (diff zero nos paths existentes). Criação
+    /// preguiçosa herdando a geometria do stream 0.
+    kv_extra_streams: HashMap<u16, Vec<KvCacheLayer>>,
     kv_cache_max_seq: usize,
     kv_cache_base_addr: u128,
     // Para generic read/write na região KV_CACHE (byte view)
@@ -260,6 +267,9 @@ pub struct MemoryManager {
     snapshots: HashMap<u64, HashMap<u128, Arc<Vec<u8>>>>,
     sparse_snapshots: HashMap<u64, HashMap<u128, SparseTensor>>,
     kv_snapshots: HashMap<u64, Vec<KvCacheLayer>>,
+    /// Snapshots dos streams extras (sexto mapa; mesma disciplina
+    /// mesma-chave-ou-nenhuma — ver `evict_old_snapshots`).
+    kv_extra_snapshots: HashMap<u64, HashMap<u16, Vec<KvCacheLayer>>>,
     kv_heap_snapshots: HashMap<u64, HashMap<u128, Arc<Vec<u8>>>>,
     /// Metadados por versão (RFC-0016): sem este mapa, allocs pós-snapshot
     /// deixavam metas penduradas após restore (divergência meta/heap).
@@ -299,6 +309,7 @@ impl MemoryManager {
             model_mmap: None,
             model_path: None,
             kv_cache_layers: Vec::new(),
+            kv_extra_streams: HashMap::new(),
             kv_cache_max_seq: KV_CACHE_MAX_SEQ,
             kv_cache_base_addr: (REGION_KV_CACHE as u128) << 120,
             kv_heap: HashMap::new(),
@@ -308,6 +319,7 @@ impl MemoryManager {
             snapshots: HashMap::new(),
             sparse_snapshots: HashMap::new(),
             kv_snapshots: HashMap::new(),
+            kv_extra_snapshots: HashMap::new(),
             kv_heap_snapshots: HashMap::new(),
             meta_snapshots: HashMap::new(),
         })
@@ -340,6 +352,7 @@ impl MemoryManager {
             model_mmap: None,
             model_path: None,
             kv_cache_layers: Vec::new(),
+            kv_extra_streams: HashMap::new(),
             kv_cache_max_seq: KV_CACHE_MAX_SEQ,
             kv_cache_base_addr: (REGION_KV_CACHE as u128) << 120,
             kv_heap: HashMap::new(),
@@ -349,6 +362,7 @@ impl MemoryManager {
             snapshots: HashMap::new(),
             sparse_snapshots: HashMap::new(),
             kv_snapshots: HashMap::new(),
+            kv_extra_snapshots: HashMap::new(),
             kv_heap_snapshots: HashMap::new(),
             meta_snapshots: HashMap::new(),
         })
@@ -380,6 +394,7 @@ impl MemoryManager {
                     model_mmap: None,
                     model_path: None,
                     kv_cache_layers: Vec::new(),
+            kv_extra_streams: HashMap::new(),
                     kv_cache_max_seq: KV_CACHE_MAX_SEQ,
                     kv_cache_base_addr: (REGION_KV_CACHE as u128) << 120,
                     kv_heap: HashMap::new(),
@@ -389,6 +404,7 @@ impl MemoryManager {
                     snapshots: HashMap::new(),
                     sparse_snapshots: HashMap::new(),
                     kv_snapshots: HashMap::new(),
+            kv_extra_snapshots: HashMap::new(),
                     kv_heap_snapshots: HashMap::new(),
             meta_snapshots: HashMap::new(),
                 }
@@ -916,7 +932,37 @@ impl MemoryManager {
 
     /// Retorna seq_len atual (assume todas layers têm mesmo seq_len).
     pub fn kv_cache_seq_len(&self) -> usize {
-        self.kv_cache_layers.first().map(|l| l.seq_len()).unwrap_or(0)
+        self.kv_cache_seq_len_stream(0)
+    }
+
+    /// Store imutável de um stream (None = inexistente, nunca erro).
+    fn kv_store(&self, sid: u16) -> Option<&Vec<KvCacheLayer>> {
+        if sid == 0 {
+            Some(&self.kv_cache_layers)
+        } else {
+            self.kv_extra_streams.get(&sid)
+        }
+    }
+
+    /// Store mutável de um stream (0 = legado). Extras: criação preguiçosa
+    /// herdando (n_layers, hidden) do stream 0; stream 0 sem init => Err
+    /// (mesma regra de sempre, estendida).
+    fn kv_store_mut(&mut self, sid: u16) -> Result<&mut Vec<KvCacheLayer>> {
+        if sid == 0 {
+            Ok(&mut self.kv_cache_layers)
+        } else {
+            if self.kv_cache_layers.is_empty() {
+                return Err(anyhow!("kv stream {}: stream 0 não inicializado (chame kv_cache_init)", sid));
+            }
+            let n = self.kv_cache_layers.len();
+            let h = self.kv_cache_layers.first().map(|l| l.hidden).unwrap_or(0);
+            Ok(self.kv_extra_streams.entry(sid).or_insert_with(|| (0..n).map(|_| KvCacheLayer::new(h)).collect()))
+        }
+    }
+
+    /// seq_len de um stream (inexistente = 0, nunca erro).
+    pub fn kv_cache_seq_len_stream(&self, sid: u16) -> usize {
+        self.kv_store(sid).and_then(|s| s.first()).map(|l| l.seq_len()).unwrap_or(0)
     }
 
     /// Retorna hidden configurado.
@@ -924,19 +970,26 @@ impl MemoryManager {
         self.kv_cache_layers.first().map(|l| l.hidden).unwrap_or(0)
     }
 
-    /// Append de K/V para uma camada específica.
+    /// Append de K/V para uma camada específica (stream 0).
     pub fn kv_cache_append(&mut self, layer: usize, k_vec: &[f32], v_vec: &[f32]) -> Result<()> {
-        if layer >= self.kv_cache_layers.len() {
-            return Err(anyhow!("kv_cache_append: layer {} >= n_layers {}", layer, self.kv_cache_layers.len()));
+        self.kv_cache_append_stream(0, layer, k_vec, v_vec)
+    }
+
+    /// Append num stream (0 = legado; extras herdam geometria).
+    pub fn kv_cache_append_stream(&mut self, sid: u16, layer: usize, k_vec: &[f32], v_vec: &[f32]) -> Result<()> {
+        let max_seq = self.kv_cache_max_seq;
+        let store = self.kv_store_mut(sid)?;
+        if layer >= store.len() {
+            return Err(anyhow!("kv_cache_append: layer {} >= n_layers {}", layer, store.len()));
         }
-        let hidden = self.kv_cache_layers[layer].hidden;
+        let hidden = store[layer].hidden;
         if k_vec.len() != hidden || v_vec.len() != hidden {
             return Err(anyhow!("kv_cache_append: k/v len {} / {} != hidden {}", k_vec.len(), v_vec.len(), hidden));
         }
-        if self.kv_cache_layers[layer].seq_len >= self.kv_cache_max_seq {
-            return Err(anyhow!("kv_cache_append: seq_len {} atingiu max {}", self.kv_cache_layers[layer].seq_len, self.kv_cache_max_seq));
+        if store[layer].seq_len >= max_seq {
+            return Err(anyhow!("kv_cache_append: seq_len {} atingiu max {}", store[layer].seq_len, max_seq));
         }
-        self.kv_cache_layers[layer].push(k_vec, v_vec);
+        store[layer].push(k_vec, v_vec);
         Ok(())
     }
 
@@ -950,15 +1003,34 @@ impl MemoryManager {
 
     /// Trunca todas as camadas para `new_seq_len` (rollback seletivo).
     pub fn kv_cache_truncate(&mut self, new_seq_len: usize) {
-        for layer in &mut self.kv_cache_layers {
-            layer.truncate(new_seq_len);
+        self.kv_cache_truncate_stream(0, new_seq_len);
+    }
+
+    /// Trunca as camadas de um stream. Inexistente: no-op Ok (não
+    /// materializa estado vazio).
+    pub fn kv_cache_truncate_stream(&mut self, sid: u16, new_seq_len: usize) {
+        let store_opt: Option<&mut Vec<KvCacheLayer>> = if sid == 0 {
+            Some(&mut self.kv_cache_layers)
+        } else {
+            self.kv_extra_streams.get_mut(&sid)
+        };
+        if let Some(store) = store_opt {
+            for layer in store.iter_mut() {
+                layer.truncate(new_seq_len);
+            }
         }
     }
 
-    /// Limpa todo o KV cache (início de nova geração).
+    /// Limpa TODO o KV cache, todos os streams (início de nova geração;
+    /// chamadores single-stream observam comportamento idêntico).
     pub fn kv_cache_clear(&mut self) {
         for layer in &mut self.kv_cache_layers {
             layer.clear();
+        }
+        for store in self.kv_extra_streams.values_mut() {
+            for layer in store.iter_mut() {
+                layer.clear();
+            }
         }
     }
 
@@ -969,7 +1041,18 @@ impl MemoryManager {
     /// sink+window > 0 (degenerado veta no opcode). Escopo = camadas
     /// (kv_heap intocado, como TRUNCATE); rollback via snapshots.
     pub fn kv_cache_compress_sink_window(&mut self, sink: usize, window: usize) {
-        for layer in &mut self.kv_cache_layers {
+        self.kv_cache_compress_sink_window_stream(0, sink, window);
+    }
+
+    /// Compressão num stream (0 = legado). Inexistente: no-op Ok.
+    pub fn kv_cache_compress_sink_window_stream(&mut self, sid: u16, sink: usize, window: usize) {
+        let store_opt: Option<&mut Vec<KvCacheLayer>> = if sid == 0 {
+            Some(&mut self.kv_cache_layers)
+        } else {
+            self.kv_extra_streams.get_mut(&sid)
+        };
+        let Some(store) = store_opt else { return };
+        for layer in store.iter_mut() {
             let s = layer.seq_len();
             if s <= sink.saturating_add(window) {
                 continue;
@@ -992,7 +1075,12 @@ impl MemoryManager {
     /// Lê linha (K, V) de uma camada (inspeção/teste, RFC-0029).
     /// None se camada/posição inexistente.
     pub fn kv_cache_row(&self, layer: usize, pos: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-        let l = self.kv_cache_layers.get(layer)?;
+        self.kv_cache_row_stream(0, layer, pos)
+    }
+
+    /// Linha (K, V) num stream (inexistente = None, nunca erro).
+    pub fn kv_cache_row_stream(&self, sid: u16, layer: usize, pos: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        let l = self.kv_store(sid)?.get(layer)?;
         if pos >= l.seq_len() {
             return None;
         }
@@ -1098,9 +1186,11 @@ impl MemoryManager {
         self.snapshots.insert(self.version, snap);
         let sparse_snap = self.sparse_heap.clone();
         self.sparse_snapshots.insert(self.version, sparse_snap);
-        // KV cache snapshot (22 camadas)
+        // KV cache snapshot (22 camadas) + streams extras (RFC-0033)
         let kv_snap = self.kv_cache_layers.clone();
         self.kv_snapshots.insert(self.version, kv_snap);
+        let kv_extra_snap = self.kv_extra_streams.clone();
+        self.kv_extra_snapshots.insert(self.version, kv_extra_snap);
         let kv_heap_snap = self.kv_heap.clone();
         self.kv_heap_snapshots.insert(self.version, kv_heap_snap);
         let meta_snap = self.tensor_meta.clone();
@@ -1121,7 +1211,7 @@ impl MemoryManager {
         self.snapshots.len()
     }
 
-    /// Recicla as versões mais antigas além da janela, nos CINCO mapas de
+    /// Recicla as versões mais antigas além da janela, nos SEIS mapas de
     /// uma vez (mesma chave ou nenhuma — os mapas nunca divergem).
     fn evict_old_snapshots(&mut self) {
         if self.max_snapshots == 0 {
@@ -1135,6 +1225,7 @@ impl MemoryManager {
                     self.kv_snapshots.remove(&oldest);
                     self.kv_heap_snapshots.remove(&oldest);
                     self.meta_snapshots.remove(&oldest);
+                    self.kv_extra_snapshots.remove(&oldest);
                 }
                 None => break,
             }
@@ -1177,6 +1268,10 @@ impl MemoryManager {
         }
         if let Some(kv_snap) = self.kv_snapshots.get(&version) {
             self.kv_cache_layers = kv_snap.clone();
+            ok = true;
+        }
+        if let Some(kv_extra_snap) = self.kv_extra_snapshots.get(&version) {
+            self.kv_extra_streams = kv_extra_snap.clone();
             ok = true;
         }
         if let Some(kv_heap_snap) = self.kv_heap_snapshots.get(&version) {
