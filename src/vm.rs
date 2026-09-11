@@ -22,7 +22,7 @@ use crate::memory_wgpu::WgpuMemoryManager;
 #[cfg(feature = "wgpu")]
 use pollster;
 use crate::opcodes::{
-    Instruction, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
+    Instruction, ProgramInstr, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
     OP_COMPARE, OP_CTX_SWITCH, OP_DISTANCE, OP_EMBED, OP_FFN, OP_FORK, OP_GATHER, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
     OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
     OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_AUDIO_PCM, SENSE_CODEC_FRAME, SENSE_TOKEN, SENSE_USER_INPUT,
@@ -340,9 +340,13 @@ pub const TRACE_CAP: usize = 1024;
 pub struct Vm {
     pub memory: MemBackend,
     pub scheduler: Scheduler,
-    /// Programa carregado (instruções decodificadas). PC é índice * 32 + base.
-    /// Mantemos também mapa PC (u128) -> índice, pois PC é 128-bit.
-    pub(crate) program: Vec<Instruction>,
+    /// Programa carregado (frames decodificados, largura mista).
+    /// `pc_offsets[i]` = byte offset da instrução `i` a partir de
+    /// `program_base`; o stride vem de `ProgramInstr::byte_len()`
+    /// (W1-remainder). Programas só-32B têm offsets uniformes.
+    pub(crate) program: Vec<ProgramInstr>,
+    /// Byte offsets por instrução (mesmo len que `program`).
+    pub(crate) pc_offsets: Vec<u128>,
     /// Base address do programa em GLOBAL (onde o código reside conceitualmente)
     pub(crate) program_base: u128,
     pub config: VmConfig,
@@ -426,6 +430,7 @@ impl Vm {
             memory,
             scheduler,
             program: Vec::new(),
+            pc_offsets: Vec::new(),
             program_base: 0x1000, // programa começa em GLOBAL 0x1000
             config,
             stats: VmStats::new(),
@@ -456,6 +461,7 @@ impl Vm {
             memory,
             scheduler: Scheduler::new(),
             program: Vec::new(),
+            pc_offsets: Vec::new(),
             program_base: 0x1000,
             config,
             stats: VmStats::new(),
@@ -483,6 +489,7 @@ impl Vm {
             memory: MemBackend::Cpu(MemoryManager::new()?),
             scheduler: Scheduler::new(),
             program: Vec::new(),
+            pc_offsets: Vec::new(),
             program_base: 0x1000,
             config,
             stats: VmStats::new(),
@@ -558,16 +565,50 @@ impl Vm {
         Ok(tok)
     }
 
-    /// Carrega programa a partir de Vec<Instruction>
+    /// Carrega programa 32B a partir de Vec<Instruction> (envolve em
+    /// `ProgramInstr::W32`; todos os chamadores existentes inalterados).
     pub fn load_program(&mut self, prog: Vec<Instruction>) {
+        self.load_mixed(prog.into_iter().map(ProgramInstr::W32).collect());
+    }
+
+    /// Carrega programa de largura mista + reconstrói a tabela de offsets
+    /// (base do fetch com stride variável, W1-remainder).
+    pub fn load_mixed(&mut self, prog: Vec<ProgramInstr>) {
+        // Invariante: classe de largura do frame == classe do opcode
+        // (W64(0x00/0xFF) e W32(0x80+) são inconstructíveis via decode).
+        debug_assert!(prog.iter().all(|f| match f {
+            ProgramInstr::W32(i) =>
+                crate::opcodes::instr_width(i.opcode) == crate::opcodes::InstrWidth::Fixed32,
+            ProgramInstr::W64(g) =>
+                crate::opcodes::instr_width(g.opcode) == crate::opcodes::InstrWidth::Fixed64,
+        }));
         let base = self.program_base;
         self.program = prog;
+        self.rebuild_offsets();
         // Cria contexto inicial GREEN se não houver nenhum
         if self.scheduler.count() == 0 {
             let root = self.memory.current_version();
             let entry_pc = base; // PC inicial aponta para primeira instrução
             let ctx_id = self.scheduler.create_context(Priority::Green, entry_pc, root);
             log_info("vm", &format!("programa carregado: {} instr, ctx inicial {} @ PC {:032x}", self.program.len(), ctx_id, entry_pc));
+        }
+    }
+
+    /// Reconstrói `pc_offsets` a partir das larguras reais.
+    fn rebuild_offsets(&mut self) {
+        self.pc_offsets.clear();
+        let mut off = 0u128;
+        for ins in &self.program {
+            self.pc_offsets.push(off);
+            off += ins.byte_len() as u128;
+        }
+    }
+
+    /// Fim do programa em endereço absoluto (para validação de jump).
+    fn program_end(&self) -> u128 {
+        match (self.pc_offsets.last(), self.program.last()) {
+            (Some(&off), Some(last)) => self.program_base + off + last.byte_len() as u128,
+            _ => self.program_base,
         }
     }
 
@@ -586,25 +627,24 @@ impl Vm {
         Ok(())
     }
 
-    /// Traduz PC (u128) para índice no Vec<Instruction>
+    /// Traduz PC (u128) para índice no programa via tabela de offsets
+    /// (busca binária; endereço no meio de instrução larga => None).
     fn pc_to_index(&self, pc: u128) -> Option<usize> {
         if pc < self.program_base {
             return None;
         }
         let offset = pc - self.program_base;
-        if offset % 32 != 0 {
-            return None;
-        }
-        let idx = (offset / 32) as usize;
-        if idx < self.program.len() {
-            Some(idx)
-        } else {
-            None
-        }
+        self.pc_offsets.binary_search(&offset).ok()
+    }
+
+    /// Busca instrução num PC absoluto (compartilhado com main/reactor,
+    /// que indexavam `program` com `/32` — ver `fetch_at`).
+    pub(crate) fn fetch_at(&self, pc: u128) -> Option<ProgramInstr> {
+        self.pc_to_index(pc).map(|idx| self.program[idx])
     }
 
     /// Busca instrução no PC do contexto
-    fn fetch(&self, ctx: &Context) -> Result<Instruction> {
+    fn fetch(&self, ctx: &Context) -> Result<ProgramInstr> {
         if let Some(idx) = self.pc_to_index(ctx.pc) {
             Ok(self.program[idx])
         } else {
@@ -664,7 +704,7 @@ impl Vm {
             }
 
             // HALT / NOP são tratados sem dispatch genérico para permitir PC advance correto
-            match instr.opcode {
+            match instr.opcode() {
                 OP_HALT => {
                     log_info("vm", &format!("HALT em ctx {} step {}", ctx_id, self.stats.steps));
                     if let Some(c) = self.scheduler.get_mut(ctx_id) {
@@ -679,7 +719,8 @@ impl Vm {
                     continue;
                 }
                 OP_NOP => {
-                    // NOP: só avança PC
+                    // NOP: só avança PC (NOP é sempre 32B por R2).
+                    debug_assert_eq!(instr.byte_len(), 32);
                     if let Some(c) = self.scheduler.get_mut(ctx_id) {
                         c.advance_pc();
                         c.state = crate::context::ContextState::Ready;
@@ -691,6 +732,25 @@ impl Vm {
                 }
                 _ => {}
             }
+
+            // Stride real da instrução buscada (W1-remainder): o avanço
+            // de PC usa largura, nunca constante.
+            let fetched_width = instr.byte_len() as u64;
+            // Formas 64B: fetch OK; dispatch chega nas Fases 7/9. Rejeição
+            // limpa aqui (nunca misdispatch): termina só o contexto.
+            let instr: Instruction = match instr {
+                ProgramInstr::W32(i) => i,
+                ProgramInstr::W64(g) => {
+                    log_warn("vm", &format!("ctx {} opcode 0x{:02x} 64B sem dispatch (Fases 7/9) — terminando contexto", ctx_id, g.opcode));
+                    if let Some(c) = self.scheduler.get_mut(ctx_id) {
+                        c.state = crate::context::ContextState::Terminated;
+                    }
+                    self.scheduler.yield_current();
+                    self.stats.steps += 1;
+                    self.meter.tick(1);
+                    continue;
+                }
+            };
 
             // Execute — erro não deve derrubar VM inteira, apenas o contexto
             let should_advance_pc = match self.execute_instruction(ctx_id, &instr) {
@@ -711,7 +771,7 @@ impl Vm {
             if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
                 if ctx.state == crate::context::ContextState::Running {
                     if should_advance_pc {
-                        ctx.advance_pc();
+                        ctx.advance_pc_by(fetched_width);
                     }
                     ctx.state = crate::context::ContextState::Ready;
                 }
@@ -1692,20 +1752,19 @@ impl Vm {
         Ok(())
     }
 
-    /// Valida que um PC alvo cai dentro do programa.
+    /// Valida que um PC alvo cai em início de instrução do programa
+    /// (tabela de offsets; em programa só-32B equivale ao `% 32` anterior).
     fn check_jump_target(&self, target: u128) -> Result<()> {
         if target < self.program_base {
             return Err(anyhow!("JUMP para {:032x} antes da base {:032x}", target, self.program_base));
         }
-        let offset = target - self.program_base;
-        if offset % 32 != 0 {
-            return Err(anyhow!("JUMP para {:032x} desalinhado", target));
+        if self.pc_to_index(target).is_some() {
+            return Ok(());
         }
-        let idx = (offset / 32) as usize;
-        if idx >= self.program.len() {
+        if target >= self.program_end() {
             return Err(anyhow!("JUMP para {:032x} fora do programa (len {})", target, self.program.len()));
         }
-        Ok(())
+        Err(anyhow!("JUMP para {:032x} desalinhado (não cai em início de instrução)", target))
     }
 
     /// JUMP alvo — pc = alvo (chamador não avança).
@@ -4352,6 +4411,39 @@ mod tests {
         // SAMPLE guardou token em r3 e last_sample
         let r3 = ctx.reg(3).unwrap();
         assert_eq!(vm.last_sample as u128, r3);
+    }
+
+    #[test]
+    fn test_mixed_width_fetch_stride() {
+        // W1-remainder: programa [NOP32][X(0x84)64B][NOP32].
+        // Offsets: [0, 32, 96]; fim em 128. Meio de 64B nunca faz fetch.
+        use crate::opcodes::{instr_nop, Instr64, ProgramInstr};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(10), ..Default::default() });
+        vm.load_mixed(vec![
+            ProgramInstr::W32(instr_nop()),
+            ProgramInstr::W64(Instr64::new(0x84, 0xFF, [0xFF; 5])),
+            ProgramInstr::W32(instr_nop()),
+        ]);
+        let base = vm.program_base;
+        assert_eq!(vm.pc_offsets, vec![0, 32, 96]);
+        assert!(matches!(vm.fetch_at(base), Some(ProgramInstr::W32(_))));
+        assert!(matches!(vm.fetch_at(base + 32), Some(ProgramInstr::W64(_))));
+        assert!(matches!(vm.fetch_at(base + 96), Some(ProgramInstr::W32(_))));
+        // Meio da instrução larga => None (nunca misfetch/misdispatch).
+        assert_eq!(vm.fetch_at(base + 64), None);
+        assert_eq!(vm.fetch_at(base + 128), None); // além do fim
+        // Jumps: inícios OK; meio de 64B e além-do-fim rejeitados.
+        assert!(vm.check_jump_target(base + 32).is_ok());
+        assert!(vm.check_jump_target(base + 96).is_ok());
+        assert!(vm.check_jump_target(base + 64).is_err());
+        assert!(vm.check_jump_target(base + 128).is_err());
+        // Run: NOP avança 32 (stride real), W64 termina o contexto com
+        // mensagem limpa — sem pânico, sem misdispatch. 2 steps.
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.steps, 2);
+        let ctx = vm.scheduler.get(1).unwrap();
+        assert_eq!(ctx.pc, base + 32);
+        assert_eq!(ctx.state, crate::context::ContextState::Terminated);
     }
 
     #[tokio::test]

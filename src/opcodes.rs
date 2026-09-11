@@ -696,6 +696,56 @@ impl std::fmt::Display for Instr64 {
 }
 
 // ---------------------------------------------------------------------------
+// Programa de largura mista (W1-remainder). O `Vm.program` guarda frames
+// já decodificados; o stride vem de `byte_len()`, nunca de constante.
+// Programas só-32B (todo o corpus atual) têm offsets uniformes e
+// comportamento bit-idêntico ao anterior.
+// ---------------------------------------------------------------------------
+
+/// Uma instrução do programa: 32B (`Instruction`) ou 64B (`Instr64`).
+/// `Copy` de propósito: o fetch retorna por valor, sem empréstimo do `Vm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramInstr {
+    W32(Instruction),
+    W64(Instr64),
+}
+
+impl ProgramInstr {
+    /// Opcode (byte 0 em ambas as larguras).
+    pub fn opcode(&self) -> u8 {
+        match *self {
+            ProgramInstr::W32(i) => i.opcode,
+            ProgramInstr::W64(g) => g.opcode,
+        }
+    }
+
+    /// Stride em bytes desta instrução (32 ou 64).
+    pub fn byte_len(&self) -> usize {
+        match *self {
+            ProgramInstr::W32(_) => INSTR_SIZE,
+            ProgramInstr::W64(g) => g.byte_len(),
+        }
+    }
+
+    /// Mnemônico (W64: "UNKNOWN" até as RFCs das Fases 7/9).
+    pub fn mnemonic(&self) -> &'static str {
+        match *self {
+            ProgramInstr::W32(i) => i.mnemonic(),
+            ProgramInstr::W64(g) => g.mnemonic(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProgramInstr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ProgramInstr::W32(i) => write!(f, "{}", i),
+            ProgramInstr::W64(g) => write!(f, "{}", g),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers de construção (ergonomia para assembler / testes)
 // ---------------------------------------------------------------------------
 
@@ -3418,6 +3468,24 @@ mod tests {
     fn test_instr64_display() {
         let s = format!("{}", sample_instr64());
         assert!(s.contains("X_84"), "display deve mostrar opcode: {}", s);
+    }
+
+    #[test]
+    fn test_program_instr_accessors() {
+        let a = ProgramInstr::W32(instr_nop());
+        assert_eq!(a.opcode(), OP_NOP);
+        assert_eq!(a.byte_len(), 32);
+        assert_eq!(a.mnemonic(), "NOP");
+        let b = ProgramInstr::W64(Instr64::new(0x84, 0, [0xFF; 5]));
+        assert_eq!(b.opcode(), 0x84);
+        assert_eq!(b.byte_len(), 64);
+        assert_eq!(b.mnemonic(), "UNKNOWN");
+        // Copy: o fetch retorna por valor, sem empréstimo do Vm.
+        let c = b;
+        assert_eq!(c, b);
+        // Display delega para a largura interna.
+        assert!(format!("{}", a).contains("NOP"));
+        assert!(format!("{}", b).contains("X_84"));
     }
 
     // ---- RFC-0004: GATHER / DISTANCE / RANK1_UPDATE ---------------------

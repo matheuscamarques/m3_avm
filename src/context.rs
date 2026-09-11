@@ -157,9 +157,16 @@ impl Context {
         Ok(())
     }
 
-    /// Incrementa PC em 32 bytes (tamanho fixo da instrução).
+    /// Incrementa PC em 32 bytes (correto para toda instrução 32B e para
+    /// NOP, que é sempre 32B por R2 — ver ESPEC-V2 §4.3).
     pub fn advance_pc(&mut self) {
-        self.pc = self.pc.wrapping_add(32);
+        self.advance_pc_by(32);
+    }
+
+    /// Incrementa PC pela largura real da instrução buscada (W1-remainder:
+    /// o run loop passa `instr.byte_len()`; nunca constante).
+    pub fn advance_pc_by(&mut self, bytes: u64) {
+        self.pc = self.pc.wrapping_add(bytes as u128);
     }
 }
 

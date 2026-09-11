@@ -536,11 +536,17 @@ async fn run_interactive(mut vm: vm::Vm, max_steps: u64, trace: bool) -> Result<
                 Some(c) => c.clone(),
                 None => continue,
             };
-            let base = vm.program_base;
-            if ctx.pc < base { eprintln!("PC fora"); vm.scheduler.get_mut(ctx_id).unwrap().state = crate::context::ContextState::Terminated; continue; }
-            let idx = ((ctx.pc - base)/32) as usize;
-            if idx >= vm.program.len() { eprintln!("PC fora do programa"); vm.scheduler.get_mut(ctx_id).unwrap().state = crate::context::ContextState::Terminated; continue; }
-            vm.program[idx].clone()
+            // Fetch com stride variável (W1-remainder); 64B ainda sem
+            // dispatch no interativo (Fases 7/9) — termina o contexto.
+            match vm.fetch_at(ctx.pc) {
+                Some(opcodes::ProgramInstr::W32(i)) => i,
+                Some(opcodes::ProgramInstr::W64(g)) => {
+                    eprintln!("ctx {} opcode 0x{:02x} 64B sem dispatch (Fases 7/9) — terminando", ctx_id, g.opcode);
+                    vm.scheduler.get_mut(ctx_id).unwrap().state = crate::context::ContextState::Terminated;
+                    continue;
+                }
+                None => { eprintln!("PC fora do programa"); vm.scheduler.get_mut(ctx_id).unwrap().state = crate::context::ContextState::Terminated; continue; }
+            }
         };
 
         if trace {

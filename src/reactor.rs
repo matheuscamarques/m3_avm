@@ -11,7 +11,7 @@
 use crate::bus::{Bus, InterruptSignal, SchedSignal, StreamSignal};
 use crate::context::{Priority, ContextState};
 use crate::memory::DType;
-use crate::opcodes::{Instruction, OP_ABORT, OP_ATTN, OP_FFN, OP_FORK, OP_NORM, OP_SENSE, OP_STREAM, OP_TENSOR, OP_HALT, OP_NOP, SENSE_AUDIO, SENSE_VAD, STREAM_FLAG_BLOCKING};
+use crate::opcodes::{Instruction, ProgramInstr, OP_ABORT, OP_ATTN, OP_FFN, OP_FORK, OP_NORM, OP_SENSE, OP_STREAM, OP_TENSOR, OP_HALT, OP_NOP, SENSE_AUDIO, SENSE_VAD, STREAM_FLAG_BLOCKING};
 use crate::vm::{Vm, VmConfig, VmStats};
 use crate::utils::{log_info, log_warn};
 use anyhow::{anyhow, Result};
@@ -157,15 +157,12 @@ impl Reactor {
     }
 
     fn vm_fetch(&self, ctx: &crate::context::Context) -> Result<Instruction> {
-        let base = self.vm.program_base;
-        if ctx.pc < base { return Err(anyhow!("PC fora")); }
-        let offset = ctx.pc - base;
-        if offset % 32 != 0 { return Err(anyhow!("PC desalinhado")); }
-        let idx = (offset / 32) as usize;
-        if idx < self.vm.program.len() {
-            Ok(self.vm.program[idx].clone())
-        } else {
-            Err(anyhow!("PC fora do programa"))
+        // Fetch com stride variável (W1-remainder); 64B ainda sem dispatch
+        // no reator (Fases 7/9) — erro limpo vira término de contexto acima.
+        match self.vm.fetch_at(ctx.pc) {
+            Some(ProgramInstr::W32(i)) => Ok(i),
+            Some(ProgramInstr::W64(g)) => Err(anyhow!("opcode 0x{:02x} 64B sem dispatch (Fases 7/9)", g.opcode)),
+            None => Err(anyhow!("PC fora do programa")),
         }
     }
 
