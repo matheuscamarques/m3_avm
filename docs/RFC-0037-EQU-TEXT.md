@@ -1,9 +1,9 @@
-# RFC-0037 — Constantes `.equ` + `.text` no Assembler (V-1a, sem opcode)
+# RFC-0037 — Diretivas de Assembler (`.equ`/`.text`/`.data`, sem opcode)
 
 ```text
 Status      : IMPLEMENTED
 Category    : Standards Track
-Updates     : assembler §(assemble_with_base Passo 1, parse_imm_*, 8 use-sites); PLANO_VISAO V-1 (passo 2)
+Updates     : assembler §(assemble Passo 1/1b, parse_imm_*, 8 use-sites, DataSection); PLANO_VISAO V-1 (passos 2–3)
 Obsoletes   : None
 Feature Bit : none (assembler-only)
 Bump        : none (no encoding touched — Trilha P precedent)
@@ -15,10 +15,11 @@ Immediates may now be named: `.equ RAG_TOPK 5` binds an integer
 constant, and later uses in immediate positions (`LOADI r0, RAG_TOPK`,
 `ADD_IMM r1, r0 IMM=RAG_TOPK`, `TENSOR r1 NR NC f32`, `TREES=`/`DEPTH=`,
 `START=`/`LEN=`, `CODE=`, `COMPARE` second operand) assemble to the
-same bytes as the literal. `.text` is accepted as a no-op section
-marker (convention for V-1b). `.data`/`.str` fail with an explicit
-error pointing at V-1b — they previously fell through to the generic
-unknown-opcode error and still fail; nothing was loosened.
+same bytes as the literal. `.text` is accepted as a section marker
+(idempotent; default section stays `.text`). `.data` opens the data
+section (V-1b dia 1: `.u32`/`.i32`/`.f32` escalares + `.str` UTF-8,
+sidecar via `assemble_with_data`); multi-value (`[...]`) é dia 2 e
+erra explícito. `.str` nu erra (é tipo de blob, não diretiva).
 
 ## Motivation
 
@@ -40,8 +41,18 @@ binding) — both are a separate decision (V-1b), not smuggled in here.
                         order-independent (collected in Passo 1, like `.reg`).
 .text                  — section marker, no operands, no instruction emitted.
                          Idempotent. Default section stays `.text`.
-.data / .str           — RESERVED: hard error naming V-1b (not silently dropped,
-                         not assembled).
+.data                  — opens the data section (V-1b dia 1), no operands,
+                         no instruction emitted. Idempotent; `.text`
+                         switches back. Blob lines, one per line:
+                           <nome>: .u32 <dec/0x-hex/.equ>  — 4B LE
+                           <nome>: .i32 <dec/.equ>         — 4B LE (sinal ok)
+                           <nome>: .f32 <literal>          — 4B LE (só literal;
+                                                              const int→float
+                                                              recusada: perda
+                                                              silenciosa)
+                           <nome>: .str "<utf8>"           — bytes crus, sem NUL
+                         Multi-value (`[...]`) é dia 2 (erro explícito).
+                         `.str` nu (fora de blob) erra.
 ```
 
 - Name: `[A-Za-z_][A-Za-z0-9_]*`. Reserved (rejected at declare):
@@ -69,16 +80,31 @@ binding) — both are a separate decision (V-1b), not smuggled in here.
   a word declared in both `.reg` and `.equ` resolves as register in
   reg positions, as constant in immediate positions. `R<digits>` and
   dtype/keyword reservations keep the ambiguous cases unreachable.
-- Unknown dot-words other than the four above keep falling through to
-  the existing unknown-opcode error.
+- `.data` dia 1: blob `nome` é ident (`[A-Za-z_][A-Za-z0-9_]*`,
+  guardado em minúsculas); duplicado → Err; colisão com rótulo de
+  código → Err (namespaces separados, confusão recusada). `.u32`/`.i32`
+  aceitam literal ou `.equ` (faixa checada, nunca truncada); `.f32`
+  recusa `NaN`/`Inf` (bounds assumem finitos); `.str` sem escapes no
+  dia 1 (aspas internas recusadas) e sem `;`/`#` (a linha passa por
+  `strip_comment` antes do parse — dia 2 trata aspas antes do corte).
+  Diretivas `.reg`/`.equ` valem no arquivo todo, independente de seção
+  (blobs parseados no passo 1b — mesmo precedente de forward-reference
+  do `.reg`).
+- `assemble()` com blobs → Err nomeando `assemble_with_data` (nada
+  descartado em silêncio); `assemble_with_data()` retorna
+  `AssembledProgram { instrs, data }`. `instrs` valem para
+  `load_program` hoje; `data` aguarda o preload do dia 3 (sem binding,
+  sem efeito em execução).
+- Unknown dot-words other than `.reg`/`.equ`/`.text`/`.data` keep
+  falling through to the existing unknown-opcode error.
 
 ## Backwards Compatibility
 
 Pure assembler addition. Every previously-assembling program assembles
-to byte-identical output: new code paths trigger only on `.equ`/`.text`
-(which old programs don't contain) or on declared-const lookup (undeclared
-names keep the legacy errors verbatim). Corpus gate 40/40 `.m3asm` via
-CLI loop, including the new demo.
+to byte-identical output: new code paths trigger only on `.equ`/`.text`/
+`.data` (which old programs don't contain) or on declared-const lookup
+(undeclared names keep the legacy errors verbatim). Corpus gate 40/40
+`.m3asm` via CLI loop, including the new demo.
 
 ## Security Considerations
 
@@ -107,14 +133,24 @@ Working tree (no PR link; single-commit scope):
   (r0=10, r1=42, r2=32, branch taken r4=1, TENSOR [2,2] FILL=0.5).
 - Suite: `cargo test --lib` 359 passed (sole failure: pre-existing
   unrelated moshi norm-gamma); corpus gate 40/40 by CLI loop.
+- Dia 1 (V-1b): `DataSection`/`DataBlob`/`DataDtype`/`AssembledProgram` +
+  `assemble_with_data()`; seção `.data` com passo 1b; `parse_data_line`
+  (`.u32`/`.i32`/`.f32`/`.str`).
+- Conformance dia 1: `opcodes::test_v1b_data_scalar_str` (bytes LE
+  bit-exatos, hex/`.equ`/negativo, `.reg`+`.equ` cross-seção,
+  idempotência de seção, 20 casos de erro incl. overflow de faixa,
+  `NaN`/`Inf`, `[...]`→dia 2, colisão blob×rótulo); `assemble()` com
+  `.data` erra pedindo `assemble_with_data`; RFC-0008 green UNCHANGED.
+- Suite dia 1: `cargo test --lib` 360 passed (sole failure: pre-existing
+  moshi); corpus 40/40.
 
-Follow-up (NOT this RFC — V-1b, decisão registrada: sidecar).
-`.data` contents + `.str` bytes + multi-value `TENSOR` init via
-assembler sidecar (`assemble_with_data`) + loader preload + address
-binding — sem opcode novo, sem bump (`.data` é load-time, não
-runtime). `STORE` segue possível um dia, mas só com dossiê R12
-(Trilha P) e 2º caso de uso concreto; V-1b não precisa dele. A V-1b
-ganha RFC própria com sua prova de estrito como esta.
+Follow-up (NOT this RFC — V-1b dias 2–3, decisão registrada: sidecar,
+formato nested). Dia 2: multi-value `.f32 [R, C] [v...]` (shape
+explícito; `DataBlob` ganha `shape[]`; contagem validada contra shape).
+Dia 3: loader preload em GLOBAL + binding + feature bit (container).
+Sem opcode novo, sem bump (`.data` é load-time, não runtime). `STORE`
+segue possível um dia, mas só com dossiê R12 (Trilha P) e 2º caso de
+uso concreto; V-1b não precisa dele.
 
 ## Changelog
 
@@ -122,6 +158,7 @@ ganha RFC própria com sua prova de estrito como esta.
 |:---|:---|:---|
 | 0037-00 | 2026-09-11 | DRAFT: V-1a scope (`.equ`/`.text` + 8 imm sites; `.data`/`.str` deferred) |
 | 0037-01 | 2026-09-11 | IMPLEMENTED: gate green; corpus 40/40; no bump |
+| 0037-02 | 2026-09-11 | V-1b dia 1: `.data` escalar/`.str` + `assemble_with_data` (sem loader); `[...]`→dia 2 |
 
 ---
 *Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

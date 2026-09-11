@@ -2532,7 +2532,22 @@ pub fn instr_forest(rdest: u8, r_feat: u8, r_table: u8, r_leaves: u8, n_trees: u
 /// NOP
 /// ```
 pub fn assemble(text: &str) -> Result<Vec<Instruction>> {
-    assemble_with_base(text, 0x1000)
+    let full = assemble_full(text, 0x1000)?;
+    if !full.data.blobs.is_empty() {
+        return Err(anyhow!(
+            "programa tem seção `.data` ({} blob(s)) — use `assemble_with_data` (V-1b; loader dia 3)",
+            full.data.blobs.len()
+        ));
+    }
+    Ok(full.instrs)
+}
+
+/// V-1b (dia 1): monta código + seção `.data`, sem exigir loader.
+/// `instrs` valem para `load_program` hoje; `data` é sidecar para o
+/// preload do dia 3 (endereços ainda sem binding — semântica de
+/// execução inalterada).
+pub fn assemble_with_data(text: &str) -> Result<AssembledProgram> {
+    assemble_full(text, 0x1000)
 }
 
 /// RFC-0008 (modo estrito): rejeita tokens extras desconhecidos.
@@ -2556,9 +2571,28 @@ fn reject_unknown(op: &str, rest: &[&str], known: &[&str]) -> Result<()> {
 }
 
 pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruction>> {
+    let full = assemble_full(text, program_base)?;
+    if !full.data.blobs.is_empty() {
+        return Err(anyhow!(
+            "programa tem seção `.data` ({} blob(s)) — use `assemble_with_data` (V-1b; loader dia 3)",
+            full.data.blobs.len()
+        ));
+    }
+    Ok(full.instrs)
+}
+
+/// Núcleo comum: duas seções (`.text` código, `.data` blobs), tabela
+/// de símbolos única por chamada (`.reg` + `.equ` valem no arquivo
+/// todo, independente de seção).
+fn assemble_full(text: &str, program_base: u128) -> Result<AssembledProgram> {
     let mut labels: HashMap<String, u128> = HashMap::new();
     let mut syms = SymbolTable::new();
     let mut instr_lines: Vec<(usize, String)> = Vec::new();
+    let mut data = DataSection::default();
+    // Linhas `.data` cruas: parseadas SÓ após todas as diretivas (`.reg`/
+    // `.equ` valem no arquivo todo, como no Passo 2 do código).
+    let mut data_lines: Vec<(usize, String)> = Vec::new();
+    let mut in_data = false;
 
     // Passo 1: Varredura de rótulos, diretivas `.reg` e mapeamento
     for (lineno, raw) in text.lines().enumerate() {
@@ -2661,17 +2695,35 @@ pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruct
                     if words.len() != 1 {
                         return Err(anyhow!("linha {}: `.text` não recebe operandos — '{}'", lineno + 1, line));
                     }
+                    in_data = false;
                     continue;
                 }
-                if words[0].eq_ignore_ascii_case(".data") || words[0].eq_ignore_ascii_case(".str") {
+                // V-1b (dia 1): `.data` abre a seção de blobs (tipos
+                // escalares + `.str`; multi-valor é dia 2). `.str` sozinho
+                // continua erro: é tipo de blob, não diretiva.
+                if words[0].eq_ignore_ascii_case(".data") {
+                    if words.len() != 1 {
+                        return Err(anyhow!("linha {}: `.data` não recebe operandos — '{}'", lineno + 1, line));
+                    }
+                    in_data = true;
+                    continue;
+                }
+                if words[0].eq_ignore_ascii_case(".str") {
                     return Err(anyhow!(
-                        "linha {}: `{}` reservado (V-1b: sidecar de dados, sem opcode novo) — '{}'",
+                        "linha {}: `.str` é tipo de blob dentro de `.data` (ex: `filler_01: .str \"...\"`) — '{}'",
                         lineno + 1,
-                        words[0],
                         line
                     ));
                 }
             }
+        }
+
+        // Seção `.data`: só `nome: .tipo valor` (dia 1: escalar/`.str`).
+        // Instrução ou rótulo de código aqui é erro alto. O parse é
+        // adiado p/ o passo 1b (diretivas valem no arquivo todo).
+        if in_data {
+            data_lines.push((lineno + 1, line.to_string()));
+            continue;
         }
 
         // Verifica se há rótulo no início da linha (ex: "MAIN_LOOP:" ou "MAIN_LOOP: SENSE ...")
@@ -2689,13 +2741,28 @@ pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruct
         }
     }
 
+    // Passo 1b: blobs `.data` (diretivas já todas coletadas acima).
+    for (lineno, line) in &data_lines {
+        let blob = parse_data_line(line, &syms)
+            .map_err(|e| anyhow!("linha {}: {} — '{}'", lineno, e, line))?;
+        if labels.contains_key(blob.name.to_ascii_uppercase().as_str()) {
+            return Err(anyhow!(
+                "linha {}: blob '{}' colide com rótulo de código — '{}'",
+                lineno,
+                blob.name,
+                line
+            ));
+        }
+        data.declare(blob).map_err(|e| anyhow!("linha {}: {}", lineno, e))?;
+    }
+
     // Passo 2: Montagem com resolução de rótulos (+ símbolos do Passo 1)
     let mut out = Vec::with_capacity(instr_lines.len());
     for (lineno, line) in instr_lines {
         let instr = parse_line(&line, &labels, &mut syms).map_err(|e| anyhow!("linha {}: {} — '{}'", lineno, e, line))?;
         out.push(instr);
     }
-    Ok(out)
+    Ok(AssembledProgram { instrs: out, data })
 }
 
 fn strip_comment(s: &str) -> &str {
@@ -2848,6 +2915,149 @@ fn parse_dim_u64(tok: &str, syms: &SymbolTable) -> Result<u64> {
     }
     let c = syms.resolve_const(tok)?;
     u64::try_from(c).map_err(|_| anyhow!("dimensão '{}' fora da faixa u64", tok))
+}
+
+// ---------------------------------------------------------------------------
+// V-1b (dia 1): seção `.data` — sidecar de blobs (load-time, sem opcode).
+// Tipos do dia 1: `.u32`/`.i32`/`.f32` escalares + `.str` UTF-8.
+// Multi-valor (`[...]`) é dia 2 e erra explícito. O loader (dia 3) dá
+// binding aos endereços; até lá, `data` não afeta execução.
+// ---------------------------------------------------------------------------
+
+/// Tipo de um blob `.data` (dia 1: escalar ou string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDtype {
+    U32,
+    I32,
+    F32,
+    Str,
+}
+
+/// Um blob nomeado da seção `.data`: nome (minúsculas), tipo e bytes LE
+/// (inteiros/float em little-endian; `.str` = UTF-8 cru, sem NUL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataBlob {
+    pub name: String,
+    pub dtype: DataDtype,
+    pub bytes: Vec<u8>,
+}
+
+/// Sidecar de dados de um programa montado com `.data`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataSection {
+    pub blobs: Vec<DataBlob>,
+}
+
+impl DataSection {
+    /// Registra um blob; nome repetido: erro (uma definição por arquivo,
+    /// mesma regra de `.reg`/`.equ`).
+    pub fn declare(&mut self, blob: DataBlob) -> Result<()> {
+        if self.blobs.iter().any(|b| b.name == blob.name) {
+            return Err(anyhow!("blob '{}' redeclarado (uma definição por arquivo)", blob.name));
+        }
+        self.blobs.push(blob);
+        Ok(())
+    }
+
+    /// Soma dos `bytes` (para dimensionar a região do loader, dia 3).
+    pub fn total_bytes(&self) -> usize {
+        self.blobs.iter().map(|b| b.bytes.len()).sum()
+    }
+
+    /// Busca case-insensitive (nomes guardados em minúsculas).
+    pub fn find(&self, name: &str) -> Option<&DataBlob> {
+        let key = name.trim().to_ascii_lowercase();
+        self.blobs.iter().find(|b| b.name == key)
+    }
+}
+
+/// Programa montado com dados: instruções + sidecar `.data`.
+#[derive(Debug, Clone)]
+pub struct AssembledProgram {
+    pub instrs: Vec<Instruction>,
+    pub data: DataSection,
+}
+
+/// `nome: .tipo valor` na seção `.data` (dia 1).
+/// Limitação honesta do dia 1: a linha já passou por `strip_comment`
+/// (`;`/`#` cortam), então strings não podem conter `;`/`#` — dia 2
+/// trata aspas antes do corte de comentário.
+fn parse_data_line(line: &str, syms: &SymbolTable) -> Result<DataBlob> {
+    let colon = line.find(':').ok_or_else(|| {
+        anyhow!("seção `.data` só aceita `nome: .tipo valor` (instrução vive em `.text`)")
+    })?;
+    let (name_raw, rest_raw) = (&line[..colon], &line[colon + 1..]);
+    let name = name_raw.trim().to_ascii_lowercase();
+    let ok_ident = !name.is_empty()
+        && name.bytes().next().map_or(false, |b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !ok_ident || name_raw.trim().split_whitespace().count() != 1 {
+        return Err(anyhow!("nome de blob inválido '{}' (ident único)", name_raw.trim()));
+    }
+    let rest = rest_raw.trim();
+    let mut words = rest.split_whitespace();
+    let ty = words.next().ok_or_else(|| {
+        anyhow!("blob '{}' sem tipo (use .u32/.i32/.f32/.str)", name)
+    })?;
+    let after_ty = rest[ty.len()..].trim();
+    match ty.to_ascii_lowercase().as_str() {
+        ".u32" => {
+            if after_ty.is_empty() || after_ty.split_whitespace().count() != 1 {
+                return Err(anyhow!("blob '{}': `.u32` precisa de um valor — ex: `{}: .u32 1920`", name, name));
+            }
+            // Literal decimal/0x-hex ou `.equ` (faixa u32 checada).
+            let v = parse_imm_u128(after_ty, syms)
+                .map_err(|_| anyhow!("blob '{}': valor `.u32` inválido '{}'", name, after_ty))?;
+            let n = u32::try_from(v).map_err(|_| anyhow!("blob '{}': '{}' fora da faixa u32", name, after_ty))?;
+            Ok(DataBlob { name, dtype: DataDtype::U32, bytes: n.to_le_bytes().to_vec() })
+        }
+        ".i32" => {
+            if after_ty.is_empty() || after_ty.split_whitespace().count() != 1 {
+                return Err(anyhow!("blob '{}': `.i32` precisa de um valor — ex: `{}: .i32 -5`", name, name));
+            }
+            // Literal com sinal ou `.equ` (faixa i32 checada).
+            let n = if let Ok(n) = after_ty.parse::<i32>() {
+                n
+            } else if let Ok(c) = syms.resolve_const(after_ty) {
+                i32::try_from(c).map_err(|_| anyhow!("blob '{}': '{}' fora da faixa i32", name, after_ty))?
+            } else {
+                return Err(anyhow!("blob '{}': valor `.i32` inválido '{}'", name, after_ty));
+            };
+            Ok(DataBlob { name, dtype: DataDtype::I32, bytes: n.to_le_bytes().to_vec() })
+        }
+        ".f32" => {
+            if after_ty.is_empty() || after_ty.split_whitespace().count() != 1 {
+                return Err(anyhow!("blob '{}': `.f32` precisa de um valor — ex: `{}: .f32 0.5`", name, name));
+            }
+            // Dia 1: literal float apenas (constante int→float seria
+            // conversão com perda silenciosa — recusada por estrito).
+            let f: f32 = after_ty
+                .parse()
+                .map_err(|_| anyhow!("blob '{}': valor `.f32` inválido '{}'", name, after_ty))?;
+            if !f.is_finite() {
+                return Err(anyhow!("blob '{}': `.f32` não-finito '{}' (NaN/Inf recusados)", name, after_ty));
+            }
+            Ok(DataBlob { name, dtype: DataDtype::F32, bytes: f.to_le_bytes().to_vec() })
+        }
+        ".str" => {
+            if after_ty.len() < 2 || !after_ty.starts_with('"') || !after_ty.ends_with('"') {
+                return Err(anyhow!(
+                    "blob '{}': `.str` precisa de aspas duplas — ex: `{}: .str \"...\"`",
+                    name,
+                    name
+                ));
+            }
+            let inner = &after_ty[1..after_ty.len() - 1];
+            if inner.contains('"') {
+                return Err(anyhow!("blob '{}': `.str` sem escapes no dia 1 (aspas internas recusadas)", name));
+            }
+            Ok(DataBlob { name, dtype: DataDtype::Str, bytes: inner.as_bytes().to_vec() })
+        }
+        _ if ty.starts_with('[') || after_ty.starts_with('[') => {
+            Err(anyhow!("blob '{}': init multi-valor `[...]` é dia 2 (hoje: escalar/`.str`)", name))
+        }
+        _ => Err(anyhow!("blob '{}': tipo '{}' inválido (use .u32/.i32/.f32/.str)", name, ty)),
+    }
 }
 
 fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable) -> Result<Instruction> {
@@ -6551,13 +6761,73 @@ mod tests {
         assert!(assemble(".equ BIG 99999999999999999999999\nTENSOR r1 BIG 4 f32").is_err());
         assert!(assemble(".equ BIG 70000\nASSERT r1 CODE=BIG").is_err());
         assert!(assemble(".text extra\nHALT").is_err());
-        // `.data`/`.str`: erro explícito V-1b (antes: opcode desconhecido;
-        // continuam errando — nada afrouxado).
-        let err = assemble(".data\nHALT").unwrap_err().to_string();
-        assert!(err.contains("V-1b"), "erro deve apontar V-1b: {}", err);
+        // `.data`/`.str` (V-1b dia 1): `.data` abre seção de blobs —
+        // instrução lá dentro erra; `assemble()` com blobs erra pedindo
+        // `assemble_with_data`; `.str` nu erra (é tipo de blob).
+        assert!(assemble(".data\nHALT").is_err());
+        let err = assemble(".data\nx: .u32 1\n.text\nHALT").unwrap_err().to_string();
+        assert!(err.contains("assemble_with_data"), "erro deve apontar assemble_with_data: {}", err);
+        let full = assemble_with_data(".data\nx: .u32 1\n.text\nHALT").unwrap();
+        assert_eq!((full.instrs.len(), full.data.blobs.len()), (1, 1));
         let err = assemble(".str\nHALT").unwrap_err().to_string();
-        assert!(err.contains("V-1b"), "erro deve apontar V-1b: {}", err);
+        assert!(err.contains(".data"), "erro deve apontar .data: {}", err);
         // Faixa preservada: TREES=0 via const continua erro.
         assert!(assemble(".equ Z 0\nFOREST r4, r0, r1, r2 TREES=Z").is_err());
+    }
+
+    // ---- V-1b dia 1: `.data` escalar + `.str` (parser, sem loader) ----
+
+    #[test]
+    fn test_v1b_data_scalar_str() {
+        use super::{assemble_with_data, DataDtype};
+        // Escalares: bytes LE exatos.
+        let full = assemble_with_data(".data\nframe_len: .u32 1920\n.text\nHALT").unwrap();
+        assert_eq!(full.instrs.len(), 1);
+        assert_eq!(full.data.blobs.len(), 1);
+        let b = &full.data.blobs[0];
+        assert_eq!((b.name.as_str(), b.dtype), ("frame_len", DataDtype::U32));
+        assert_eq!(b.bytes, 1920u32.to_le_bytes().to_vec());
+        // Hex + `.equ` no `.u32`; `.i32` negativo e via const.
+        let full = assemble_with_data(".equ N 7\n.data\na: .u32 0x20\nb: .u32 N\nc: .i32 -5\nd: .i32 N\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs.len(), 4);
+        assert_eq!(full.data.blobs[0].bytes, 32u32.to_le_bytes().to_vec());
+        assert_eq!(full.data.blobs[1].bytes, 7u32.to_le_bytes().to_vec());
+        assert_eq!(full.data.blobs[2].bytes, (-5i32).to_le_bytes().to_vec());
+        assert_eq!(full.data.blobs[3].bytes, 7i32.to_le_bytes().to_vec());
+        // `.f32` bit-exato; `.str` UTF-8 cru.
+        let full = assemble_with_data(".data\nt: .f32 0.5\nf: .str \"Hmm...\"\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs[0].bytes, 0.5f32.to_le_bytes().to_vec());
+        assert_eq!(full.data.blobs[1].dtype, DataDtype::Str);
+        assert_eq!(full.data.blobs[1].bytes, b"Hmm...".to_vec());
+        assert_eq!(full.data.total_bytes(), 4 + 6);
+        assert_eq!(full.data.find("T").unwrap().dtype, DataDtype::F32);
+        // `.reg`/`.equ` valem no arquivo todo, em qualquer seção.
+        let full = assemble_with_data(".data\nn: .u32 BASE\n.text\n.reg rFoo r5\n.equ BASE 9\nADD rFoo, r0, r1").unwrap();
+        assert_eq!(full.data.blobs[0].bytes, 9u32.to_le_bytes().to_vec());
+        assert_eq!(full.instrs[0].rdest, 5);
+        // Seção default é `.text`; idempotência de `.text`/`.data`.
+        let full = assemble_with_data("HALT\n.text\nHALT\n.data\na: .u32 1\n.data\nb: .u32 2\n.text\nHALT").unwrap();
+        assert_eq!((full.instrs.len(), full.data.blobs.len()), (3, 2));
+        // Erros altos: instrução/rótulo-nu em `.data`, tipo ruim, valor
+        // ruim, aridade ruim, nome ruim/duplicado, NaN/Inf, aspas,
+        // multi-valor (dia 2), colisão com rótulo de código.
+        assert!(assemble_with_data(".data\nHALT").is_err());
+        assert!(assemble_with_data(".data\nfoo:\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .u64 1\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .u32\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 1 2\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 abc\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 4294967296\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .i32 2147483648\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .f32 abc\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .f32 NaN\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .f32 inf\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .str hi\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .str \"a\"b\"\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\n1x: .u32 1\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nx: .u32 1\nx: .u32 2\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [0.1, 0.2]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nLOOP: .u32 1\n.text\nLOOP:\nHALT").is_err());
+        assert!(assemble_with_data(".data extra\nHALT").is_err());
     }
 }
