@@ -1,0 +1,13 @@
+; programs/arena_memcpy_demo.m3asm — RFC-0023: núcleo de memória.
+; TENSOR FILL -> MEMCPY (inteiro) -> MEMSET (cabeça) + ARENA_ALLOC/RESET
+; com reuso. Todos os contadores verificados em test_rfc0023_demo_runs:
+; arena_alloc=3, arena_reset=1, memcpy=1, memset=1.
+TENSOR r0 2 2 f32 FILL=1
+TENSOR r1 2 2 f32
+MEMCPY r1, r0
+MEMSET r1 PATTERN=0 LEN=4
+ARENA_ALLOC r2, SIZE=64
+ARENA_ALLOC r3, SIZE=32 ALIGN=32
+ARENA_RESET
+ARENA_ALLOC r4, SIZE=16
+HALT

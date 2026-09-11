@@ -32,6 +32,7 @@ use crate::opcodes::{
     OP_PRIORITY_SET, OP_PRIORITY_GET, OP_LOCK, OP_UNLOCK, OP_FENCE, OP_LOADI, OP_MOV, OP_KV_TRUNCATE,
     OP_FOREST, OP_DENOISE_STEP, OP_ODE_STEP, OP_SPIKE_STEP, OP_CONV,
     OP_REMOTE_SPAWN, OP_SIGNAL, OP_SEND_TENSOR, OP_BARRIER, OP_SLICE,
+    OP_ARENA_ALLOC, OP_ARENA_RESET, OP_MEMCPY, OP_MEMSET, MEMCPY_DIR_HOST,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -114,6 +115,10 @@ pub struct VmStats {
     pub signal_execs: u64,
     pub send_tensor_execs: u64,
     pub barrier_execs: u64,
+    pub arena_alloc_execs: u64,
+    pub arena_reset_execs: u64,
+    pub memcpy_execs: u64,
+    pub memset_execs: u64,
     pub start_ns: u64,
 }
 
@@ -375,6 +380,11 @@ pub struct Vm {
     /// push no FORK e pop versionado no ABORT (espelha rank1_layers).
     pub snn_layers: HashMap<u8, (u128, u128)>,
     snn_snapshots: Vec<(u64, HashMap<u8, (u128, u128)>)>,
+    /// Arenas bump por id (ARENA_ALLOC 0x26, RFC-0023): id -> Arena.
+    /// Push (clone) no FORK, pop versionado no ABORT (espelha
+    /// rank1_layers); custo do snapshot O(bytes totais), ver RFC.
+    pub arenas: HashMap<u8, crate::arena::Arena>,
+    arena_snapshots: Vec<(u64, HashMap<u8, crate::arena::Arena>)>,
     /// Barreiras locais (BARRIER 0x1D, RFC-0018): id -> estado one-shot.
     /// Removida no RELEASE e no timeout (sem reuso silencioso de geração).
     pub barriers: HashMap<u32, BarrierState>,
@@ -445,6 +455,8 @@ impl Vm {
             rank1_snapshots: Vec::new(),
             snn_layers: HashMap::new(),
             snn_snapshots: Vec::new(),
+            arenas: HashMap::new(),
+            arena_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -476,6 +488,8 @@ impl Vm {
             rank1_snapshots: Vec::new(),
             snn_layers: HashMap::new(),
             snn_snapshots: Vec::new(),
+            arenas: HashMap::new(),
+            arena_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -504,6 +518,8 @@ impl Vm {
             rank1_snapshots: Vec::new(),
             snn_layers: HashMap::new(),
             snn_snapshots: Vec::new(),
+            arenas: HashMap::new(),
+            arena_snapshots: Vec::new(),
             barriers: HashMap::new(),
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
@@ -1056,6 +1072,22 @@ impl Vm {
                 self.exec_slice(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_ARENA_ALLOC => {
+                self.exec_arena_alloc(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_ARENA_RESET => {
+                self.exec_arena_reset(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_MEMCPY => {
+                self.exec_memcpy(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_MEMSET => {
+                self.exec_memset(ctx_id, instr)?;
+                Ok(true)
+            }
             OP_FOREST => {
                 self.exec_forest(ctx_id, instr)?;
                 Ok(true)
@@ -1592,6 +1624,8 @@ impl Vm {
         self.rank1_snapshots.push((snap_version, self.rank1_layers.clone()));
         // Snapshot dos handles SNN (idem; V/refr imutáveis por passo).
         self.snn_snapshots.push((snap_version, self.snn_layers.clone()));
+        // Snapshot das arenas (mapa; buffers clonados — custo O(total), RFC-0023).
+        self.arena_snapshots.push((snap_version, self.arenas.clone()));
         self.stats.forks += 1;
         log_info("fork", &format!("ctx {} FORK -> child {} prio {} (snap v{})", ctx_id, new_id, child_prio, snap_version));
         Ok(())
@@ -1884,6 +1918,19 @@ impl Vm {
             }
         } else if let Some((_, snap)) = self.snn_snapshots.pop() {
             self.snn_layers = snap;
+        }
+        // Rollback arenas: idem (buffers do filho descartados com o mapa).
+        if ts_version != 0 {
+            while self.arena_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.arena_snapshots.pop();
+            }
+            if self.arena_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.arena_snapshots.pop() {
+                    self.arenas = snap;
+                }
+            }
+        } else if let Some((_, snap)) = self.arena_snapshots.pop() {
+            self.arenas = snap;
         }
 
         self.stats.aborts += 1;
@@ -3526,6 +3573,140 @@ impl Vm {
         Ok(())
     }
 
+    /// ARENA_ALLOC rD, SIZE=n [ALIGN=n] [ARENA=id] — bump-alloc na arena
+    /// (criada no primeiro uso); rdest <- offset em bytes. FORK clona o
+    /// mapa, ABORT restaura (disciplina rank1_layers, RFC-0011).
+    fn exec_arena_alloc(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let (size_p, align_p, arena_id) = instr.arena_alloc_params();
+        let size = usize::try_from(size_p).map_err(|_| anyhow!("ARENA_ALLOC: SIZE {} não cabe", size_p))?;
+        let align = usize::try_from(align_p).map_err(|_| anyhow!("ARENA_ALLOC: ALIGN {} não cabe", align_p))?;
+        let arena = self.arenas.entry(arena_id).or_default();
+        let off = arena.alloc(size, align).map_err(|e| anyhow!("ARENA_ALLOC: {}", e))?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, off as u128)?;
+            }
+        }
+        self.stats.arena_alloc_execs += 1;
+        log_debug("arena", &format!("ctx {} ARENA_ALLOC arena={} size={} align={} -> off={}", ctx_id, arena_id, size, align_p, off));
+        Ok(())
+    }
+
+    /// ARENA_RESET [ARENA=id] — cursor=0 O(1), capacidade mantida.
+    /// Arena inexistente é Err (sem criação silenciosa).
+    fn exec_arena_reset(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let arena_id = instr.arena_id();
+        let arena = self.arenas.get_mut(&arena_id)
+            .ok_or_else(|| anyhow!("ARENA_RESET: arena {} inexistente (sem criação silenciosa)", arena_id))?;
+        arena.reset();
+        self.stats.arena_reset_execs += 1;
+        log_debug("arena", &format!("ctx {} ARENA_RESET arena={}", ctx_id, arena_id));
+        Ok(())
+    }
+
+    /// MEMCPY rDst, rSrc [LEN=n] [SRC_OFF=n] [DST_OFF=n] [DIR=HOST] —
+    /// cópia byte-exata tensor->tensor. rDst/rSrc guardam addrs (não são
+    /// reescritos). Lê tudo e reescreve: caminhos exatos de read/write
+    /// (sem depender de busca-por-base com offset), overlap-safe (buffer
+    /// próprio) e CoW-safe (`Arc::make_mut` no write => snapshots
+    /// intactos, RFC-0016). Custo O(src+dst), documentado.
+    fn exec_memcpy(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("MEMCPY precisa de rDst e rSrc com endereços de tensores"));
+        }
+        let (dst_addr, src_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rdest)?, ctx.reg(instr.rsrc1)?)
+        };
+        let (len_p, src_off_p, dst_off_p, dir) = instr.memcpy_params();
+        if dir != MEMCPY_DIR_HOST {
+            return Err(anyhow!("MEMCPY: DIR={} sem driver (só HOST; GPU/NIC são RFC futura)", dir));
+        }
+        let src_meta = self.memory.get_tensor_meta(src_addr).cloned()
+            .ok_or_else(|| anyhow!("MEMCPY: fonte 0x{:x} não é tensor", src_addr))?;
+        let dst_meta = self.memory.get_tensor_meta(dst_addr).cloned()
+            .ok_or_else(|| anyhow!("MEMCPY: destino 0x{:x} não é tensor", dst_addr))?;
+        if src_meta.is_sparse || dst_meta.is_sparse {
+            return Err(anyhow!("MEMCPY: esparso não suportado (denso nesta RFC)"));
+        }
+        if crate::memory::region_of(dst_addr) == crate::memory::Region::Persistent {
+            return Err(anyhow!("MEMCPY: destino em PERSISTENTE (WEIGHTS sempre RO, ESPEC §7.4)"));
+        }
+        let (src_bytes, dst_bytes) = (src_meta.byte_len, dst_meta.byte_len);
+        let (len, so, doff) = if len_p == 0 {
+            if src_off_p != 0 || dst_off_p != 0 {
+                return Err(anyhow!("MEMCPY: LEN=0 seleciona o tensor fonte inteiro e exige offsets 0"));
+            }
+            (src_bytes, 0usize, 0usize)
+        } else {
+            let len = usize::try_from(len_p).map_err(|_| anyhow!("MEMCPY: LEN {} não cabe", len_p))?;
+            let so = usize::try_from(src_off_p).map_err(|_| anyhow!("MEMCPY: SRC_OFF {} não cabe", src_off_p))?;
+            let doff = usize::try_from(dst_off_p).map_err(|_| anyhow!("MEMCPY: DST_OFF {} não cabe", dst_off_p))?;
+            (len, so, doff)
+        };
+        if len == 0 {
+            return Err(anyhow!("MEMCPY: nada a copiar (fonte vazia)"));
+        }
+        if so.saturating_add(len) > src_bytes {
+            return Err(anyhow!("MEMCPY: janela fonte [{}..{}] fora do tensor ({} bytes)", so, so + len, src_bytes));
+        }
+        if doff.saturating_add(len) > dst_bytes {
+            return Err(anyhow!("MEMCPY: janela destino [{}..{}] fora do tensor ({} bytes)", doff, doff + len, dst_bytes));
+        }
+        let src_full = self.memory.read(src_addr, src_bytes)?;
+        let mut dst_full = self.memory.read(dst_addr, dst_bytes)?;
+        dst_full[doff..doff + len].copy_from_slice(&src_full[so..so + len]);
+        self.memory.write(dst_addr, &dst_full)?;
+        self.stats.memcpy_execs += 1;
+        log_debug("memcpy", &format!("ctx {} MEMCPY 0x{:x}[{}..{}] -> 0x{:x}[{}..{}]", ctx_id, src_addr, so, so + len, dst_addr, doff, doff + len));
+        Ok(())
+    }
+
+    /// MEMSET rT, PATTERN=n [LEN=n] [OFF=n] — fill byte-level (não
+    /// value-level; value fill é TENSOR FILL, RFC-0019). Mesmas regras
+    /// de região/esparso do MEMCPY.
+    fn exec_memset(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF {
+            return Err(anyhow!("MEMSET precisa de rTensor com endereço de tensor"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rdest)?
+        };
+        let (pattern, len_p, off_p) = instr.memset_params();
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("MEMSET: 0x{:x} não é tensor", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("MEMSET: esparso não suportado (denso nesta RFC)"));
+        }
+        if crate::memory::region_of(t_addr) == crate::memory::Region::Persistent {
+            return Err(anyhow!("MEMSET: destino em PERSISTENTE (WEIGHTS sempre RO, ESPEC §7.4)"));
+        }
+        let total = meta.byte_len;
+        let (len, off) = if len_p == 0 {
+            if off_p != 0 {
+                return Err(anyhow!("MEMSET: LEN=0 seleciona o tensor inteiro e exige OFF=0"));
+            }
+            (total, 0usize)
+        } else {
+            let len = usize::try_from(len_p).map_err(|_| anyhow!("MEMSET: LEN {} não cabe", len_p))?;
+            let off = usize::try_from(off_p).map_err(|_| anyhow!("MEMSET: OFF {} não cabe", off_p))?;
+            (len, off)
+        };
+        if len == 0 {
+            return Err(anyhow!("MEMSET: nada a preencher (tensor vazio)"));
+        }
+        if off.saturating_add(len) > total {
+            return Err(anyhow!("MEMSET: janela [{}..{}] fora do tensor ({} bytes)", off, off + len, total));
+        }
+        let mut full = self.memory.read(t_addr, total)?;
+        full[off..off + len].fill(pattern);
+        self.memory.write(t_addr, &full)?;
+        self.stats.memset_execs += 1;
+        log_debug("memset", &format!("ctx {} MEMSET 0x{:x}[{}..{}] <- 0x{:02x}", ctx_id, t_addr, off, off + len, pattern));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -4947,6 +5128,155 @@ mod tests {
         assert_eq!(stats.rank1_execs, 3);
         assert_eq!(stats.forks, 1);
         assert_eq!(stats.aborts, 1);
+    }
+
+    // ---- RFC-0023: núcleo de memória --------------------------------
+
+    #[test]
+    fn test_rfc0023_arena_alloc_reset() {
+        use crate::opcodes::{instr_arena_alloc, instr_arena_reset};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        vm.step_instruction(cid, &instr_arena_alloc(2, 64, 16, 1)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 2), 0);
+        vm.step_instruction(cid, &instr_arena_alloc(3, 32, 16, 1)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 3), 64);
+        // cursor=96 já é múltiplo de 32 => 96 (align-up real, não arredonda à toa).
+        vm.step_instruction(cid, &instr_arena_alloc(4, 1, 32, 1)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 4), 96);
+        // align-up de verdade: cursor=97, align 32 => 128.
+        vm.step_instruction(cid, &instr_arena_alloc(7, 1, 32, 1)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 7), 128);
+        // Arenas separadas por id.
+        vm.step_instruction(cid, &instr_arena_alloc(5, 16, 0, 7)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 5), 0);
+        // RESET + reuso O(1).
+        vm.step_instruction(cid, &instr_arena_reset(1)).unwrap();
+        vm.step_instruction(cid, &instr_arena_alloc(6, 16, 0, 1)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 6), 0);
+        // Erros: size 0, align não-potência, reset de arena inexistente.
+        assert!(vm.step_instruction(cid, &instr_arena_alloc(6, 0, 16, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_arena_alloc(6, 8, 3, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_arena_reset(9)).is_err());
+        assert_eq!(vm.stats.arena_alloc_execs, 6);
+        assert_eq!(vm.stats.arena_reset_execs, 1);
+    }
+
+    #[test]
+    fn test_rfc0023_memcpy_memset() {
+        use crate::opcodes::{instr_memcpy, instr_memset, MEMCPY_DIR_GPU, MEMCPY_DIR_HOST};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let a1 = rfc0004_f32(&mut vm, &[2, 2], &[0.0; 4]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0), (1, a1)]);
+        // Cópia inteira bit-exata.
+        vm.step_instruction(cid, &instr_memcpy(1, 0, 0, 0, 0, MEMCPY_DIR_HOST)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a1, 4).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        // MEMSET parcial: primeiros 4 bytes zeram o 1º f32.
+        vm.step_instruction(cid, &instr_memset(1, 0, 4, 0)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a1, 4).unwrap(), vec![0.0, 2.0, 3.0, 4.0]);
+        // Janela parcial: bytes [4..8] de a0 (2.0f32) sobre a1[8..12].
+        vm.step_instruction(cid, &instr_memcpy(1, 0, 4, 4, 8, MEMCPY_DIR_HOST)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a1, 4).unwrap(), vec![0.0, 2.0, 2.0, 4.0]);
+        // Self-copy com overlap: memmove via buffer próprio.
+        vm.step_instruction(cid, &instr_memcpy(1, 1, 4, 0, 4, MEMCPY_DIR_HOST)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a1, 4).unwrap(), vec![0.0, 0.0, 2.0, 4.0]);
+        // Erros: OOB fonte/destino, dir, meta ausente, esparso, PERSISTENTE.
+        assert!(vm.step_instruction(cid, &instr_memcpy(1, 0, 99, 0, 0, MEMCPY_DIR_HOST)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memcpy(1, 0, 4, 0, 13, MEMCPY_DIR_HOST)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memcpy(1, 0, 0, 0, 0, MEMCPY_DIR_GPU)).is_err());
+        vm.scheduler.get_mut(cid).unwrap().set_reg(2, 0xdead).unwrap();
+        assert!(vm.step_instruction(cid, &instr_memcpy(2, 0, 0, 0, 0, MEMCPY_DIR_HOST)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memset(1, 0xAB, 99, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memset(1, 0, 0, 4)).is_err());
+        let a_sparse = vm.memory.alloc_sparse_tensor(&[2, 2], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(3, a_sparse).unwrap();
+        assert!(vm.step_instruction(cid, &instr_memcpy(3, 0, 0, 0, 0, MEMCPY_DIR_HOST)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memcpy(1, 3, 0, 0, 0, MEMCPY_DIR_HOST)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memset(3, 0, 0, 0)).is_err());
+        // Destino PERSISTENTE: meta existe, região veta (WEIGHTS RO).
+        let paddr = 0x2000_0000_0000_0000_0000_0000_0000_1000u128;
+        vm.memory.as_cpu_mut().unwrap().tensor_meta.insert(paddr, crate::memory::TensorMeta {
+            addr: paddr, shape: vec![4], dtype: crate::memory::DType::F32,
+            byte_len: 16, is_sparse: false, density: 1.0,
+        });
+        vm.scheduler.get_mut(cid).unwrap().set_reg(4, paddr).unwrap();
+        assert!(vm.step_instruction(cid, &instr_memcpy(4, 0, 0, 0, 0, MEMCPY_DIR_HOST)).is_err());
+        assert!(vm.step_instruction(cid, &instr_memset(4, 0, 0, 0)).is_err());
+        assert_eq!(vm.stats.memcpy_execs, 3);
+        assert_eq!(vm.stats.memset_execs, 1);
+    }
+
+    #[test]
+    fn test_rfc0023_arena_fork_abort() {
+        use crate::opcodes::{instr_abort, instr_arena_alloc, instr_fork, FORK_FLAG_GREEN};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let parent = rfc0004_ctx_with(&mut vm, &[]);
+        vm.step_instruction(parent, &instr_arena_alloc(0, 64, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, parent, 0), 0);
+        vm.step_instruction(parent, &instr_fork(1, FORK_FLAG_GREEN)).unwrap();
+        let child = rfc0005_reg_u64(&vm, parent, 1);
+        // Mapa vivo compartilhado até o ABORT (disciplina rank1_layers):
+        // filho aloca em 64, cursor vai a 96.
+        vm.step_instruction(child, &instr_arena_alloc(2, 32, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, child, 2), 64);
+        // Pai vê o cursor movido (sem cópia concorrente — isolamento é
+        // por snapshot, não por cópia).
+        vm.step_instruction(parent, &instr_arena_alloc(3, 8, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, parent, 3), 96);
+        // ABORT ts=0 restaura o snapshot do FORK (cursor 64): os dois
+        // allocs pós-FORK desfazem, como rank1_layers.
+        vm.scheduler.get_mut(parent).unwrap().set_reg(4, child as u128).unwrap();
+        vm.scheduler.get_mut(parent).unwrap().set_reg(5, 0).unwrap();
+        vm.step_instruction(parent, &instr_abort(4, 5)).unwrap();
+        vm.step_instruction(parent, &instr_arena_alloc(6, 8, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, parent, 6), 64);
+        assert_eq!(vm.stats.arena_alloc_execs, 4);
+        assert_eq!(vm.stats.forks, 1);
+        assert_eq!(vm.stats.aborts, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0023_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // Pipeline combinado: FILL -> MEMCPY -> MEMSET + ARENA com reuso.
+        let src = r#"
+            TENSOR r0 2 2 f32 FILL=1
+            TENSOR r1 2 2 f32
+            MEMCPY r1, r0
+            MEMSET r1 PATTERN=0 LEN=4
+            ARENA_ALLOC r2, SIZE=64
+            ARENA_ALLOC r3, SIZE=32 ALIGN=32
+            ARENA_RESET
+            ARENA_ALLOC r4, SIZE=16
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.memcpy_execs, 1);
+        assert_eq!(stats.memset_execs, 1);
+        assert_eq!(stats.arena_alloc_execs, 3);
+        assert_eq!(stats.arena_reset_execs, 1);
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        let a1 = ctx.reg(1).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a1, 4).unwrap(), vec![0.0, 1.0, 1.0, 1.0]);
+        // RESET reuso: r2=0, r3=64 (align 32 de cursor 64), r4=0.
+        assert_eq!(ctx.reg(2).unwrap(), 0);
+        assert_eq!(ctx.reg(3).unwrap(), 64);
+        assert_eq!(ctx.reg(4).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0023_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/arena_memcpy_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.arena_alloc_execs, stats.arena_reset_execs, stats.memcpy_execs, stats.memset_execs), (3, 1, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

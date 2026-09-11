@@ -125,6 +125,15 @@ pub const OP_FOREST: u8 = 0x22; // XGBoost/RF: walk sobre tabela plana
 // RFC-0019: FILL escalar em TENSOR + SLICE flat (0x2E).
 pub const TENSOR_FLAG_FILL: u8 = 0b01; // payload[22..26] = fill f32 LE
 pub const OP_SLICE: u8 = 0x2E; // fatia flat [start,start+len) => [1,len]
+// RFC-0023: núcleo de memória (0x26/0x27/0x2A/0x2B; resto de 0x26-0x2F na RFC-0024).
+pub const OP_ARENA_ALLOC: u8 = 0x26; // bump-alloc size+align -> offset
+pub const OP_ARENA_RESET: u8 = 0x27; // cursor=0 O(1)
+pub const OP_MEMCPY: u8 = 0x2A; // cópia byte-exata tensor->tensor
+pub const OP_MEMSET: u8 = 0x2B; // fill de padrão byte
+// Direções — MEMCPY (payload[24]): só HOST executa; GPU/NIC vetam explícito.
+pub const MEMCPY_DIR_HOST: u8 = 0;
+pub const MEMCPY_DIR_GPU: u8 = 1;
+pub const MEMCPY_DIR_NIC: u8 = 2;
 // Modos — FOREST (payload[4]): 0 = valores por árvore, 1 = média.
 pub const FOREST_MODE_VOTE: u8 = 0;
 pub const FOREST_MODE_MEAN: u8 = 1;
@@ -459,6 +468,10 @@ impl Instruction {
             OP_MOV => "MOV",
             OP_KV_TRUNCATE => "KV_TRUNCATE",
             OP_SLICE => "SLICE",
+            OP_ARENA_ALLOC => "ARENA_ALLOC",
+            OP_ARENA_RESET => "ARENA_RESET",
+            OP_MEMCPY => "MEMCPY",
+            OP_MEMSET => "MEMSET",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -1403,6 +1416,115 @@ impl Instruction {
 pub fn instr_slice(rdest: u8, r_tensor: u8, start: u32, len: u32) -> Instruction {
     let mut instr = Instruction::new(OP_SLICE, 0, rdest, r_tensor, 0xFF, 0xFF);
     instr.set_slice_params(start, len);
+    instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0023: ARENA_ALLOC (0x26) / ARENA_RESET (0x27) / MEMCPY (0x2A) /
+// MEMSET (0x2B). Layouts nos 26B congelados (ver RFC).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// ARENA_ALLOC: payload[0..8]=size u64 LE, [8..12]=align u32 LE
+    /// (0=default), [12]=arena_id u8.
+    pub fn arena_alloc_params(&self) -> (u64, u32, u8) {
+        let mut bs = [0u8; 8];
+        bs.copy_from_slice(&self.payload[0..8]);
+        let mut ba = [0u8; 4];
+        ba.copy_from_slice(&self.payload[8..12]);
+        (
+            u64::from_le_bytes(bs),
+            u32::from_le_bytes(ba),
+            self.payload[12],
+        )
+    }
+
+    pub fn set_arena_alloc_params(&mut self, size: u64, align: u32, arena: u8) {
+        self.payload[0..8].copy_from_slice(&size.to_le_bytes());
+        self.payload[8..12].copy_from_slice(&align.to_le_bytes());
+        self.payload[12] = arena;
+    }
+
+    /// ARENA_RESET: payload[0]=arena_id u8.
+    pub fn arena_id(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_arena_id(&mut self, arena: u8) {
+        self.payload[0] = arena;
+    }
+
+    /// MEMCPY: payload[0..8]=len u64 LE (0=tensor fonte inteiro),
+    /// [8..16]=src_off u64, [16..24]=dst_off u64, [24]=dir u8.
+    pub fn memcpy_params(&self) -> (u64, u64, u64, u8) {
+        let mut bl = [0u8; 8];
+        bl.copy_from_slice(&self.payload[0..8]);
+        let mut bs = [0u8; 8];
+        bs.copy_from_slice(&self.payload[8..16]);
+        let mut bd = [0u8; 8];
+        bd.copy_from_slice(&self.payload[16..24]);
+        (
+            u64::from_le_bytes(bl),
+            u64::from_le_bytes(bs),
+            u64::from_le_bytes(bd),
+            self.payload[24],
+        )
+    }
+
+    pub fn set_memcpy_params(&mut self, len: u64, src_off: u64, dst_off: u64, dir: u8) {
+        self.payload[0..8].copy_from_slice(&len.to_le_bytes());
+        self.payload[8..16].copy_from_slice(&src_off.to_le_bytes());
+        self.payload[16..24].copy_from_slice(&dst_off.to_le_bytes());
+        self.payload[24] = dir;
+    }
+
+    /// MEMSET: payload[0]=pattern byte, [1..5]=len u32 LE (0=tensor
+    /// inteiro), [5..13]=offset u64 LE. Byte-level, não value-level.
+    pub fn memset_params(&self) -> (u8, u32, u64) {
+        let mut bl = [0u8; 4];
+        bl.copy_from_slice(&self.payload[1..5]);
+        let mut bo = [0u8; 8];
+        bo.copy_from_slice(&self.payload[5..13]);
+        (
+            self.payload[0],
+            u32::from_le_bytes(bl),
+            u64::from_le_bytes(bo),
+        )
+    }
+
+    pub fn set_memset_params(&mut self, pattern: u8, len: u32, offset: u64) {
+        self.payload[0] = pattern;
+        self.payload[1..5].copy_from_slice(&len.to_le_bytes());
+        self.payload[5..13].copy_from_slice(&offset.to_le_bytes());
+    }
+}
+
+/// ARENA_ALLOC rD, SIZE=n [ALIGN=n] [ARENA=id] — rdest <- offset em bytes.
+pub fn instr_arena_alloc(rdest: u8, size: u64, align: u32, arena: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_ARENA_ALLOC, 0, rdest, 0xFF, 0xFF, 0xFF);
+    instr.set_arena_alloc_params(size, align, arena);
+    instr
+}
+
+/// ARENA_RESET [ARENA=id] — cursor=0 O(1), capacidade mantida.
+pub fn instr_arena_reset(arena: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_ARENA_RESET, 0, 0xFF, 0xFF, 0xFF, 0xFF);
+    instr.set_arena_id(arena);
+    instr
+}
+
+/// MEMCPY rDst, rSrc [LEN=n] [SRC_OFF=n] [DST_OFF=n] [DIR=HOST] —
+/// rDst/rSrc guardam addrs de tensores (não são reescritos).
+pub fn instr_memcpy(r_dst: u8, r_src: u8, len: u64, src_off: u64, dst_off: u64, dir: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_MEMCPY, 0, r_dst, r_src, 0xFF, 0xFF);
+    instr.set_memcpy_params(len, src_off, dst_off, dir);
+    instr
+}
+
+/// MEMSET rT, PATTERN=n [LEN=n] [OFF=n] — fill byte-level no tensor.
+pub fn instr_memset(r_tensor: u8, pattern: u8, len: u32, offset: u64) -> Instruction {
+    let mut instr = Instruction::new(OP_MEMSET, 0, r_tensor, 0xFF, 0xFF, 0xFF);
+    instr.set_memset_params(pattern, len, offset);
     instr
 }
 
@@ -2707,6 +2829,97 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_slice(parse_reg(parts[1])?, parse_reg(parts[2])?, start, len))
         }
+        "ARENA_ALLOC" => {
+            // ARENA_ALLOC rD, SIZE=n [ALIGN=n] [ARENA=id]
+            if parts.len() < 3 {
+                return Err(anyhow!("ARENA_ALLOC precisa de rdest e SIZE= — ex: ARENA_ALLOC r2, SIZE=64 ALIGN=16"));
+            }
+            let (mut size, mut align, mut arena, mut has_size) = (0u64, 0u32, 0u8, false);
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("SIZE=") {
+                    size = v.parse::<u64>().map_err(|_| anyhow!("ARENA_ALLOC SIZE inválido '{}'", p))?;
+                    has_size = true;
+                } else if let Some(v) = up.strip_prefix("ALIGN=") {
+                    align = v.parse::<u32>().map_err(|_| anyhow!("ARENA_ALLOC ALIGN inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("ARENA=") {
+                    arena = v.parse::<u8>().map_err(|_| anyhow!("ARENA_ALLOC ARENA inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("ARENA_ALLOC token desconhecido '{}' (use SIZE=/ALIGN=/ARENA=)", p));
+                }
+            }
+            if !has_size {
+                return Err(anyhow!("ARENA_ALLOC precisa de SIZE= — ex: ARENA_ALLOC r2, SIZE=64"));
+            }
+            Ok(instr_arena_alloc(parse_reg(parts[1])?, size, align, arena))
+        }
+        "ARENA_RESET" => {
+            // ARENA_RESET [ARENA=id]
+            let mut arena = 0u8;
+            for p in &parts[1..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("ARENA=") {
+                    arena = v.parse::<u8>().map_err(|_| anyhow!("ARENA_RESET ARENA inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("ARENA_RESET token desconhecido '{}' (use ARENA=)", p));
+                }
+            }
+            Ok(instr_arena_reset(arena))
+        }
+        "MEMCPY" => {
+            // MEMCPY rDst, rSrc [LEN=n] [SRC_OFF=n] [DST_OFF=n] [DIR=HOST]
+            if parts.len() < 3 {
+                return Err(anyhow!("MEMCPY precisa de rDst, rSrc — ex: MEMCPY r1, r0 LEN=16"));
+            }
+            let (mut len, mut src_off, mut dst_off, mut dir) = (0u64, 0u64, 0u64, MEMCPY_DIR_HOST);
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("LEN=") {
+                    len = v.parse::<u64>().map_err(|_| anyhow!("MEMCPY LEN inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("SRC_OFF=") {
+                    src_off = v.parse::<u64>().map_err(|_| anyhow!("MEMCPY SRC_OFF inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("DST_OFF=") {
+                    dst_off = v.parse::<u64>().map_err(|_| anyhow!("MEMCPY DST_OFF inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("DIR=") {
+                    dir = match v {
+                        "HOST" => MEMCPY_DIR_HOST,
+                        "GPU" => MEMCPY_DIR_GPU,
+                        "NIC" => MEMCPY_DIR_NIC,
+                        _ => v.parse::<u8>().map_err(|_| anyhow!("MEMCPY DIR inválido '{}' (use HOST/GPU/NIC)", p))?,
+                    };
+                    if dir > MEMCPY_DIR_NIC {
+                        return Err(anyhow!("MEMCPY DIR inválido '{}' (use HOST/GPU/NIC)", p));
+                    }
+                } else {
+                    return Err(anyhow!("MEMCPY token desconhecido '{}' (use LEN=/SRC_OFF=/DST_OFF=/DIR=)", p));
+                }
+            }
+            Ok(instr_memcpy(parse_reg(parts[1])?, parse_reg(parts[2])?, len, src_off, dst_off, dir))
+        }
+        "MEMSET" => {
+            // MEMSET rT, PATTERN=n [LEN=n] [OFF=n]
+            if parts.len() < 3 {
+                return Err(anyhow!("MEMSET precisa de rTensor e PATTERN= — ex: MEMSET r1, PATTERN=0 LEN=4"));
+            }
+            let (mut pattern, mut len, mut off, mut has_pat) = (0u8, 0u32, 0u64, false);
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("PATTERN=") {
+                    pattern = v.parse::<u8>().map_err(|_| anyhow!("MEMSET PATTERN inválido '{}' (0-255)", p))?;
+                    has_pat = true;
+                } else if let Some(v) = up.strip_prefix("LEN=") {
+                    len = v.parse::<u32>().map_err(|_| anyhow!("MEMSET LEN inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("OFF=") {
+                    off = v.parse::<u64>().map_err(|_| anyhow!("MEMSET OFF inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("MEMSET token desconhecido '{}' (use PATTERN=/LEN=/OFF=)", p));
+                }
+            }
+            if !has_pat {
+                return Err(anyhow!("MEMSET precisa de PATTERN= — ex: MEMSET r1, PATTERN=0"));
+            }
+            Ok(instr_memset(parse_reg(parts[1])?, pattern, len, off))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -3962,6 +4175,55 @@ mod tests {
         assert!(assemble("SLICE r4, r0 LEN=3").is_err());
         assert!(assemble("SLICE r4").is_err());
         assert!(assemble("SLICE r4, r0 START=3 LEN=3 FOO=1").is_err());
+    }
+
+    // ---- RFC-0023: núcleo de memória --------------------------------
+
+    #[test]
+    fn test_rfc0023_ctor_roundtrip() {
+        let a = instr_arena_alloc(2, 64, 16, 1);
+        assert_eq!(a.opcode, OP_ARENA_ALLOC);
+        assert_eq!(a.arena_alloc_params(), (64, 16, 1));
+        let d = Instruction::decode(&a.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "ARENA_ALLOC");
+        assert_eq!(d.arena_alloc_params(), (64, 16, 1));
+        let r = instr_arena_reset(3);
+        assert_eq!(r.opcode, OP_ARENA_RESET);
+        assert_eq!(r.arena_id(), 3);
+        let d = Instruction::decode(&r.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "ARENA_RESET");
+        let c = instr_memcpy(1, 0, 16, 0, 8, MEMCPY_DIR_HOST);
+        assert_eq!(c.opcode, OP_MEMCPY);
+        assert_eq!(c.memcpy_params(), (16, 0, 8, MEMCPY_DIR_HOST));
+        let d = Instruction::decode(&c.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "MEMCPY");
+        assert_eq!(d.memcpy_params(), (16, 0, 8, MEMCPY_DIR_HOST));
+        let s = instr_memset(1, 0xAB, 4, 8);
+        assert_eq!(s.opcode, OP_MEMSET);
+        assert_eq!(s.memset_params(), (0xAB, 4, 8));
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "MEMSET");
+        assert_eq!(d.memset_params(), (0xAB, 4, 8));
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("ARENA_ALLOC r2, SIZE=64 ALIGN=16 ARENA=1").unwrap();
+        assert_eq!(prog[0].arena_alloc_params(), (64, 16, 1));
+        let prog = assemble("ARENA_RESET ARENA=3").unwrap();
+        assert_eq!(prog[0].arena_id(), 3);
+        let prog = assemble("MEMCPY r1, r0 LEN=16 DST_OFF=8 DIR=HOST").unwrap();
+        assert_eq!(prog[0].memcpy_params(), (16, 0, 8, MEMCPY_DIR_HOST));
+        let prog = assemble("MEMSET r1, PATTERN=171 LEN=4 OFF=8").unwrap();
+        assert_eq!(prog[0].memset_params(), (171, 4, 8));
+        assert!(assemble("ARENA_ALLOC r2").is_err());
+        assert!(assemble("ARENA_ALLOC r2, SIZE=64 FOO=1").is_err());
+        assert!(assemble("ARENA_RESET FOO=1").is_err());
+        assert!(assemble("MEMCPY r1").is_err());
+        assert!(assemble("MEMCPY r1, r0 DIR=GP").is_err());
+        assert!(assemble("MEMCPY r1, r0 DIR=9").is_err());
+        assert!(assemble("MEMCPY r1, r0 FOO=1").is_err());
+        assert!(assemble("MEMSET r1").is_err());
+        assert!(assemble("MEMSET r1, LEN=4").is_err());
+        assert!(assemble("MEMSET r1, PATTERN=256").is_err());
+        assert!(assemble("MEMSET r1, PATTERN=0 FOO=1").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

@@ -596,6 +596,7 @@ outruns the Status column above.
 | `0x1E-0x25` operators (minus GATHER/DISTANCE/RANK1) | ROADMAP | Rejected explicitly until specified |
 | GPU path | PARTIAL | `ATTN<=64` only; GEMV stays CPU |
 | Benches for `0x13-0x19` | IMPL | `benches/hybrid_ops_bench.rs` (7 ops + 80 ms window, §17) |
+| `0x26/0x27 ARENA` + `0x2A/0x2B MEMCPY/MEMSET` (memory core) | IMPL | RFC-0023; bump+O(1) reset, bit-exact/OOB/RO/dir goldens, FORK-snapshot/ABORT-restore, demo `arena_memcpy_demo` (exec verified) |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
 `cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,

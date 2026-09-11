@@ -27,6 +27,7 @@ pub mod utils;
 pub mod vm;
 pub mod asm_emitter;
 pub mod m3bc;
+pub mod arena;
 
 // Módulo de QA — testes de física abstrata (Nível 1-4)
 #[cfg(test)]

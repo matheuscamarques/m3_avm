@@ -230,12 +230,12 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x26` | `ARENA_ALLOC` | 32 | DRAFT | S | ARENA; size+align |
-| `0x27` | `ARENA_RESET` | 32 | DRAFT | S | ARENA; O(1) |
+| `0x26` | `ARENA_ALLOC` | 32 | IMPL | S | Vm-side bump; size+align (RFC-0023) |
+| `0x27` | `ARENA_RESET` | 32 | IMPL | S | O(1); unknown arena traps (RFC-0023) |
 | `0x28` | `SNAPSHOT` | 32 | DRAFT | S | SNAPSHOT; region bitmask; retention k=16 |
 | `0x29` | `RESTORE` | 32 | DRAFT | S | Version handle; monotonic (I-Mono) |
-| `0x2A` | `MEMCPY` | 32 | DRAFT | S | Any region; host/GPU/NIC dir |
-| `0x2B` | `MEMSET` | 32 | DRAFT | S | Pattern+len |
+| `0x2A` | `MEMCPY` | 32 | IMPL | S | Tensor-only MVP; HOST dir; CoW-safe (RFC-0023) |
+| `0x2B` | `MEMSET` | 32 | IMPL | S | Byte pattern+len; PERSISTENT-RO (RFC-0023) |
 | `0x2C` | `PREFETCH` | 32 | DRAFT | S | Cache hint |
 | `0x2D` | `RESHAPE` | 32 | DRAFT | S | View or copy |
 | `0x2E` | `SLICE` | 32 | IMPL | S | Flat [start,len) => [1,len] (RFC-0019) |
