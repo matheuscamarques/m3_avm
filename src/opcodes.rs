@@ -2933,12 +2933,14 @@ pub enum DataDtype {
     Str,
 }
 
-/// Um blob nomeado da seção `.data`: nome (minúsculas), tipo e bytes LE
-/// (inteiros/float em little-endian; `.str` = UTF-8 cru, sem NUL).
+/// Um blob nomeado da seção `.data`: nome (minúsculas), tipo, shape e
+/// bytes LE (dia 1: `shape` vazio = escalar/`.str`; dia 2: `.f32` com
+/// shape explícito `[N]`/`[R,C]` e valores em little-endian).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataBlob {
     pub name: String,
     pub dtype: DataDtype,
+    pub shape: Vec<u32>,
     pub bytes: Vec<u8>,
 }
 
@@ -3009,7 +3011,7 @@ fn parse_data_line(line: &str, syms: &SymbolTable) -> Result<DataBlob> {
             let v = parse_imm_u128(after_ty, syms)
                 .map_err(|_| anyhow!("blob '{}': valor `.u32` inválido '{}'", name, after_ty))?;
             let n = u32::try_from(v).map_err(|_| anyhow!("blob '{}': '{}' fora da faixa u32", name, after_ty))?;
-            Ok(DataBlob { name, dtype: DataDtype::U32, bytes: n.to_le_bytes().to_vec() })
+            Ok(DataBlob { name, dtype: DataDtype::U32, shape: vec![], bytes: n.to_le_bytes().to_vec() })
         }
         ".i32" => {
             if after_ty.is_empty() || after_ty.split_whitespace().count() != 1 {
@@ -3023,9 +3025,14 @@ fn parse_data_line(line: &str, syms: &SymbolTable) -> Result<DataBlob> {
             } else {
                 return Err(anyhow!("blob '{}': valor `.i32` inválido '{}'", name, after_ty));
             };
-            Ok(DataBlob { name, dtype: DataDtype::I32, bytes: n.to_le_bytes().to_vec() })
+            Ok(DataBlob { name, dtype: DataDtype::I32, shape: vec![], bytes: n.to_le_bytes().to_vec() })
         }
         ".f32" => {
+            // Dia 2: `[shape] [valores]` (nested, shape explícito) ou
+            // escalar literal. `.f32 [...]` sem shape erra (sem inferência).
+            if after_ty.starts_with('[') {
+                return parse_nested_f32(&name, after_ty, syms);
+            }
             if after_ty.is_empty() || after_ty.split_whitespace().count() != 1 {
                 return Err(anyhow!("blob '{}': `.f32` precisa de um valor — ex: `{}: .f32 0.5`", name, name));
             }
@@ -3037,7 +3044,7 @@ fn parse_data_line(line: &str, syms: &SymbolTable) -> Result<DataBlob> {
             if !f.is_finite() {
                 return Err(anyhow!("blob '{}': `.f32` não-finito '{}' (NaN/Inf recusados)", name, after_ty));
             }
-            Ok(DataBlob { name, dtype: DataDtype::F32, bytes: f.to_le_bytes().to_vec() })
+            Ok(DataBlob { name, dtype: DataDtype::F32, shape: vec![], bytes: f.to_le_bytes().to_vec() })
         }
         ".str" => {
             if after_ty.len() < 2 || !after_ty.starts_with('"') || !after_ty.ends_with('"') {
@@ -3051,13 +3058,120 @@ fn parse_data_line(line: &str, syms: &SymbolTable) -> Result<DataBlob> {
             if inner.contains('"') {
                 return Err(anyhow!("blob '{}': `.str` sem escapes no dia 1 (aspas internas recusadas)", name));
             }
-            Ok(DataBlob { name, dtype: DataDtype::Str, bytes: inner.as_bytes().to_vec() })
+            Ok(DataBlob { name, dtype: DataDtype::Str, shape: vec![], bytes: inner.as_bytes().to_vec() })
         }
         _ if ty.starts_with('[') || after_ty.starts_with('[') => {
-            Err(anyhow!("blob '{}': init multi-valor `[...]` é dia 2 (hoje: escalar/`.str`)", name))
+            Err(anyhow!("blob '{}': init multi-valor só `.f32` no dia 2 (ex: `{}: .f32 [2, 2] [1.0, 0.0, 0.0, 1.0]`)", name, name))
         }
         _ => Err(anyhow!("blob '{}': tipo '{}' inválido (use .u32/.i32/.f32/.str)", name, ty)),
     }
+}
+
+/// Multi-valor nested dia 2: `.f32 [R] [v...]` / `.f32 [R, C] [v...]`.
+/// Gramática fechada, tudo numa linha (parser é line-based):
+/// - shape explícito e obrigatório (sem inferência: `.f32 [...]` erra);
+/// - rank 1–2 (rank 3+ erra); dims decimais/0x-hex/`.equ`, não-zero;
+/// - valores separados por vírgula (trailing/leading/dupla vírgula erra);
+/// - `count == prod(shape)` ou erro `esperados N, obtidos M`;
+/// - `prod(shape) ≤ u32::MAX` (checado no parse, não em runtime);
+/// - floats finitos; `[[...]]` estilo-JSON recusado explícito.
+fn parse_nested_f32(name: &str, after_ty: &str, syms: &SymbolTable) -> Result<DataBlob> {
+    // Primeiro grupo: shape.
+    let s_close = after_ty.find(']').ok_or_else(|| {
+        anyhow!("blob '{}': shape sem `]` de fechamento — ex: `{}: .f32 [2, 2] [...]`", name, name)
+    })?;
+    let shape_raw = after_ty[1..s_close].trim();
+    let rest = after_ty[s_close + 1..].trim();
+    if shape_raw.is_empty() {
+        return Err(anyhow!(
+            "blob '{}': `.f32 [...]` sem shape (inferência recusada) — ex: `{}: .f32 [4] [...]`",
+            name,
+            name
+        ));
+    }
+    let mut shape: Vec<u32> = Vec::new();
+    for d in shape_raw.split(',') {
+        let d = d.trim();
+        if d.is_empty() {
+            return Err(anyhow!("blob '{}': vírgula vazia no shape `[{}]`", name, shape_raw));
+        }
+        if d.contains('.') {
+            return Err(anyhow!(
+                "blob '{}': `[{}]` parece lista de valores sem shape (shape explícito exigido) — ex: `{}: .f32 [2] [...]`",
+                name,
+                shape_raw,
+                name
+            ));
+        }
+        let v = parse_imm_u128(d, syms)
+            .map_err(|_| anyhow!("blob '{}': dim inválida '{}' no shape `[{}]`", name, d, shape_raw))?;
+        let n = u32::try_from(v).map_err(|_| anyhow!("blob '{}': dim '{}' fora da faixa u32", name, d))?;
+        if n == 0 {
+            return Err(anyhow!("blob '{}': dim zero no shape `[{}]` (tensor vazio recusado)", name, shape_raw));
+        }
+        shape.push(n);
+    }
+    if shape.len() > 2 {
+        return Err(anyhow!(
+            "blob '{}': rank {} não suportado no dia 2 (ranks 1–2) — shape `[{}]`",
+            name,
+            shape.len(),
+            shape_raw
+        ));
+    }
+    let prod: u128 = shape.iter().map(|&n| n as u128).product();
+    if prod > u32::MAX as u128 {
+        return Err(anyhow!("blob '{}': prod(shape)={} acima de u32::MAX", name, prod));
+    }
+    let expected = prod as usize;
+    // Segundo grupo: valores (obrigatório; nada após ele).
+    if rest.is_empty() {
+        return Err(anyhow!(
+            "blob '{}': shape `[{}]` sem bloco de valores — ex: `{}: .f32 [{}] [...]`",
+            name,
+            shape_raw,
+            name,
+            shape_raw
+        ));
+    }
+    if !rest.starts_with('[') || !rest.ends_with(']') {
+        return Err(anyhow!(
+            "blob '{}': após o shape, esperado `[v, ...]` — obtido '{}'",
+            name,
+            rest
+        ));
+    }
+    let vals_raw = rest[1..rest.len() - 1].trim();
+    // Vírgula pendente/líder explícita (antes de tokenizar).
+    if vals_raw.is_empty() {
+        return Err(anyhow!("blob '{}': esperados {} valores, obtidos 0", name, expected));
+    }
+    if vals_raw.starts_with(',') || vals_raw.ends_with(',') {
+        return Err(anyhow!("blob '{}': vírgula pendente/líder em `[{}]` (trailing comma recusada)", name, vals_raw));
+    }
+    let mut bytes: Vec<u8> = Vec::with_capacity(expected * 4);
+    let mut got = 0usize;
+    for tok in vals_raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            return Err(anyhow!("blob '{}': vírgula dupla/vazia em `[{}]`", name, vals_raw));
+        }
+        if tok.starts_with('[') {
+            return Err(anyhow!("blob '{}': `[[...]]` estilo-JSON recusado (forma nested: `[shape] [v...]`)", name));
+        }
+        let f: f32 = tok
+            .parse()
+            .map_err(|_| anyhow!("blob '{}': valor `.f32` inválido '{}'", name, tok))?;
+        if !f.is_finite() {
+            return Err(anyhow!("blob '{}': `.f32` não-finito '{}' (NaN/Inf recusados)", name, tok));
+        }
+        bytes.extend_from_slice(&f.to_le_bytes());
+        got += 1;
+    }
+    if got != expected {
+        return Err(anyhow!("blob '{}': esperados {} valores, obtidos {}", name, expected, got));
+    }
+    Ok(DataBlob { name: name.to_string(), dtype: DataDtype::F32, shape, bytes })
 }
 
 fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable) -> Result<Instruction> {
@@ -6829,5 +6943,57 @@ mod tests {
         assert!(assemble_with_data(".data\nv: .f32 [0.1, 0.2]\n.text\nHALT").is_err());
         assert!(assemble_with_data(".data\nLOOP: .u32 1\n.text\nLOOP:\nHALT").is_err());
         assert!(assemble_with_data(".data extra\nHALT").is_err());
+    }
+
+    // ---- V-1b dia 2: multi-valor nested `.f32 [shape] [vals]` ----------
+
+    #[test]
+    fn test_v1b_data_nested() {
+        use super::{assemble_with_data, DataDtype};
+        fn f32s(v: &[f32]) -> Vec<u8> {
+            v.iter().flat_map(|f| f.to_le_bytes()).collect()
+        }
+        // Vetor rank-1 e matriz rank-2: bytes LE bit-exatos + shape.
+        let full = assemble_with_data(".data\nv: .f32 [4] [1.0, 2.0, 3.0, 4.0]\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs[0].shape, vec![4]);
+        assert_eq!(full.data.blobs[0].bytes, f32s(&[1.0, 2.0, 3.0, 4.0]));
+        let full = assemble_with_data(".data\nm: .f32 [2, 2] [1.0, 0.0, 0.0, 1.0]\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs[0].shape, vec![2, 2]);
+        assert_eq!(full.data.blobs[0].bytes, f32s(&[1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(full.data.blobs[0].dtype, DataDtype::F32);
+        // Whitespace normalizado: `[4,4]`, `[4 , 4]`, hex e `.equ` em dims.
+        let a = assemble_with_data(".data\nm: .f32 [2,2] [1.0, 0.0, 0.0, 1.0]\n.text\nHALT").unwrap();
+        let b = assemble_with_data(".data\nm: .f32 [2 , 2] [1.0, 0.0, 0.0, 1.0]\n.text\nHALT").unwrap();
+        assert_eq!(a.data.blobs[0].bytes, b.data.blobs[0].bytes);
+        let full = assemble_with_data(".equ N 2\n.data\nm: .f32 [N, 0x2] [1.0, 0.0, 0.0, 1.0]\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs[0].shape, vec![2, 2]);
+        // Negativos e expoentes.
+        let full = assemble_with_data(".data\nv: .f32 [3] [-1.5, 1e3, 0.25]\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs[0].bytes, f32s(&[-1.5, 1000.0, 0.25]));
+        // Mismatch nomeia esperados/obtidos.
+        let err = assemble_with_data(".data\nv: .f32 [4] [1.0, 2.0]\n.text\nHALT").unwrap_err().to_string();
+        assert!(err.contains("esperados 4") && err.contains("obtidos 2"), "mismatch deve nomear N/M: {}", err);
+        // Erros altos: zero, rank-3, trailing/leading/dupla vírgula, shape
+        // sem valores, valores sem shape, JSON-style, vazio, f32-only,
+        // NaN, sobra após bloco, colchete aberto, escalar intacto.
+        assert!(assemble_with_data(".data\nm: .f32 [0, 4] [1.0, 0.0, 0.0, 1.0]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nt: .f32 [1, 2, 3] [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2] [1.0, 2.0, ]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2] [, 1.0, 2.0]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2] [1.0,, 2.0]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [4]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [1.0, 2.0]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nm: .f32 [[1.0, 2.0], [3.0, 4.0]]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2] []\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .u32 [2] [1, 2]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2] [1.0, NaN]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2] [1.0, 2.0] EXTRA\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [2 [1.0, 2.0]\n.text\nHALT").is_err());
+        assert!(assemble_with_data(".data\nv: .f32 [65536, 65536] [1.0]\n.text\nHALT").is_err());
+        // Escalar dia 1 intacto ao lado de nested.
+        let full = assemble_with_data(".data\ns: .f32 0.5\nm: .f32 [2] [1.0, 2.0]\n.text\nHALT").unwrap();
+        assert_eq!(full.data.blobs.len(), 2);
+        assert_eq!(full.data.blobs[0].shape.len(), 0);
+        assert_eq!(full.data.blobs[1].shape, vec![2]);
     }
 }

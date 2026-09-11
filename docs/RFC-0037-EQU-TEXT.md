@@ -18,8 +18,9 @@ constant, and later uses in immediate positions (`LOADI r0, RAG_TOPK`,
 same bytes as the literal. `.text` is accepted as a section marker
 (idempotent; default section stays `.text`). `.data` opens the data
 section (V-1b dia 1: `.u32`/`.i32`/`.f32` escalares + `.str` UTF-8,
-sidecar via `assemble_with_data`); multi-value (`[...]`) é dia 2 e
-erra explícito. `.str` nu erra (é tipo de blob, não diretiva).
+sidecar via `assemble_with_data`); multi-value nested dia 2
+(`.f32 [R] [v...]` / `.f32 [R, C] [v...]`, shape explícito).
+`.str` nu erra (é tipo de blob, não diretiva).
 
 ## Motivation
 
@@ -51,7 +52,9 @@ binding) — both are a separate decision (V-1b), not smuggled in here.
                                                               recusada: perda
                                                               silenciosa)
                            <nome>: .str "<utf8>"           — bytes crus, sem NUL
-                         Multi-value (`[...]`) é dia 2 (erro explícito).
+                         Multi-valor nested dia 2, só `.f32`, tudo numa linha:
+                           <nome>: .f32 [N] [v, ...]       — vetor rank-1
+                           <nome>: .f32 [R, C] [v, ...]    — matriz rank-2
                          `.str` nu (fora de blob) erra.
 ```
 
@@ -90,6 +93,14 @@ binding) — both are a separate decision (V-1b), not smuggled in here.
   Diretivas `.reg`/`.equ` valem no arquivo todo, independente de seção
   (blobs parseados no passo 1b — mesmo precedente de forward-reference
   do `.reg`).
+- `.data` dia 2 (nested, só `.f32`): shape explícito e obrigatório
+  (`.f32 [...]` sem shape erra — sem inferência); rank 1–2 (rank 3+
+  erra); dims decimais/0x-hex/`.equ`, não-zero; valores separados por
+  vírgula (trailing/leading/dupla vírgula erra); `count == prod(shape)`
+  ou erro `esperados N, obtidos M`; `prod(shape) ≤ u32::MAX` no parse;
+  floats finitos; `[[...]]` estilo-JSON recusado; nada após o bloco de
+  valores (sem mistura flat/nested). `DataBlob.shape: Vec<u32>`
+  (vazio = escalar dia 1).
 - `assemble()` com blobs → Err nomeando `assemble_with_data` (nada
   descartado em silêncio); `assemble_with_data()` retorna
   `AssembledProgram { instrs, data }`. `instrs` valem para
@@ -143,10 +154,12 @@ Working tree (no PR link; single-commit scope):
   `.data` erra pedindo `assemble_with_data`; RFC-0008 green UNCHANGED.
 - Suite dia 1: `cargo test --lib` 360 passed (sole failure: pre-existing
   moshi); corpus 40/40.
+- Dia 2: `parse_nested_f32` + `DataBlob.shape`; conformance
+  `opcodes::test_v1b_data_nested` (bytes LE bit-exatos, whitespace/hex/
+  `.equ` em dims, 20 casos incl. mismatch `esperados N, obtidos M`,
+  zero, rank-3, vírgulas, `[[...]]`, `prod > u32::MAX`).
 
-Follow-up (NOT this RFC — V-1b dias 2–3, decisão registrada: sidecar,
-formato nested). Dia 2: multi-value `.f32 [R, C] [v...]` (shape
-explícito; `DataBlob` ganha `shape[]`; contagem validada contra shape).
+Follow-up (NOT this RFC — V-1b dia 3, decisão registrada: sidecar).
 Dia 3: loader preload em GLOBAL + binding + feature bit (container).
 Sem opcode novo, sem bump (`.data` é load-time, não runtime). `STORE`
 segue possível um dia, mas só com dossiê R12 (Trilha P) e 2º caso de
@@ -159,6 +172,7 @@ uso concreto; V-1b não precisa dele.
 | 0037-00 | 2026-09-11 | DRAFT: V-1a scope (`.equ`/`.text` + 8 imm sites; `.data`/`.str` deferred) |
 | 0037-01 | 2026-09-11 | IMPLEMENTED: gate green; corpus 40/40; no bump |
 | 0037-02 | 2026-09-11 | V-1b dia 1: `.data` escalar/`.str` + `assemble_with_data` (sem loader); `[...]`→dia 2 |
+| 0037-03 | 2026-09-11 | V-1b dia 2: multi-valor nested `.f32 [shape] [vals]` (só explícito, ranks 1–2) |
 
 ---
 *Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*
