@@ -1,0 +1,112 @@
+; programs/english_tutor_demo.m3asm — ENGLISH_TUTOR (tutor no emulador).
+; Contrato-contrato: docs/ENGLISH_TUTOR.md (fases, modos, invariantes).
+; Composição sobre voice_loop_demo (fluxo) + V-1b `.str` (filler library).
+; Zero opcode, zero sintaxe, zero região, zero bit.
+;
+; Por run: 1 PHASE (harness: 0 warm-up / 1 interview / 2 review) +
+; 1 TEACH_MODE (harness: 0 explicit / 1 implicit). Run abort: PHASE=1
+; + 1 USER_INPUT -> GOT_SPEECH -> RESTORE -> INCOMPLETE -> HALT.
+; Tabela DEPFORMER via `.equ W_TAB` (nota harness_table, RFC-0037).
+; Filler phrases em `.str` (endereço selecionado por fase, nunca emitido).
+;
+; Regs (16/16 GPR — teto arquitetural, sem folga):
+;   r0=rTurn r1=rTeach r2=rPhase/rIn r3=rPcm r4=rCodes r5=rVad
+;   r6=rY r7=rPcmOut r8=rCorr r9=rAns r10=rOrder r11=rSnap
+;   r12=rW r13=rCan r14=rFil r15=rFh
+.data
+filler_warmup:    .str "Take your time"
+filler_interview: .str "Good point"
+filler_review:    .str "Nice review"
+.text
+.equ TEACH_MODE 0  ; <-- harness: 0 explicit / 1 implicit
+.equ PHASE 0       ; <-- harness: 0 warm-up / 1 interview / 2 review
+.equ W_TAB 0       ; <-- harness: endereço da tabela DEPFORMER
+; Constantes p/ COMPARE (numerais 0-15 parseiam como REGISTRADOR —
+; path numérico legado; .equ é a forma correta de imediato pequeno).
+.equ PH_WARMUP 0
+.equ PH_INTERVIEW 1
+.equ MODE_EXPLICIT 0
+.equ TAG_WARM 9
+.reg rTurn r0
+.reg rTeach r1
+.reg rPhase r2
+.reg rPcm r3
+.reg rCodes r4
+.reg rVad r5
+.reg rY r6
+.reg rPcmOut r7
+.reg rCorr r8
+.reg rAns r9
+.reg rOrder r10
+.reg rSnap r11
+.reg rW r12
+.reg rCan r13
+.reg rFil r14
+.reg rFh r15
+LOADI rTurn, 0
+LOADI rTeach, TEACH_MODE
+LOADI rPhase, PHASE
+TENSOR rCan 1 4 f32 FILL=1.0
+TENSOR rFil 1 8 f32 FILL=9.999
+LOADI rW, W_TAB
+LOADI rOrder, 0
+SNAPSHOT rSnap
+COMPARE rPhase, PH_WARMUP PRED=EQ
+IF_EQUAL PH_W
+COMPARE rPhase, PH_INTERVIEW PRED=EQ
+IF_EQUAL PH_I
+LOADI rFh, @filler_review
+JUMP PH_SEL
+PH_W:
+LOADI rFh, @filler_warmup
+JUMP PH_SEL
+PH_I:
+LOADI rFh, @filler_interview
+PH_SEL:
+LOADI rTurn, 1
+COMPARE rPhase, PH_WARMUP PRED=EQ
+IF_EQUAL MARK_W
+JUMP DO_SENSE
+MARK_W:
+LOADI rOrder, 9
+DO_SENSE:
+SENSE rPhase, USER_INPUT
+IF_INTERRUPT GOT_SPEECH
+JUMP NO_BARGE
+GOT_SPEECH:
+LOADI rTurn, 3
+RESTORE rSnap
+LOADI rTurn, 1
+HALT
+NO_BARGE:
+LOADI rTurn, 2
+SENSE rPcm, AUDIO_PCM
+VAD_DETECT rVad, rCan
+CODEC_ENC rCodes, rPcm TENSOR
+DEPFORMER rY, rCodes, rW NCB=2 NHEADS=2 LEVELS=2 CONTEXT=2
+CODEC_DEC rPcmOut, rY TENSOR
+STREAM rPcmOut, OUTPUT BLOCKING
+COMPARE rOrder, TAG_WARM PRED=EQ
+IF_EQUAL EMIT_W
+COMPARE rTeach, MODE_EXPLICIT PRED=EQ
+IF_EQUAL DO_EXPLICIT
+TENSOR rAns 1 4 f32 FILL=3.5
+STREAM rAns, OUTPUT BLOCKING
+TENSOR rCorr 1 4 f32 FILL=2.5
+STREAM rCorr, OUTPUT BLOCKING
+LOADI rOrder, 2
+JUMP EMITTED
+DO_EXPLICIT:
+TENSOR rCorr 1 4 f32 FILL=2.5
+STREAM rCorr, OUTPUT BLOCKING
+TENSOR rAns 1 4 f32 FILL=3.5
+STREAM rAns, OUTPUT BLOCKING
+LOADI rOrder, 1
+JUMP EMITTED
+EMIT_W:
+TENSOR rAns 1 4 f32 FILL=3.5
+STREAM rAns, OUTPUT BLOCKING
+LOADI rOrder, 0
+EMITTED:
+LOADI rTurn, 0
+HALT

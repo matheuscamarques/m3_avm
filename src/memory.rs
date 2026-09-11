@@ -435,6 +435,12 @@ impl MemoryManager {
         Ok(addr)
     }
 
+    /// Cursor atual do heap GLOBAL (dia 3b: harness lê para montar `.data`
+    /// após pré-alocações; o valor vira `AssembledProgram.data_base`).
+    pub fn global_heap_cursor(&self) -> u128 {
+        self.next_global_offset
+    }
+
     /// Tenta mapear tensor do GGUF para shape (zero-copy PERSISTENTE)
     /// Se shape [2048,2048] bater com `blk.0.attn_q.weight` (f32 ou Q4_K), retorna addr PERSISTENTE
     /// Suporta F32 (0) e Q4_K (12) — para Q4_K, dtype da meta será Q4_K e leitura fará dequant

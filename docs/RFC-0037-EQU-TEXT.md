@@ -128,6 +128,12 @@ binding) — both are a separate decision (V-1b), not smuggled in here.
   `AssembledProgram { instrs, data }`. `instrs` valem para
   `load_program` hoje; `data` aguarda o preload do dia 3 (sem binding,
   sem efeito em execução).
+- ARMADILHA (COMPARE, segundo operando): `parse_reg` tenta antes do
+  imediato, então numerais 0–15 parseiam como REGISTRADOR
+  (`COMPARE rX, 0` compara com r0 — path numérico legado, quirks
+  preservados). Imediato pequeno exige `.equ`
+  (`COMPARE rTeach, MODE_EXPLICIT`); literais ≥16 são imediatos.
+  Achado via `english_tutor_demo` (ordem de emissão invertida).
 - Unknown dot-words other than `.reg`/`.equ`/`.text`/`.data` keep
   falling through to the existing unknown-opcode error.
 

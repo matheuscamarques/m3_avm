@@ -267,6 +267,13 @@ impl MemBackend {
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.alloc_global(size),
         }
     }
+    /// Cursor GLOBAL (dia 3b: base p/ `.data` após pré-alocações).
+    pub fn global_cursor(&self) -> u128 {
+        match self {
+            MemBackend::Cpu(m) => m.global_heap_cursor(),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.global_heap_cursor(),
+        }
+    }
     /// Alocação com byte_len explícito (layouts em bloco, RFC-0025).
     /// GPU veta explícito (sem meta em blocos lá).
     pub fn alloc_tensor_bytes(&mut self, shape: &[usize], dtype: crate::memory::DType, byte_len: usize) -> anyhow::Result<u128> {
@@ -704,23 +711,22 @@ impl Vm {
     }
 
     /// V-1b dia 3: carrega programa montado com `.data` (Opção A).
-    /// Preload como PRIMEIRA alocação GLOBAL (base determinística
-    /// `DATA_LOAD_BASE`); qualquer desvio => erro alto, nunca silencioso
-    /// (ex.: VM não-fresca ou segundo preload — endereços `@` foram
-    /// congelados no assemble para a base).
+    /// Preload no cursor GLOBAL assumido (`prog.data_base`, default
+    /// DATA_LOAD_BASE p/ VM fresca); qualquer desvio => erro alto, nunca
+    /// silencioso (endereços `@` foram congelados no assemble p/ a base).
     pub fn load_assembled(&mut self, prog: &crate::opcodes::AssembledProgram) -> anyhow::Result<()> {
-        use crate::opcodes::{data_layout_addrs, data_layout_total, DATA_LOAD_BASE};
+        use crate::opcodes::{data_layout_addrs_at, data_layout_total};
         if !prog.data.blobs.is_empty() {
             let total = data_layout_total(&prog.data);
             let base = self.memory.alloc_global(total)?;
-            if base != DATA_LOAD_BASE {
+            if base != prog.data_base {
                 return Err(anyhow::anyhow!(
-                    "load_assembled: base GLOBAL 0x{:x} != DATA_LOAD_BASE 0x{:x} (preload exige VM fresca, antes de qualquer alloc)",
+                    "load_assembled: base GLOBAL 0x{:x} != data_base 0x{:x} (monte com assemble_with_data_base(cursor) após pré-alocações)",
                     base,
-                    DATA_LOAD_BASE
+                    prog.data_base
                 ));
             }
-            for (name, addr) in data_layout_addrs(&prog.data) {
+            for (name, addr) in data_layout_addrs_at(&prog.data, prog.data_base) {
                 let blob = prog.data.find(&name).ok_or_else(|| {
                     anyhow::anyhow!("load_assembled: blob '{}' sumiu do layout", name)
                 })?;
@@ -8971,6 +8977,106 @@ mod tests {
         assert_eq!(vm.stats.codec_encs, 2);
         assert_eq!(vm.stats.codec_decs, 2);
         assert_eq!(vm.stats.streams, 2);
+    }
+
+    /// Harness do tutor: tabela DEPFORMER + `.equ` injetados; 1 run por
+    /// (fase, modo). Retorna a Vm pós-run (regs lidos pelo chamador).
+    /// Ordem dia 3b: tabela primeiro (cursor anda), `.data` depois com a
+    /// base lida do cursor — `@` continua absoluto e verificado.
+    fn tutor_run(phase: u8, teach: u8, with_input: bool) -> (Vm, Vec<(String, u128)>) {
+        use crate::opcodes::{assemble_with_data_base, data_layout_addrs_at};
+        let template = include_str!("../programs/english_tutor_demo.m3asm");
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(4000), ..Default::default() });
+        let (_x, t) = rfc0032_table(&mut vm, 16, 2, 2, 1.0);
+        let data_base = vm.memory.global_cursor();
+        let src = template
+            .replace(".equ W_TAB 0", &format!(".equ W_TAB {}", t))
+            .replace(".equ TEACH_MODE 0", &format!(".equ TEACH_MODE {}", teach))
+            .replace(".equ PHASE 0", &format!(".equ PHASE {}", phase));
+        let prog = assemble_with_data_base(&src, data_base).unwrap();
+        let addrs = data_layout_addrs_at(&prog.data, data_base);
+        vm.load_assembled(&prog).unwrap();
+        if with_input {
+            vm.push_input("sorry, could you repeat?".to_string());
+        }
+        vm.run().unwrap();
+        (vm, addrs)
+    }
+
+    fn tutor_reg(vm: &Vm, r: u8) -> u128 {
+        vm.scheduler.get(1).unwrap().reg(r).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_english_tutor_demo() {
+        // Endereços das frases vêm do layout real de cada run (base varia
+        // com a tabela do harness; offsets são fixos). Bytes: do template.
+        let template = include_str!("../programs/english_tutor_demo.m3asm");
+        let blobs = crate::opcodes::assemble_with_data(template).unwrap().data;
+        let phrase_bytes = |n: &str| -> Vec<u8> { blobs.find(n).unwrap().bytes.clone() };
+        // 6 runs limpos: 3 fases × 2 modos.
+        for phase in 0..3u8 {
+            for teach in 0..2u8 {
+                let (vm, addrs) = tutor_run(phase, teach, false);
+                let addr_of = |n: &str| -> u128 {
+                    addrs.iter().find(|(m, _)| m == n).unwrap().1
+                };
+                // (1) Sessão completa; final IDLE.
+                assert_eq!(tutor_reg(&vm, 0), 0, "fase {} modo {}: rTurn=IDLE", phase, teach);
+                // (2) Ordem por modo (+ warm-up só-response).
+                let order = tutor_reg(&vm, 10);
+                let resp = tutor_reg(&vm, 9);
+                assert_eq!(vm.memory.read_f32_tensor(resp, 4).unwrap(), vec![3.5; 4]);
+                if phase == 0 {
+                    assert_eq!(order, 0, "warm-up: sem ordem");
+                } else if teach == 0 {
+                    assert_eq!(order, 1, "explicit: correction-first");
+                    let corr = tutor_reg(&vm, 8);
+                    assert_eq!(vm.memory.read_f32_tensor(corr, 4).unwrap(), vec![2.5; 4]);
+                } else {
+                    assert_eq!(order, 2, "implicit: response-first");
+                    let corr = tutor_reg(&vm, 8);
+                    assert_eq!(vm.memory.read_f32_tensor(corr, 4).unwrap(), vec![2.5; 4]);
+                }
+                // (3) Filler fora do output (marcador + bytes das 3 frases).
+                let out = tutor_reg(&vm, 7);
+                assert!(!vm.memory.read_f32_tensor(out, 1920).unwrap().iter().any(|&v| v == 9.999f32));
+                let raw = vm.memory.read(out, 1920 * 4).unwrap();
+                for f in ["filler_warmup", "filler_interview", "filler_review"] {
+                    let pb = phrase_bytes(f);
+                    assert!(!raw.windows(pb.len()).any(|w| w == pb.as_slice()), "frase {} vazou p/ output", f);
+                }
+                // (4) Filler fora do transcript (= codes do usuário).
+                let codes = tutor_reg(&vm, 4);
+                assert!(!vm.memory.read_f32_tensor(codes, 16).unwrap().iter().any(|&v| v == 9.999f32));
+                // Frase da fase selecionada (endereço), nunca emitida.
+                let want = match phase {
+                    0 => "filler_warmup",
+                    1 => "filler_interview",
+                    _ => "filler_review",
+                };
+                assert_eq!(tutor_reg(&vm, 15), addr_of(want));
+                // Filler marker vivo; canário intacto; VAD determinístico.
+                let fil = tutor_reg(&vm, 14);
+                assert_eq!(vm.memory.read_f32_tensor(fil, 8).unwrap(), vec![9.999f32; 8]);
+                let can = tutor_reg(&vm, 13);
+                assert_eq!(vm.memory.read_f32_tensor(can, 4).unwrap(), vec![1.0; 4]);
+                let vad = tutor_reg(&vm, 5);
+                assert_eq!(vm.memory.read_f32_tensor(vad, 1).unwrap(), vec![1.0]);
+                // Cobertura exata por run.
+                assert_eq!(vm.stats.vad_detect_execs, 1);
+                assert_eq!(vm.stats.codec_encs, 1);
+                assert_eq!(vm.stats.codec_decs, 1);
+                assert_eq!(vm.stats.streams, if phase == 0 { 2 } else { 3 });
+            }
+        }
+        // (5) Abort no role-play: volta a INCOMPLETE, nada emitido.
+        let (vm, _addrs) = tutor_run(1, 0, true);
+        assert_eq!(tutor_reg(&vm, 0), 1, "rTurnState=INCOMPLETE");
+        assert_eq!(tutor_reg(&vm, 10), 0, "rOrder: nada emitido");
+        let can = tutor_reg(&vm, 13);
+        assert_eq!(vm.memory.read_f32_tensor(can, 4).unwrap(), vec![1.0; 4]);
+        assert!(tutor_reg(&vm, 11) > 0, "rSnap válido");
     }
 
     #[tokio::test]

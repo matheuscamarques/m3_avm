@@ -2533,7 +2533,7 @@ pub fn instr_forest(rdest: u8, r_feat: u8, r_table: u8, r_leaves: u8, n_trees: u
 /// NOP
 /// ```
 pub fn assemble(text: &str) -> Result<Vec<Instruction>> {
-    let full = assemble_full(text, 0x1000)?;
+    let full = assemble_full(text, 0x1000, DATA_LOAD_BASE)?;
     if !full.data.blobs.is_empty() {
         return Err(anyhow!(
             "programa tem seção `.data` ({} blob(s)) — use `assemble_with_data` (V-1b; loader dia 3)",
@@ -2548,7 +2548,14 @@ pub fn assemble(text: &str) -> Result<Vec<Instruction>> {
 /// preload do dia 3 (endereços ainda sem binding — semântica de
 /// execução inalterada).
 pub fn assemble_with_data(text: &str) -> Result<AssembledProgram> {
-    assemble_full(text, 0x1000)
+    assemble_full(text, 0x1000, DATA_LOAD_BASE)
+}
+
+/// Variante dia 3b: base de carga explícita (harness que aloca tabelas
+/// antes do preload; o valor viaja em `AssembledProgram.data_base` e o
+/// loader verifica — sem relocation, sem lookup).
+pub fn assemble_with_data_base(text: &str, data_base: u128) -> Result<AssembledProgram> {
+    assemble_full(text, 0x1000, data_base)
 }
 
 /// RFC-0008 (modo estrito): rejeita tokens extras desconhecidos.
@@ -2572,7 +2579,7 @@ fn reject_unknown(op: &str, rest: &[&str], known: &[&str]) -> Result<()> {
 }
 
 pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruction>> {
-    let full = assemble_full(text, program_base)?;
+    let full = assemble_full(text, program_base, DATA_LOAD_BASE)?;
     if !full.data.blobs.is_empty() {
         return Err(anyhow!(
             "programa tem seção `.data` ({} blob(s)) — use `assemble_with_data` (V-1b; loader dia 3)",
@@ -2584,8 +2591,9 @@ pub fn assemble_with_base(text: &str, program_base: u128) -> Result<Vec<Instruct
 
 /// Núcleo comum: duas seções (`.text` código, `.data` blobs), tabela
 /// de símbolos única por chamada (`.reg` + `.equ` valem no arquivo
-/// todo, independente de seção).
-fn assemble_full(text: &str, program_base: u128) -> Result<AssembledProgram> {
+/// todo, independente de seção). `program_base` = PCs do código;
+/// `data_base` = cursor GLOBAL assumido p/ `@` (loader verifica).
+fn assemble_full(text: &str, program_base: u128, data_base: u128) -> Result<AssembledProgram> {
     let mut labels: HashMap<String, u128> = HashMap::new();
     let mut syms = SymbolTable::new();
     let mut instr_lines: Vec<(usize, String)> = Vec::new();
@@ -2769,8 +2777,8 @@ fn assemble_full(text: &str, program_base: u128) -> Result<AssembledProgram> {
         data.declare(blob).map_err(|e| anyhow!("linha {}: {}", lineno, e))?;
     }
     // Dia 3: layout fixo + bind de `@nome` (antes do Passo 2, que resolve
-    // os LOADI de endereço).
-    syms.bind_addrs(&data_layout_addrs(&data));
+    // os LOADI de endereço). Base explícita (dia 3b).
+    syms.bind_addrs(&data_layout_addrs_at(&data, data_base));
 
     // Passo 2: Montagem com resolução de rótulos (+ símbolos do Passo 1)
     let mut out = Vec::with_capacity(instr_lines.len());
@@ -2778,7 +2786,7 @@ fn assemble_full(text: &str, program_base: u128) -> Result<AssembledProgram> {
         let instr = parse_line(&line, &labels, &mut syms).map_err(|e| anyhow!("linha {}: {} — '{}'", lineno, e, line))?;
         out.push(instr);
     }
-    Ok(AssembledProgram { instrs: out, data })
+    Ok(AssembledProgram { instrs: out, data, data_base })
 }
 
 fn strip_comment(s: &str) -> &str {
@@ -3008,11 +3016,14 @@ impl DataSection {
     }
 }
 
-/// Programa montado com dados: instruções + sidecar `.data`.
+/// Programa montado com dados: instruções + sidecar `.data` + base de
+/// carga assumida (dia 3b: harness pode alocar tabelas antes; a base
+/// viaja com o artefato e o loader verifica — Opção A pura, sem lookup).
 #[derive(Debug, Clone)]
 pub struct AssembledProgram {
     pub instrs: Vec<Instruction>,
     pub data: DataSection,
+    pub data_base: u128,
 }
 
 /// `nome: .tipo valor` na seção `.data` (dia 1).
@@ -3240,12 +3251,19 @@ fn align_up(off: usize, align: usize) -> usize {
 /// Layout determinístico compartilhado assembler↔loader: `(nome, addr)`
 /// na ordem de declaração. `start=align(off,tipo)`; próximo blob em
 /// `align8(start+len)`; total inclui o pad final (base+total 8-alinhado).
+/// `base` = cursor GLOBAL onde o loader vai posicionar (default
+/// DATA_LOAD_BASE; dia 3b permite outra quando o harness aloca antes).
 pub fn data_layout_addrs(data: &DataSection) -> Vec<(String, u128)> {
+    data_layout_addrs_at(data, DATA_LOAD_BASE)
+}
+
+/// Variante com base explícita (dia 3b).
+pub fn data_layout_addrs_at(data: &DataSection, base: u128) -> Vec<(String, u128)> {
     let mut out = Vec::with_capacity(data.blobs.len());
     let mut off = 0usize;
     for b in &data.blobs {
         let start = align_up(off, data_dtype_align(b.dtype));
-        out.push((b.name.clone(), DATA_LOAD_BASE + start as u128));
+        out.push((b.name.clone(), base + start as u128));
         off = align_up(start + b.bytes.len(), DATA_BLOB_PAD);
     }
     out

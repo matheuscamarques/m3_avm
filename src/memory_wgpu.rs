@@ -129,6 +129,10 @@ impl WgpuMemoryManager {
         Ok(addr)
     }
 
+    pub fn global_heap_cursor(&self) -> u128 {
+        self.next_offset
+    }
+
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> Result<u128> {
         let elems: usize = shape.iter().product();
         let byte_len = elems * dtype.byte_width();
