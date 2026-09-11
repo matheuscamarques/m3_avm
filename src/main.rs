@@ -3,6 +3,7 @@
 //! Uso:
 //!   cargo run -- run examples/test.m3asm         # assembly textual
 //!   cargo run -- run program.m3bin               # binário 32 bytes/instr
+//!   cargo run -- run program.m3bc                # container (header+CRC, ESPEC-V2 §8)
 //!   cargo run -- bench --nops 1000000            # mede IPS
 //!   cargo run -- asm --help                      # ajuda do assembler
 
@@ -36,6 +37,7 @@ pub mod utils;
 pub mod vm;
 pub mod memory_wgpu;
 pub mod asm_emitter;
+pub mod m3bc;
 
 use opcodes::{assemble, Instruction, INSTR_SIZE, OP_HALT, OP_NOP};
 use vm::{Vm, VmConfig};
@@ -51,7 +53,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Executa um programa (.m3asm ou .m3bin) — tese: SENSE/FORK/ABORT inseparáveis de ATTN/NORM/FFN
+    /// Executa um programa (.m3asm, .m3bin ou .m3bc) — tese: SENSE/FORK/ABORT inseparáveis de ATTN/NORM/FFN
     Run {
         /// Arquivo de entrada (.m3asm ou .m3bin)
         file: PathBuf,
@@ -158,10 +160,36 @@ async fn run_file(path: PathBuf, max_steps: u64, trace: bool, model: Option<Path
             println!(";; Loaded {} instruções de {}", prog.len(), path.display());
             prog
         }
-        _ => {
-            // Tenta detectar por conteúdo: se contém texto legível, assume asm
+        "m3bc" => {
+            // Container .m3bc: header + CRC32 + negociação + frames (ESPEC-V2 §8).
             let bytes = fs::read(&path)?;
-            if bytes.len() % INSTR_SIZE == 0 && is_probably_bin(&bytes) {
+            let loaded = m3bc::load(&bytes)?;
+            let prog = loaded.instructions_32().map_err(|e| {
+                anyhow!(
+                    "{}: {} (fetch 64B pendente — W1-remainder)",
+                    path.display(),
+                    e
+                )
+            })?;
+            println!(
+                ";; Loaded {} instruções de {} (formato .m3bc v{}.{}.{}, entry_pc={})",
+                prog.len(),
+                path.display(),
+                loaded.header.map(|h| h.major).unwrap_or(0),
+                loaded.header.map(|h| h.minor).unwrap_or(0),
+                loaded.header.map(|h| h.patch).unwrap_or(0),
+                loaded.entry_pc
+            );
+            prog
+        }
+        _ => {
+            // Tenta detectar por conteúdo: .m3bc (MAGIC) primeiro (R10),
+            // depois binário legado, senão assume asm.
+            let bytes = fs::read(&path)?;
+            if m3bc::sniff(&bytes) == m3bc::ContainerFormat::M3bc {
+                let loaded = m3bc::load(&bytes)?;
+                loaded.instructions_32()?
+            } else if bytes.len() % INSTR_SIZE == 0 && is_probably_bin(&bytes) {
                 let mut prog = Vec::new();
                 for chunk in bytes.chunks_exact(INSTR_SIZE) {
                     prog.push(Instruction::decode(chunk)?);
