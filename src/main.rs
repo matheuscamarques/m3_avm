@@ -87,7 +87,7 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Desmonta .m3bin -> texto
+    /// Desmonta .m3bin/.m3bc -> texto (misto 32B/64B com PCs reais)
     Disassemble {
         file: PathBuf,
     },
@@ -1155,6 +1155,28 @@ fn assemble_file(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
 
 fn disassemble_file(path: PathBuf) -> Result<()> {
     let bytes = fs::read(&path)?;
+    // Container .m3bc: header validado + frames de largura mista com PCs
+    // reais (stride por frame, nunca `idx * 32`).
+    if m3bc::sniff(&bytes) == m3bc::ContainerFormat::M3bc {
+        let loaded = m3bc::load(&bytes)?;
+        if let Some(h) = loaded.header {
+            println!(";; .m3bc v{}.{}.{} entry_pc={} ({} frames)", h.major, h.minor, h.patch, loaded.entry_pc, loaded.frames.len());
+        }
+        let mut pc = 0x1000u128;
+        for (idx, frame) in loaded.frames.iter().enumerate() {
+            let mark = if pc - 0x1000 == loaded.entry_pc as u128 { " <-- entry" } else { "" };
+            match frame {
+                m3bc::Frame::I32(instr) => println!("{:04}: {:032x}  {}{}", idx, pc, instr, mark),
+                // Frame largo: opcode + largura + tamanho (dispatch: Fases 7/9).
+                m3bc::Frame::Raw { width, bytes } => println!(
+                    "{:04}: {:032x}  X_{:02x} {:?} ({}B, sem dispatch){}",
+                    idx, pc, bytes[0], width, bytes.len(), mark
+                ),
+            }
+            pc += frame.byte_len() as u128;
+        }
+        return Ok(());
+    }
     if bytes.len() % INSTR_SIZE != 0 {
         return Err(anyhow!("tamanho inválido para .m3bin"));
     }
