@@ -87,7 +87,7 @@ Fora de escopo permanente: programa `.m3asm` completo da família antes de G2 ·
 
 | Fase | Status | Evidência de saída |
 |:---|:---|:---|
-| V-0 quick wins | ⬜ pendente | 2 demos + testes; `src/` intocado |
+| V-0 quick wins | ✅ feito (RFC-0035) | 2 demos + testes; `src/` intocado |
 | V-1 assembler | ⬜ pendente | tabelas montáveis; corpus verde |
 | V-2 retrieval | ⬜ pendente | busca real + bump minor |
 | V-3 system+loop | ⬜ pendente | conversa sintética fim-a-fim medida |

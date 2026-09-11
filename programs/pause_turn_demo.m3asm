@@ -1,0 +1,29 @@
+; programs/pause_turn_demo.m3asm — PLANO_VISAO Fase V-0 (turn-taking).
+; Máquina INCOMPLETE(1)/THINKING(2)/RESUMED(3)/TURN_END(4) com timeout
+; determinístico via STEPS (contador de retiradas, não wall-clock —
+; a variante CYCLES_COUNT é uma troca de 1 imediato, ver RFC-0035).
+; Driver: fila USER_INPUT (push_input no teste) como eventos de fala;
+; VAD_DETECT pontua frames sintéticos em paralelo (assert no teste).
+; Regs: r0=state, r1=t0, r2=deadline, r3=frame, r4=vadscore,
+;        r5=input, r6=now, r7=t1.
+; Verificado em test_planoV0_pause_paths.
+LOADI r0, 1
+STEPS r1
+ADD_IMM r2, r1 IMM=64
+TENSOR r3 1 4 f32 FILL=0.5
+VAD_DETECT r4, r3
+LOOP:
+    SENSE r5, USER_INPUT
+    IF_INTERRUPT GOT_SPEECH
+    STEPS r6
+    COMPARE r6, r2 PRED=LT
+    IF_EQUAL LOOP
+    LOADI r0, 4
+    JUMP DONE
+GOT_SPEECH:
+    LOADI r0, 3
+    STEPS r7
+    ADD_IMM r2, r7 IMM=64
+    JUMP LOOP
+DONE:
+    HALT

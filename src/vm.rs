@@ -8826,6 +8826,50 @@ mod tests {
         assert!(ctx.call_stack.is_empty());
     }
 
+    // ---- PLANO_VISAO Fase V-0 (demos de comportamento) --------------------
+
+    #[tokio::test]
+    async fn test_planoV0_pause_paths() {
+        use crate::opcodes::assemble;
+        // Caminho retomada: 1 evento de fala => RESUMED(3), VAD pontuado.
+        let src = include_str!("../programs/pause_turn_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        vm.load_program(prog);
+        vm.push_input("oi".to_string());
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx.reg(0).unwrap(), 3);
+        let vscore = ctx.reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(vscore, 1).unwrap(), vec![0.5]);
+        // Caminho timeout: sem eventos, 64 iters quietas => TURN_END(4)+HALT.
+        let prog = assemble(src).unwrap();
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(300), ..Default::default() });
+        vm2.load_program(prog);
+        vm2.run().unwrap();
+        let ctx2 = vm2.scheduler.get(1).unwrap().clone();
+        assert_eq!(ctx2.reg(0).unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_planoV0_filler_synth() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/filler_synth_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        vm.load_program(prog);
+        vm.run().unwrap();
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        // Crossfade 0.25*0.5+0.75*0.5 = 0.5 bit-exato; 3 iterações.
+        let out = ctx.reg(7).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out, 8).unwrap(), vec![0.5; 8]);
+        assert_eq!(ctx.reg(8).unwrap(), 3);
+        // Sorteio com seed: bits f32 zero-estendidos ([0,1)).
+        let pick = ctx.reg(1).unwrap();
+        let pickf = f32::from_bits(pick as u32);
+        assert!(pickf >= 0.0 && pickf < 1.0, "pick={}", pickf);
+    }
+
     // ---- RFC-0005: determinismo -------------------------------------
 
     fn rfc0005_reg_u64(vm: &Vm, cid: u64, r: u8) -> u64 {

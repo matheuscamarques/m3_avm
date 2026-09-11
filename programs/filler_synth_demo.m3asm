@@ -1,0 +1,23 @@
+; programs/filler_synth_demo.m3asm — PLANO_VISAO Fase V-0 (filler Marco 0).
+; Crossfade A/B via FILL+MUL+ADD (§5.2 de FILLER_SPEECH.md) + contador
+; de 3 "frases" + sorteio com seed (determinístico sob RNG_SEED).
+; Tudo sintético (FILL); voz real entra na Fase V-3. Verificado em
+; test_planoV0_filler_synth.
+; Regs: r0=seed, r1=pick, r2=A, r3=B, r4=G, r5=A2, r6=B2, r7=Out,
+;        r8=I, r9=N.
+LOADI r0, 42
+RNG_SEED r0
+RNG_UNIFORM r1
+TENSOR r2 1 8 f32 FILL=0.25
+TENSOR r3 1 8 f32 FILL=0.75
+TENSOR r4 1 8 f32 FILL=0.5
+MUL r5, r2, r4
+MUL r6, r3, r4
+ADD r7, r5, r6
+LOADI r8, 0
+LOADI r9, 3
+LOOP:
+    ADD_IMM r8, r8 IMM=1
+    COMPARE r8, r9 PRED=LT
+    IF_EQUAL LOOP
+HALT
