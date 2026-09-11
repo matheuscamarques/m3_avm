@@ -91,6 +91,11 @@ O que você sente: Como interromper uma pessoa. Ele não fica preso na resposta 
 
 Nos assistentes atuais, você teria que esperar ele terminar a resposta antiga. Aqui, não.
 
+> Mecanismo por trás (alvo): pausas no meio do pensamento, retomada,
+> reformulação e abandono são desenhados em
+> `docs/PAUSA_DE_PENSAMENTO.md` — incluindo a análise de que nenhum
+> opcode novo é necessário para o MVP.
+
 ## Mudança de Assunto — "Beleza, agora me ajuda com código Rust"
 
 Você: "Beleza, agora me ajuda a debugar esse código Rust."
