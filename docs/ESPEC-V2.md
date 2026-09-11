@@ -647,8 +647,8 @@ each wave needs its RFC + green tests + Lean delta where bounds move.
 
 ## 15. Open Obligations
 
-1. Lean: TopK main bound proof; stepError physical instantiation
-   (carried from ESPEC Section 15).
+1. Lean: TopK main bound PROVED (RFC-0029); stepError physical
+   instantiation still open (carried from ESPEC Section 15).
 2. New: dual-mode decoder model (size function + 0xFF exception);
    WAL dual-naming conservation; Region Table refinement (N==0 vs
    override); X-form equivalence (neutral fields).

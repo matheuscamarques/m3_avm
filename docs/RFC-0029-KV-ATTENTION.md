@@ -125,27 +125,34 @@ Working tree (no PR link; single-commit scope):
 
 Follow-up (NOT this RFC): KV_PIN/KV_RETRIEVE; non-DOT prune metrics;
 sparse-table ATTN_SPARSE; GPU-tiled FLASH_ATTN; cyclic barriers
-(cluster); TopK Lean main bound (§6).
+(cluster); stepError physical instantiation (Lean, still open).
 
-## §6. TopK Lean obligation — veredito honesto (NÃO fechada)
+## §6. TopK Lean obligation — FECHADA (com correções de rota)
 
-The `topk_error_bound` sorry in `formal/Formal/TopK.lean` stays open,
-and deliberately so for two honest reasons:
+The `topk_error_bound` sorry in `formal/Formal/TopK.lean` is now a
+machine-checked proof (`lake build` green, zero `sorry` in `formal/`).
+What the attempt taught (recorded so the next proof goes faster):
 
-1. The stated theorem is vacuous as written (`... ∨ True` closes by
-   `Or.inr trivial` — proving nothing). The REAL statement (L1 ≤
-   2ε/(1−ε) over Finset sums with a top-T subset) needs restating
-   first; restating without building is unverifiable work.
-2. The environment cannot build it: toolchain present
-   (elan, leanprover/lean4:v4.33.1) but Mathlib sources are NOT
-   vendored (no `formal/.lake`, no cached `mathlib` anywhere on disk)
-   and `lake build` would fetch + compile all of Mathlib (GBs, hours).
-   An unbuilt `.lean` edit would violate "verify through execution".
-
-When the environment allows: restate without `∨ True`, prove via the
-renormalization computation in the file's own docstring
-(`L1 = τ + τ = 2τ ≤ 2ε/(1−ε)`), `lake build` green. Until then the
-tolerance bound lives in Rust tests (this RFC), not in Lean.
+1. The stated theorem was vacuous as written (`... ∨ True` closes by
+   `Or.inr trivial` — proving nothing). It was RESTATED first: L1 ≤
+   `2ε/(1−ε)` over `Finset` sums with a top-T subset, for ANY subset
+   `T` ("top" matters only for the assumed hypothesis `τ < ε`, never
+   in the proof). Restating is honest here because the build verifies
+   the new statement immediately.
+2. The environment CAN build it: toolchain present (elan,
+   leanprover/lean4:v4.33.1) AND Mathlib vendored with prebuilt
+   oleans (`formal/.lake`, 8322 oleans) — an early `ls` without `-a`
+   hid `.lake` and nearly caused a false "blocked" verdict. Lesson:
+   `ls` hides dotfiles; verify with the build itself.
+3. Lemma names were verified empirically FIRST (`lake env lean` on a
+   scratch file: `div_lt_iff₀`, `le_div_iff₀`, `Finset.sum_sdiff`,
+   `Finset.sum_div`), which held the proof to two iterations:
+   (a) `Finset.mul_sum` has the constant on the LEFT — the needed
+   direction is `(Finset.sum_mul ..).symm`; (b) one `field_simp`
+   closed its goal alone, leaving `ring` with "no goals" (removed).
+4. The tolerance bound still lives in Rust tests too (this RFC) —
+   Lean proves the math, tests prove the code honors it. Both, not
+   either-or.
 
 ## Changelog
 
@@ -153,6 +160,7 @@ tolerance bound lives in Rust tests (this RFC), not in Lean.
 |:---|:---|:---|
 | 0029-00 | 2026-09-11 | DRAFT: KV/attention + Lean verdict |
 | 0029-01 | 2026-09-11 | IMPLEMENTED: merged to tree, suite green, v1.11 |
+| 0029-02 | 2026-09-11 | TopK main bound proved (sorry removed, lake build green) |
 
 ---
 *Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*

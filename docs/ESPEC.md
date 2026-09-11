@@ -408,8 +408,9 @@ the reactor — open gap).
 - **T4 (top-k attention) [NORMATIVE direction].** If softmax tail mass
   `tau < eps`, pruned renormalized attention errs by `<=
   2.eps/(1-eps)` in L1; cost drops to `O(N.d + T^2.d)`. Requires fast
-  QK decay AND `T << N`; otherwise pruning is decorative. Statement in
-  `formal/Formal/TopK.lean` (proof obligation); `DISTANCE 0x23` fused
+QK decay AND `T << N`; otherwise pruning is decorative. Proved in
+`formal/Formal/TopK.lean` (`topk_error_bound`, RFC-0029; `lake build`
+green, no `sorry`); `DISTANCE 0x23` fused
   top-k MUST feed pruned `ATTN` (never the reverse).
 
 ## 11. Real-Time Audio
@@ -563,7 +564,7 @@ and `docs/arq/MOSHI_MAP.md`. Demos: `programs/moshi_loop_v2.m3asm`,
 | SSM contraction, Euler `O(dt^2)`, forgetting, linear scan cost | `formal/Formal/SSM.lean` | Proved |
 | Rollback roundtrip + monotonic-counter fix + clobber counterexample | `formal/Formal/Rollback.lean` | Proved; fix live in `src/memory.rs::restore` (arbiters green, §16) |
 | Windowed hybrid bound arithmetic | `formal/Formal/WindowedError.lean` | Proved; physical instantiation open |
-| Top-k statement + uniform no-gain lemma | `formal/Formal/TopK.lean` | Skeleton (`sorry` on main bound) |
+| Top-k statement + uniform no-gain lemma | `formal/Formal/TopK.lean` | Proved (`topk_error_bound`, RFC-0029; `lake build` green) |
 | Migration conservation cases | `formal/Formal/ClusterWAL.lean` | Proved (model-level) |
 
 `lake build` in `formal/` MUST stay green. No claim in Sections 8-12
