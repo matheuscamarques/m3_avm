@@ -1020,4 +1020,7 @@ ISA v1.5 · suite 270 passed + 1 falha pré-existente (moshi norm-gamma).
 do plano forem concluídas. Nada aqui altera ESPEC.md (normativo) nem
 ESPEC-V2.md (draft) — mudanças de encoding exigem RFC própria.*
 
+*Documento companheiro: `docs/EXPERIENCIA_PREMIUM.md` — a mesma visão,
+contada como experiência de conversa (sem jargão).*
+
 *Author: Matheus de Camargo Marques — matheuscamarques@gmail.com — ORCID [0009-0003-4518-2258](https://orcid.org/0009-0003-4518-2258).*
