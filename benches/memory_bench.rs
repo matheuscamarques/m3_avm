@@ -7,7 +7,11 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use m3_avm::{
     context::Priority,
     memory::DType,
-    opcodes::{instr_arena_alloc, instr_arena_reset, instr_memcpy, instr_memset, MEMCPY_DIR_HOST},
+    opcodes::{
+        instr_arena_alloc, instr_arena_reset, instr_concat, instr_memcpy, instr_memset,
+        instr_prefetch, instr_reshape, instr_restore, instr_snapshot, MEMCPY_DIR_HOST,
+        SNAP_MASK_ALL,
+    },
     vm::{Vm, VmConfig},
 };
 use std::time::Duration;
@@ -75,10 +79,54 @@ fn bench_arena(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_snapshot_restore(c: &mut Criterion) {
+    let mut g = c.benchmark_group("snapshot");
+    g.measurement_time(Duration::from_secs(2));
+    // 256 KiB de heap vivo: snapshot clona mapas (Arc), restore troca estado.
+    let (mut vm, cid) = ready_vm();
+    let _a = f32_tensor(&mut vm, 65536);
+    let sn = instr_snapshot(0, SNAP_MASK_ALL);
+    let rs = instr_restore(0);
+    g.bench_function("snapshot_restore_256KiB", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &sn).unwrap();
+            vm.step_instruction(cid, &rs).unwrap();
+        })
+    });
+    g.finish();
+}
+
+fn bench_reshape_concat(c: &mut Criterion) {
+    let mut g = c.benchmark_group("views");
+    g.measurement_time(Duration::from_secs(2));
+    // RESHAPE [64,64] -> [4096] (16 KiB copiados).
+    let (mut vm, cid) = ready_vm();
+    let a = f32_tensor(&mut vm, 4096);
+    vm.scheduler.get_mut(cid).unwrap().set_reg(0, a).unwrap();
+    let rh = instr_reshape(1, 0, &[4096]);
+    g.bench_function("reshape_16KiB", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &rh).unwrap();
+        })
+    });
+    // CONCAT [64,64]+[64,64] AXIS=0 -> [128,64] (32 KiB montados).
+    let b = f32_tensor(&mut vm, 4096);
+    vm.scheduler.get_mut(cid).unwrap().set_reg(1, b).unwrap();
+    let cc = instr_concat(2, 0, 1, 0);
+    g.bench_function("concat_32KiB_axis0", |ben| {
+        ben.iter(|| {
+            vm.step_instruction(cid, &cc).unwrap();
+        })
+    });
+    g.finish();
+}
+
 criterion_group!(
     memory,
     bench_memcpy_4k,
     bench_memset_4k,
     bench_arena,
+    bench_snapshot_restore,
+    bench_reshape_concat,
 );
 criterion_main!(memory);

@@ -4,7 +4,7 @@
 Status:   DRAFT — non-normative proposal. NOT IMPLEMENTED.
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Extends:  docs/ESPEC.md (ISA v1.4 + model, normative)
+Extends:  docs/ESPEC.md (ISA v1.6 + model, normative)
 Reconciles:
   [B] docs/arq/ISA-V2-BLUEPRINT.md (v2.0 blueprint + critique, archived)
   [R] docs/arq/RFC-0001-ESCAPE.md (extension mechanism, archived)
@@ -226,20 +226,20 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x24` | `RANK1_UPDATE` | 32 | IMPL | F2 | KV_CACHE (H_t); CoW (RFC-0004) |
 | `0x25` | `ODE_STEP` | 32 | IMPL | S | Stateless fused Euler/RK (RFC-0014) |
 
-### 3.4 Memory and arena (`0x26-0x2F`) — DRAFT, 32B
+### 3.4 Memory and arena (`0x26-0x2F`) — IMPL (v1.6), 32B
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
 | `0x26` | `ARENA_ALLOC` | 32 | IMPL | S | Vm-side bump; size+align (RFC-0023) |
 | `0x27` | `ARENA_RESET` | 32 | IMPL | S | O(1); unknown arena traps (RFC-0023) |
-| `0x28` | `SNAPSHOT` | 32 | DRAFT | S | SNAPSHOT; region bitmask; retention k=16 |
-| `0x29` | `RESTORE` | 32 | DRAFT | S | Version handle; monotonic (I-Mono) |
+| `0x28` | `SNAPSHOT` | 32 | IMPL | S | Named version; full-set mask only (RFC-0024) |
+| `0x29` | `RESTORE` | 32 | IMPL | S | Rewind memory+maps; I-Mono (RFC-0024) |
 | `0x2A` | `MEMCPY` | 32 | IMPL | S | Tensor-only MVP; HOST dir; CoW-safe (RFC-0023) |
 | `0x2B` | `MEMSET` | 32 | IMPL | S | Byte pattern+len; PERSISTENT-RO (RFC-0023) |
-| `0x2C` | `PREFETCH` | 32 | DRAFT | S | Cache hint |
-| `0x2D` | `RESHAPE` | 32 | DRAFT | S | View or copy |
+| `0x2C` | `PREFETCH` | 32 | IMPL | S | Read-only hint (RFC-0024) |
+| `0x2D` | `RESHAPE` | 32 | IMPL | S | Copy, not view (RFC-0024) |
 | `0x2E` | `SLICE` | 32 | IMPL | S | Flat [start,len) => [1,len] (RFC-0019) |
-| `0x2F` | `CONCAT` | 32 | DRAFT | S | Axis |
+| `0x2F` | `CONCAT` | 32 | IMPL | S | N-D axis assembly (RFC-0024) |
 
 ### 3.5 Advanced tensors + attention + activations (`0x30-0x43`) — DRAFT, 32B
 
@@ -632,7 +632,8 @@ RFC-0004 — 3 opcodes + SAMPLE-TOPK, 7 conformance tests, 3 demos exit 0
 `SPIKE`/`ODE`-last + `FOREST`/`DENOISE`/`CONV` IMPLEMENTED (RFC-0012/0013/0017). W5 Telemetry+scheduler
 (IMPLEMENTED: RFC-0006 — 14 opcodes, behavior goldens, demo exit 0;
 determinism `0x60-0x66` already IMPLEMENTED: RFC-0005). W6
-Memory/arena (`0x26-0x2F`) + `FENCE`/`LOCK`. W7 Retrieval
+Memory/arena (`0x26-0x2F`) IMPLEMENTED (RFC-0023/0024; `FENCE`/`LOCK`
+already IMPL via RFC-0006). W7 Retrieval
 (`0x50-0x57`) with lowering filter. W8 Moshi full-duplex
 (`0x44-0x49` + 17-stream KV). W9 Cluster X-forms + MIGRATE/WAL +
 SWIM. W10 MMIO/system + `.m3bc` loader. Order is normative-draft;

@@ -4,7 +4,7 @@
 Status:   Informational Draft (research prototype, not a standard)
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Version:  ISA v1.5 (64 opcodes: 0x00-0x25 + 0x2E,0x38,0x60-0x66,0x6A-0x79 + 0xFF implemented; cumulative since v1.4)
+Version:  ISA v1.6 (73 opcodes: 0x00-0x2F + 0x38,0x60-0x66,0x6A-0x79 + 0xFF implemented; cumulative since v1.5)
 License:  AGPL-3.0-or-later (see LICENSE; Section 15)
 Replaces: all documents under docs/arq/ (archived, non-normative)
 ```
@@ -236,9 +236,10 @@ No operation (scheduler/IP bench target).
 
 ### 5.8 Free range
 
-`0x26-0xFE` are free, except `0x2E SLICE` and `0x38 KV_TRUNCATE`
-(IMPL, RFC-0019/RFC-0010). Allocation REQUIRES a proposal following the
-stateful-opcode rule (Section 19).
+`0x30-0xFE` are free, except `0x38 KV_TRUNCATE`
+(IMPL, RFC-0010). `0x26-0x2F` are fully allocated and IMPL
+(RFC-0023/0024, incl. `0x2E SLICE` from RFC-0019). Allocation REQUIRES
+a proposal following the stateful-opcode rule (Section 19).
 
 ## 6. Memory Model
 
@@ -597,6 +598,7 @@ outruns the Status column above.
 | GPU path | PARTIAL | `ATTN<=64` only; GEMV stays CPU |
 | Benches for `0x13-0x19` | IMPL | `benches/hybrid_ops_bench.rs` (7 ops + 80 ms window, §17) |
 | `0x26/0x27 ARENA` + `0x2A/0x2B MEMCPY/MEMSET` (memory core) | IMPL | RFC-0023; bump+O(1) reset, bit-exact/OOB/RO/dir goldens, FORK-snapshot/ABORT-restore, demo `arena_memcpy_demo` (exec verified) |
+| `0x28/0x29 SNAPSHOT/RESTORE` + `0x2C/0x2D/0x2F PREFETCH/RESHAPE/CONCAT` (views & versions) | IMPL | RFC-0024; named-version roundtrip, engine rewind, N-D concat/order goldens, demo `snap_concat_demo` (exec verified); v1.6 |
 | End-to-end Mamba GGUF smoke | OPEN | — |
 
 `cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,
@@ -663,6 +665,9 @@ ation assumes non-Byzantine peers.
   RFC-0004 through RFC-0018; intermediate minors were not cut).
   Minor bump per new opcode family from here on; existing encodings
   are immutable.
+- `ISA v1.6` = v1.5 + memory/arena family `0x26-0x2F` complete
+  (RFC-0023: `ARENA_ALLOC/RESET`, `MEMCPY/MEMSET`; RFC-0024:
+  `SNAPSHOT/RESTORE`, `PREFETCH/RESHAPE/CONCAT`).
 - Draft v2.0 proposal (reconciled, non-normative): `docs/ESPEC-V2.md`
   (DRAFT — do not code against it; reservations in Sections 12-13 of
   this document remain the only binding future encodings).

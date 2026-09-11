@@ -134,6 +134,17 @@ pub const OP_MEMSET: u8 = 0x2B; // fill de padrão byte
 pub const MEMCPY_DIR_HOST: u8 = 0;
 pub const MEMCPY_DIR_GPU: u8 = 1;
 pub const MEMCPY_DIR_NIC: u8 = 2;
+// RFC-0024: views & versions (0x28/0x29/0x2C/0x2D/0x2F; fecha 0x26-0x2F, v1.6).
+pub const OP_SNAPSHOT: u8 = 0x28; // snapshot nomeado -> version handle
+pub const OP_RESTORE: u8 = 0x29; // rewind p/ version (memória + mapas)
+pub const OP_PREFETCH: u8 = 0x2C; // hint de cache (só leitura)
+pub const OP_RESHAPE: u8 = 0x2D; // cópia com novo shape
+pub const OP_CONCAT: u8 = 0x2F; // montagem ao longo de eixo
+// Máscara — SNAPSHOT (payload[0]): só o conjunto cheio executa.
+pub const SNAP_MASK_GLOBAL: u8 = 0b001;
+pub const SNAP_MASK_KV: u8 = 0b010;
+pub const SNAP_MASK_ENGINE: u8 = 0b100;
+pub const SNAP_MASK_ALL: u8 = 0b111;
 // Modos — FOREST (payload[4]): 0 = valores por árvore, 1 = média.
 pub const FOREST_MODE_VOTE: u8 = 0;
 pub const FOREST_MODE_MEAN: u8 = 1;
@@ -472,6 +483,11 @@ impl Instruction {
             OP_ARENA_RESET => "ARENA_RESET",
             OP_MEMCPY => "MEMCPY",
             OP_MEMSET => "MEMSET",
+            OP_SNAPSHOT => "SNAPSHOT",
+            OP_RESTORE => "RESTORE",
+            OP_PREFETCH => "PREFETCH",
+            OP_RESHAPE => "RESHAPE",
+            OP_CONCAT => "CONCAT",
             OP_DENOISE_STEP => "DENOISE_STEP",
             OP_ODE_STEP => "ODE_STEP",
             OP_SPIKE_STEP => "SPIKE_STEP",
@@ -1525,6 +1541,103 @@ pub fn instr_memcpy(r_dst: u8, r_src: u8, len: u64, src_off: u64, dst_off: u64, 
 pub fn instr_memset(r_tensor: u8, pattern: u8, len: u32, offset: u64) -> Instruction {
     let mut instr = Instruction::new(OP_MEMSET, 0, r_tensor, 0xFF, 0xFF, 0xFF);
     instr.set_memset_params(pattern, len, offset);
+    instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0024: SNAPSHOT (0x28) / RESTORE (0x29) / PREFETCH (0x2C) /
+// RESHAPE (0x2D) / CONCAT (0x2F). Layouts nos 26B congelados (ver RFC).
+// ---------------------------------------------------------------------------
+
+impl Instruction {
+    /// SNAPSHOT: payload[0]=mask u8 (só 0b111 executa; resto veta).
+    pub fn snapshot_mask(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_snapshot_mask(&mut self, mask: u8) {
+        self.payload[0] = mask;
+    }
+
+    /// PREFETCH: payload[0..4]=len u32 LE (0=tensor inteiro),
+    /// [4..12]=offset u64 LE.
+    pub fn prefetch_params(&self) -> (u32, u64) {
+        let mut bl = [0u8; 4];
+        bl.copy_from_slice(&self.payload[0..4]);
+        let mut bo = [0u8; 8];
+        bo.copy_from_slice(&self.payload[4..12]);
+        (u32::from_le_bytes(bl), u64::from_le_bytes(bo))
+    }
+
+    pub fn set_prefetch_params(&mut self, len: u32, offset: u64) {
+        self.payload[0..4].copy_from_slice(&len.to_le_bytes());
+        self.payload[4..12].copy_from_slice(&offset.to_le_bytes());
+    }
+
+    /// RESHAPE: payload[0]=ndim u8 (1-4), [1..5]=d0 u32 LE, [5..9]=d1,
+    /// [9..13]=d2, [13..17]=d3. Cópia (não view); numel validado no exec.
+    pub fn reshape_shape(&self) -> (u8, [u32; 4]) {
+        let mut dims = [0u32; 4];
+        for (i, d) in dims.iter_mut().enumerate() {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&self.payload[1 + i * 4..5 + i * 4]);
+            *d = u32::from_le_bytes(b);
+        }
+        (self.payload[0], dims)
+    }
+
+    pub fn set_reshape_shape(&mut self, ndim: u8, dims: [u32; 4]) {
+        self.payload[0] = ndim;
+        for (i, d) in dims.iter().enumerate() {
+            self.payload[1 + i * 4..5 + i * 4].copy_from_slice(&d.to_le_bytes());
+        }
+    }
+
+    /// CONCAT: payload[0]=axis u8 (default 0).
+    pub fn concat_axis(&self) -> u8 {
+        self.payload[0]
+    }
+
+    pub fn set_concat_axis(&mut self, axis: u8) {
+        self.payload[0] = axis;
+    }
+}
+
+/// SNAPSHOT rD [MASK=n] — rdest <- version u64 (só MASK=0b111 executa).
+pub fn instr_snapshot(rdest: u8, mask: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_SNAPSHOT, 0, rdest, 0xFF, 0xFF, 0xFF);
+    instr.set_snapshot_mask(mask);
+    instr
+}
+
+/// RESTORE rV — rV guarda version u64; rewind sem matar contexto.
+pub fn instr_restore(r_version: u8) -> Instruction {
+    Instruction::new(OP_RESTORE, 0, 0xFF, r_version, 0xFF, 0xFF)
+}
+
+/// PREFETCH rT [LEN=n] [OFF=n] — hint de cache, só leitura.
+pub fn instr_prefetch(r_tensor: u8, len: u32, offset: u64) -> Instruction {
+    let mut instr = Instruction::new(OP_PREFETCH, 0, r_tensor, 0xFF, 0xFF, 0xFF);
+    instr.set_prefetch_params(len, offset);
+    instr
+}
+
+/// RESHAPE rD, rT, dims — cópia com novo shape (1-4 dims, validadas no exec).
+pub fn instr_reshape(rdest: u8, r_src: u8, dims: &[u32]) -> Instruction {
+    debug_assert!((1..=4).contains(&dims.len()));
+    let mut arr = [0u32; 4];
+    for (i, d) in dims.iter().take(4).enumerate() {
+        arr[i] = *d;
+    }
+    let mut instr = Instruction::new(OP_RESHAPE, 0, rdest, r_src, 0xFF, 0xFF);
+    instr.set_reshape_shape(dims.len().min(255) as u8, arr);
+    instr
+}
+
+/// CONCAT rD, rA, rB [AXIS=n] — montagem ao longo do eixo.
+pub fn instr_concat(rdest: u8, r_a: u8, r_b: u8, axis: u8) -> Instruction {
+    let mut instr = Instruction::new(OP_CONCAT, 0, rdest, r_a, r_b, 0xFF);
+    instr.set_concat_axis(axis);
     instr
 }
 
@@ -2920,6 +3033,93 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>) -> Result<Instruction>
             }
             Ok(instr_memset(parse_reg(parts[1])?, pattern, len, off))
         }
+        "SNAPSHOT" => {
+            // SNAPSHOT rD [MASK=n] (só MASK=0b111 executa; resto veta no exec)
+            if parts.len() < 2 {
+                return Err(anyhow!("SNAPSHOT precisa de rdest — ex: SNAPSHOT r5"));
+            }
+            let mut mask = SNAP_MASK_ALL;
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("MASK=") {
+                    mask = v.parse::<u8>().map_err(|_| anyhow!("SNAPSHOT MASK inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("SNAPSHOT token desconhecido '{}' (use MASK=)", p));
+                }
+            }
+            Ok(instr_snapshot(parse_reg(parts[1])?, mask))
+        }
+        "RESTORE" => {
+            // RESTORE rV (rV guarda version u64; sem chaves)
+            if parts.len() != 2 {
+                return Err(anyhow!("RESTORE precisa de exatamente um registrador — ex: RESTORE r5"));
+            }
+            Ok(instr_restore(parse_reg(parts[1])?))
+        }
+        "PREFETCH" => {
+            // PREFETCH rT [LEN=n] [OFF=n]
+            if parts.len() < 2 {
+                return Err(anyhow!("PREFETCH precisa de rTensor — ex: PREFETCH r0 LEN=1024"));
+            }
+            let (mut len, mut off) = (0u32, 0u64);
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("LEN=") {
+                    len = v.parse::<u32>().map_err(|_| anyhow!("PREFETCH LEN inválido '{}'", p))?;
+                } else if let Some(v) = up.strip_prefix("OFF=") {
+                    off = v.parse::<u64>().map_err(|_| anyhow!("PREFETCH OFF inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("PREFETCH token desconhecido '{}' (use LEN=/OFF=)", p));
+                }
+            }
+            Ok(instr_prefetch(parse_reg(parts[1])?, len, off))
+        }
+        "RESHAPE" => {
+            // RESHAPE rD, rT SHAPE=AxBxC (x-separado, 1-4 dims)
+            if parts.len() < 3 {
+                return Err(anyhow!("RESHAPE precisa de rdest, rTensor e SHAPE= — ex: RESHAPE r1, r0 SHAPE=1x4"));
+            }
+            let mut dims: Option<Vec<u32>> = None;
+            for p in &parts[3..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("SHAPE=") {
+                    let mut parsed = Vec::new();
+                    for d in v.split(|c| c == 'x' || c == 'X') {
+                        let n = d.parse::<u32>().map_err(|_| anyhow!("RESHAPE SHAPE inválido '{}' (use AxBxC)", p))?;
+                        if n == 0 {
+                            return Err(anyhow!("RESHAPE SHAPE com dim 0 '{}' (dims > 0)", p));
+                        }
+                        parsed.push(n);
+                    }
+                    if parsed.is_empty() || parsed.len() > 4 {
+                        return Err(anyhow!("RESHAPE SHAPE '{}' precisa de 1-4 dims", p));
+                    }
+                    dims = Some(parsed);
+                } else {
+                    return Err(anyhow!("RESHAPE token desconhecido '{}' (use SHAPE=AxBxC)", p));
+                }
+            }
+            match dims {
+                Some(d) => Ok(instr_reshape(parse_reg(parts[1])?, parse_reg(parts[2])?, &d)),
+                None => Err(anyhow!("RESHAPE precisa de SHAPE= — ex: RESHAPE r1, r0 SHAPE=1x4")),
+            }
+        }
+        "CONCAT" => {
+            // CONCAT rD, rA, rB [AXIS=n]
+            if parts.len() < 4 {
+                return Err(anyhow!("CONCAT precisa de rdest, rA, rB — ex: CONCAT r2, r0, r1 AXIS=0"));
+            }
+            let mut axis = 0u8;
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("AXIS=") {
+                    axis = v.parse::<u8>().map_err(|_| anyhow!("CONCAT AXIS inválido '{}'", p))?;
+                } else {
+                    return Err(anyhow!("CONCAT token desconhecido '{}' (use AXIS=)", p));
+                }
+            }
+            Ok(instr_concat(parse_reg(parts[1])?, parse_reg(parts[2])?, parse_reg(parts[3])?, axis))
+        }
         "REMOTE_SPAWN" => {
             // REMOTE_SPAWN rD NODE=n ENTRY=label|pc PRI=GREEN|BLUE|RED|0|1|2
             // (NODE textual => Err: tabela de roteamento é F3, sem chute.)
@@ -4224,6 +4424,67 @@ mod tests {
         assert!(assemble("MEMSET r1, LEN=4").is_err());
         assert!(assemble("MEMSET r1, PATTERN=256").is_err());
         assert!(assemble("MEMSET r1, PATTERN=0 FOO=1").is_err());
+    }
+
+    // ---- RFC-0024: views & versions ---------------------------------
+
+    #[test]
+    fn test_rfc0024_ctor_roundtrip() {
+        let s = instr_snapshot(5, SNAP_MASK_ALL);
+        assert_eq!(s.opcode, OP_SNAPSHOT);
+        assert_eq!(s.snapshot_mask(), SNAP_MASK_ALL);
+        let d = Instruction::decode(&s.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "SNAPSHOT");
+        assert_eq!(d.snapshot_mask(), SNAP_MASK_ALL);
+        let r = instr_restore(5);
+        assert_eq!(r.opcode, OP_RESTORE);
+        let d = Instruction::decode(&r.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "RESTORE");
+        let p = instr_prefetch(0, 1024, 64);
+        assert_eq!(p.opcode, OP_PREFETCH);
+        assert_eq!(p.prefetch_params(), (1024, 64));
+        let d = Instruction::decode(&p.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "PREFETCH");
+        assert_eq!(d.prefetch_params(), (1024, 64));
+        let h = instr_reshape(1, 0, &[1, 4]);
+        assert_eq!(h.opcode, OP_RESHAPE);
+        assert_eq!(h.reshape_shape(), (2, [1, 4, 0, 0]));
+        let d = Instruction::decode(&h.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "RESHAPE");
+        assert_eq!(d.reshape_shape(), (2, [1, 4, 0, 0]));
+        let c = instr_concat(2, 0, 1, 1);
+        assert_eq!(c.opcode, OP_CONCAT);
+        assert_eq!(c.concat_axis(), 1);
+        let d = Instruction::decode(&c.encode()).unwrap();
+        assert_eq!(d.mnemonic(), "CONCAT");
+        assert_eq!(d.concat_axis(), 1);
+        // Assembler: formas válidas + rejeições estritas.
+        let prog = assemble("SNAPSHOT r5").unwrap();
+        assert_eq!(prog[0].snapshot_mask(), SNAP_MASK_ALL);
+        let prog = assemble("SNAPSHOT r5 MASK=7").unwrap();
+        assert_eq!(prog[0].snapshot_mask(), 7);
+        let prog = assemble("RESTORE r5").unwrap();
+        assert_eq!(prog[0].rsrc1, 5);
+        let prog = assemble("PREFETCH r0 LEN=1024 OFF=64").unwrap();
+        assert_eq!(prog[0].prefetch_params(), (1024, 64));
+        let prog = assemble("RESHAPE r1, r0 SHAPE=1x4").unwrap();
+        assert_eq!(prog[0].reshape_shape(), (2, [1, 4, 0, 0]));
+        let prog = assemble("RESHAPE r1, r0 SHAPE=2x2x2").unwrap();
+        assert_eq!(prog[0].reshape_shape(), (3, [2, 2, 2, 0]));
+        let prog = assemble("CONCAT r2, r0, r1 AXIS=1").unwrap();
+        assert_eq!(prog[0].concat_axis(), 1);
+        assert!(assemble("SNAPSHOT").is_err());
+        assert!(assemble("SNAPSHOT r5 FOO=1").is_err());
+        assert!(assemble("RESTORE").is_err());
+        assert!(assemble("RESTORE r5 r6").is_err());
+        assert!(assemble("PREFETCH").is_err());
+        assert!(assemble("PREFETCH r0 FOO=1").is_err());
+        assert!(assemble("RESHAPE r1, r0").is_err());
+        assert!(assemble("RESHAPE r1, r0 SHAPE=0x4").is_err());
+        assert!(assemble("RESHAPE r1, r0 SHAPE=1x2x3x4x5").is_err());
+        assert!(assemble("RESHAPE r1, r0 SHAPE=abc").is_err());
+        assert!(assemble("CONCAT r2, r0").is_err());
+        assert!(assemble("CONCAT r2, r0, r1 FOO=1").is_err());
     }
 
     // ---- RFC-0008: modo estrito -------------------------------------

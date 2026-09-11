@@ -33,6 +33,7 @@ use crate::opcodes::{
     OP_FOREST, OP_DENOISE_STEP, OP_ODE_STEP, OP_SPIKE_STEP, OP_CONV,
     OP_REMOTE_SPAWN, OP_SIGNAL, OP_SEND_TENSOR, OP_BARRIER, OP_SLICE,
     OP_ARENA_ALLOC, OP_ARENA_RESET, OP_MEMCPY, OP_MEMSET, MEMCPY_DIR_HOST,
+    OP_SNAPSHOT, OP_RESTORE, OP_PREFETCH, OP_RESHAPE, OP_CONCAT, SNAP_MASK_ALL,
 };
 use crate::utils::{log_debug, log_info, log_warn, ThroughputMeter};
 
@@ -119,6 +120,11 @@ pub struct VmStats {
     pub arena_reset_execs: u64,
     pub memcpy_execs: u64,
     pub memset_execs: u64,
+    pub snapshot_execs: u64,
+    pub restore_execs: u64,
+    pub prefetch_execs: u64,
+    pub reshape_execs: u64,
+    pub concat_execs: u64,
     pub start_ns: u64,
 }
 
@@ -224,6 +230,12 @@ impl MemBackend {
         match self {
             MemBackend::Cpu(m) => m.snapshot(),
             #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.snapshot(),
+        }
+    }
+    pub fn snapshot_count(&self) -> usize {
+        match self {
+            MemBackend::Cpu(m) => m.snapshot_count(),
+            #[cfg(feature = "wgpu")] MemBackend::Gpu(m) => m.snapshot_count(),
         }
     }
     pub fn restore(&mut self, v: u64) -> anyhow::Result<()> {
@@ -1086,6 +1098,26 @@ impl Vm {
             }
             OP_MEMSET => {
                 self.exec_memset(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SNAPSHOT => {
+                self.exec_snapshot(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RESTORE => {
+                self.exec_restore(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_PREFETCH => {
+                self.exec_prefetch(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_RESHAPE => {
+                self.exec_reshape(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_CONCAT => {
+                self.exec_concat(ctx_id, instr)?;
                 Ok(true)
             }
             OP_FOREST => {
@@ -3707,6 +3739,247 @@ impl Vm {
         Ok(())
     }
 
+    /// SNAPSHOT rD [MASK=n] — snapshot nomeado: memória + 4 mapas de
+    /// engine (mesmas 4 linhas de push do FORK; dedup é follow-up, os
+    /// caminhos auditados ficam intocados). rdest <- version u64.
+    /// Só MASK=0b111 executa (maquinário é tudo-ou-nada).
+    fn exec_snapshot(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        let mask = instr.snapshot_mask();
+        if mask != SNAP_MASK_ALL {
+            return Err(anyhow!("SNAPSHOT: MASK=0b{:03b} parcial não suportado (só 0b111; parcial é RFC futura)", mask));
+        }
+        let v = self.memory.snapshot();
+        self.ssm_snapshots.push((v, self.ssm_states.clone()));
+        self.rank1_snapshots.push((v, self.rank1_layers.clone()));
+        self.snn_snapshots.push((v, self.snn_layers.clone()));
+        self.arena_snapshots.push((v, self.arenas.clone()));
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, v as u128)?;
+            }
+        }
+        self.stats.snapshot_execs += 1;
+        log_debug("snapshot", &format!("ctx {} SNAPSHOT v{} (retidos {})", ctx_id, v, self.memory.snapshot_count()));
+        Ok(())
+    }
+
+    /// RESTORE rV — rewind p/ version: `memory.restore` + pops
+    /// versionados dos 4 mapas (mesma disciplina do ABORT ts!=0; ver
+    /// exec_abort). Contextos intocados (ninguém morre). Versão
+    /// desconhecida/expirada => Err alto. Contador nunca rebaixa
+    /// (I-Mono, via `memory.restore` — teorema `restoreFix` inalterado).
+    fn exec_restore(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rsrc1 == 0xFF {
+            return Err(anyhow!("RESTORE precisa de rV com version u64"));
+        }
+        let version = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)? as u64
+        };
+        self.memory.restore(version)?;
+        while self.ssm_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.ssm_snapshots.pop();
+        }
+        if self.ssm_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.ssm_snapshots.pop() {
+                self.ssm_states = snap;
+            }
+        }
+        while self.rank1_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.rank1_snapshots.pop();
+        }
+        if self.rank1_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.rank1_snapshots.pop() {
+                self.rank1_layers = snap;
+            }
+        }
+        while self.snn_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.snn_snapshots.pop();
+        }
+        if self.snn_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.snn_snapshots.pop() {
+                self.snn_layers = snap;
+            }
+        }
+        while self.arena_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.arena_snapshots.pop();
+        }
+        if self.arena_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.arena_snapshots.pop() {
+                self.arenas = snap;
+            }
+        }
+        self.stats.restore_execs += 1;
+        log_debug("restore", &format!("ctx {} RESTORE v{}", ctx_id, version));
+        Ok(())
+    }
+
+    /// PREFETCH rT [LEN=n] [OFF=n] — hint de cache, só leitura. Valida
+    /// tensor + janela (senão Err; esparso Err) e toca as páginas da
+    /// janela (a cópia do read já falta; soma com black_box impede
+    /// eliminação). Best-effort, sem promessa de desempenho.
+    fn exec_prefetch(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF {
+            return Err(anyhow!("PREFETCH precisa de rTensor com endereço de tensor"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rdest)?
+        };
+        let (len_p, off_p) = instr.prefetch_params();
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("PREFETCH: 0x{:x} não é tensor", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("PREFETCH: esparso não suportado (denso nesta RFC)"));
+        }
+        let total = meta.byte_len;
+        let (len, off) = if len_p == 0 {
+            if off_p != 0 {
+                return Err(anyhow!("PREFETCH: LEN=0 seleciona o tensor inteiro e exige OFF=0"));
+            }
+            (total, 0usize)
+        } else {
+            let len = usize::try_from(len_p).map_err(|_| anyhow!("PREFETCH: LEN {} não cabe", len_p))?;
+            let off = usize::try_from(off_p).map_err(|_| anyhow!("PREFETCH: OFF {} não cabe", off_p))?;
+            (len, off)
+        };
+        if len == 0 {
+            return Err(anyhow!("PREFETCH: nada a pré-carregar (tensor vazio)"));
+        }
+        if off.saturating_add(len) > total {
+            return Err(anyhow!("PREFETCH: janela [{}..{}] fora do tensor ({} bytes)", off, off + len, total));
+        }
+        let full = self.memory.read(t_addr, total)?;
+        let acc = full[off..off + len].iter().fold(0u64, |a, &b| a.wrapping_add(b as u64));
+        std::hint::black_box(acc);
+        self.stats.prefetch_execs += 1;
+        log_debug("prefetch", &format!("ctx {} PREFETCH 0x{:x}[{}..{}]", ctx_id, t_addr, off, off + len));
+        Ok(())
+    }
+
+    /// RESHAPE rD, rT (cópia com novo shape; NÃO é view — views com stride
+    /// são follow-up). numel deve casar, senão Err. Denso; dtype preservado;
+    /// layouts não-planos vetam (guarda defensiva p/ quantizados).
+    fn exec_reshape(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF {
+            return Err(anyhow!("RESHAPE precisa de rdest e rTensor com endereços"));
+        }
+        let t_addr = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)?
+        };
+        let (ndim, dims) = instr.reshape_shape();
+        if !(1..=4).contains(&ndim) {
+            return Err(anyhow!("RESHAPE: ndim {} fora de 1-4", ndim));
+        }
+        let dims = &dims[..ndim as usize];
+        if dims.iter().any(|&d| d == 0) {
+            return Err(anyhow!("RESHAPE: dim 0 (dims > 0)"));
+        }
+        let meta = self.memory.get_tensor_meta(t_addr).cloned()
+            .ok_or_else(|| anyhow!("RESHAPE: 0x{:x} não é tensor", t_addr))?;
+        if meta.is_sparse {
+            return Err(anyhow!("RESHAPE: esparso não suportado (denso nesta RFC)"));
+        }
+        let old_numel: usize = meta.shape.iter().product();
+        let new_numel: usize = dims.iter()
+            .map(|&d| d as usize)
+            .try_fold(1usize, |a, d| a.checked_mul(d))
+            .ok_or_else(|| anyhow!("RESHAPE: produto das dims estoura"))?;
+        if old_numel != new_numel {
+            return Err(anyhow!("RESHAPE: numel {} != {} (shape deve preservar elementos)", new_numel, old_numel));
+        }
+        let width = meta.dtype.byte_width();
+        if meta.byte_len != old_numel.saturating_mul(width) {
+            return Err(anyhow!("RESHAPE: layout não-plano (quantizado é RFC futura)"));
+        }
+        let data = self.memory.read(t_addr, meta.byte_len)?;
+        let new_shape: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+        let out_addr = self.memory.alloc_tensor(&new_shape, meta.dtype)?;
+        self.memory.write(out_addr, &data)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.reshape_execs += 1;
+        log_debug("reshape", &format!("ctx {} RESHAPE 0x{:x} {:?} -> {:?} 0x{:x}", ctx_id, t_addr, meta.shape, new_shape, out_addr));
+        Ok(())
+    }
+
+    /// CONCAT rD, rA, rB [AXIS=n] — montagem N-D genérica ao longo do eixo:
+    /// mesmo rank, demais dims iguais, mesmo dtype, layouts planos. Cópia
+    /// (sem aliasing). Esparso veta.
+    fn exec_concat(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("CONCAT precisa de rA e rB com endereços de tensores"));
+        }
+        let (a_addr, b_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let axis = instr.concat_axis() as usize;
+        let ma = self.memory.get_tensor_meta(a_addr).cloned()
+            .ok_or_else(|| anyhow!("CONCAT: A 0x{:x} não é tensor", a_addr))?;
+        let mb = self.memory.get_tensor_meta(b_addr).cloned()
+            .ok_or_else(|| anyhow!("CONCAT: B 0x{:x} não é tensor", b_addr))?;
+        if ma.is_sparse || mb.is_sparse {
+            return Err(anyhow!("CONCAT: esparso não suportado (denso nesta RFC)"));
+        }
+        if ma.dtype != mb.dtype {
+            return Err(anyhow!("CONCAT: dtypes {:?} != {:?} (sem cast silencioso)", ma.dtype, mb.dtype));
+        }
+        if ma.shape.len() != mb.shape.len() || ma.shape.is_empty() {
+            return Err(anyhow!("CONCAT: ranks {:?} vs {:?} (mesmo rank ≥ 1)", ma.shape, mb.shape));
+        }
+        let rank = ma.shape.len();
+        if axis >= rank {
+            return Err(anyhow!("CONCAT: AXIS {} fora do rank {}", axis, rank));
+        }
+        for (i, (da, db)) in ma.shape.iter().zip(mb.shape.iter()).enumerate() {
+            if i != axis && da != db {
+                return Err(anyhow!("CONCAT: dim {} difere ({} vs {}) fora do eixo", i, da, db));
+            }
+        }
+        let width = ma.dtype.byte_width();
+        for (m, tag) in [(&ma, "A"), (&mb, "B")] {
+            let numel: usize = m.shape.iter().product();
+            if m.byte_len != numel.saturating_mul(width) {
+                return Err(anyhow!("CONCAT: {} com layout não-plano (quantizado é RFC futura)", tag));
+            }
+        }
+        let (a_ax, b_ax) = (ma.shape[axis], mb.shape[axis]);
+        let outer: usize = ma.shape[..axis].iter().product();
+        let inner_elems: usize = ma.shape[axis + 1..].iter().product();
+        let inner_bytes = inner_elems.checked_mul(width).ok_or_else(|| anyhow!("CONCAT: inner_bytes estoura"))?;
+        let a_chunk = a_ax.checked_mul(inner_bytes).ok_or_else(|| anyhow!("CONCAT: janela A estoura"))?;
+        let b_chunk = b_ax.checked_mul(inner_bytes).ok_or_else(|| anyhow!("CONCAT: janela B estoura"))?;
+        let a_full = self.memory.read(a_addr, ma.byte_len)?;
+        let b_full = self.memory.read(b_addr, mb.byte_len)?;
+        if a_full.len() < outer.saturating_mul(a_chunk) || b_full.len() < outer.saturating_mul(b_chunk) {
+            return Err(anyhow!("CONCAT: layout inconsistente com shape (sem leitura OOB)"));
+        }
+        let mut out_shape = ma.shape.clone();
+        out_shape[axis] = a_ax.checked_add(b_ax).ok_or_else(|| anyhow!("CONCAT: dim resultante estoura"))?;
+        let mut out_bytes = Vec::with_capacity(out_shape[axis].saturating_mul(outer).saturating_mul(inner_bytes));
+        for o in 0..outer {
+            let a_base = o.saturating_mul(a_chunk);
+            out_bytes.extend_from_slice(&a_full[a_base..a_base + a_chunk]);
+            let b_base = o.saturating_mul(b_chunk);
+            out_bytes.extend_from_slice(&b_full[b_base..b_base + b_chunk]);
+        }
+        let out_addr = self.memory.alloc_tensor(&out_shape, ma.dtype)?;
+        self.memory.write(out_addr, &out_bytes)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            if instr.rdest != 0xFF {
+                ctx.set_reg(instr.rdest, out_addr)?;
+            }
+        }
+        self.stats.concat_execs += 1;
+        log_debug("concat", &format!("ctx {} CONCAT 0x{:x}{:?} + 0x{:x}{:?} AXIS={} -> 0x{:x}{:?}", ctx_id, a_addr, ma.shape, b_addr, mb.shape, axis, out_addr, out_shape));
+        Ok(())
+    }
+
     /// Reacorda (Ready + enqueue) os ctxs à espera da barreira `id`,
     /// ignorando os que morreram no meio (ABORT remove do scheduler, mas
     /// não desta lista — guarda `is_some`). O arrivante NÃO é tocado: o
@@ -5277,6 +5550,146 @@ mod tests {
         vm.load_program(prog);
         let stats = vm.run().unwrap();
         assert_eq!((stats.arena_alloc_execs, stats.arena_reset_execs, stats.memcpy_execs, stats.memset_execs), (3, 1, 1, 1));
+    }
+
+    // ---- RFC-0024: views & versions ---------------------------------
+
+    #[test]
+    fn test_rfc0024_snapshot_restore_roundtrip() {
+        use crate::opcodes::{instr_memset, instr_restore, instr_snapshot, SNAP_MASK_ALL};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[2, 2], &[1.0; 4]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0), (5, 0), (6, 0), (7, 9999)]);
+        // Snapshot nomeado: fresh boot => v1.
+        vm.step_instruction(cid, &instr_snapshot(5, SNAP_MASK_ALL)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 5), 1);
+        // Sujidade + rewind bit-exato.
+        vm.step_instruction(cid, &instr_memset(0, 0, 0, 0)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a0, 4).unwrap(), vec![0.0; 4]);
+        vm.step_instruction(cid, &instr_restore(5)).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a0, 4).unwrap(), vec![1.0; 4]);
+        // Monotônico: próximo snapshot é v1+1 (restore nunca rebaixa).
+        vm.step_instruction(cid, &instr_snapshot(6, SNAP_MASK_ALL)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 6), 2);
+        // Erros: MASK parcial, versão desconhecida, rV ausente.
+        assert!(vm.step_instruction(cid, &crate::opcodes::instr_snapshot(5, 0b001)).is_err());
+        assert!(vm.step_instruction(cid, &instr_restore(7)).is_err());
+        assert!(vm.step_instruction(cid, &instr_restore(0xFF)).is_err());
+        assert_eq!(vm.stats.snapshot_execs, 2);
+        assert_eq!(vm.stats.restore_execs, 1);
+    }
+
+    #[test]
+    fn test_rfc0024_restore_rewinds_engine() {
+        use crate::opcodes::{instr_arena_alloc, instr_restore, instr_snapshot, SNAP_MASK_ALL};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        vm.step_instruction(cid, &instr_arena_alloc(0, 64, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 0), 0);
+        vm.step_instruction(cid, &instr_snapshot(5, SNAP_MASK_ALL)).unwrap();
+        vm.step_instruction(cid, &instr_arena_alloc(1, 32, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 1), 64);
+        // RESTORE rebobina o mapa (cursor volta a 64).
+        vm.step_instruction(cid, &instr_restore(5)).unwrap();
+        vm.step_instruction(cid, &instr_arena_alloc(2, 8, 16, 0)).unwrap();
+        assert_eq!(rfc0005_reg_u64(&vm, cid, 2), 64);
+    }
+
+    #[test]
+    fn test_rfc0024_prefetch_reshape_concat() {
+        use crate::opcodes::{instr_concat, instr_prefetch, instr_reshape};
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(60), ..Default::default() });
+        let a0 = rfc0004_f32(&mut vm, &[2, 4], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let b0 = rfc0004_f32(&mut vm, &[2, 4], &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, a0), (1, b0), (9, 0xdead)]);
+        // PREFETCH inteiro + janela + erros.
+        vm.step_instruction(cid, &instr_prefetch(0, 0, 0)).unwrap();
+        vm.step_instruction(cid, &instr_prefetch(0, 8, 8)).unwrap();
+        assert!(vm.step_instruction(cid, &instr_prefetch(0, 99, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_prefetch(9, 0, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_prefetch(0xFF, 0, 0)).is_err());
+        // RESHAPE [2,4] -> [8]: valores preservados; ndim muda p/ [2,2,2].
+        vm.step_instruction(cid, &instr_reshape(2, 0, &[8])).unwrap();
+        let r1 = rfc0005_reg_u64(&vm, cid, 2) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(r1, 8).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        vm.step_instruction(cid, &instr_reshape(3, 0, &[2, 2, 2])).unwrap();
+        let r2 = rfc0005_reg_u64(&vm, cid, 3) as u128;
+        assert_eq!(vm.memory.read_f32_tensor(r2, 8).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!(vm.step_instruction(cid, &instr_reshape(4, 0, &[3])).is_err());
+        assert!(vm.step_instruction(cid, &instr_reshape(4, 9, &[8])).is_err());
+        // CONCAT eixo 0: [2,4]+[2,4] -> [4,4] (A em cima, B embaixo).
+        vm.step_instruction(cid, &instr_concat(4, 0, 1, 0)).unwrap();
+        let rc = rfc0005_reg_u64(&vm, cid, 4) as u128;
+        assert_eq!(
+            vm.memory.read_f32_tensor(rc, 16).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        );
+        // CONCAT eixo 1: [2,4]+[2,4] -> [2,8] (lado a lado por linha).
+        vm.step_instruction(cid, &instr_concat(5, 0, 1, 1)).unwrap();
+        let rc1 = rfc0005_reg_u64(&vm, cid, 5) as u128;
+        assert_eq!(
+            vm.memory.read_f32_tensor(rc1, 16).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 5.0, 6.0, 7.0, 8.0, 50.0, 60.0, 70.0, 80.0]
+        );
+        // Erros: eixo fora, dims fora do eixo, dtype, esparso.
+        assert!(vm.step_instruction(cid, &instr_concat(6, 0, 1, 2)).is_err());
+        let c_mismatch = rfc0004_f32(&mut vm, &[2, 3], &[0.0; 6]);
+        vm.scheduler.get_mut(cid).unwrap().set_reg(6, c_mismatch).unwrap();
+        assert!(vm.step_instruction(cid, &instr_concat(7, 0, 6, 0)).is_err());
+        let d_f16 = vm.memory.alloc_tensor(&[2, 4], crate::memory::DType::F16).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(7, d_f16).unwrap();
+        assert!(vm.step_instruction(cid, &instr_concat(8, 0, 7, 0)).is_err());
+        let a_sparse = vm.memory.alloc_sparse_tensor(&[2, 4], crate::memory::DType::F32, 0.05).unwrap();
+        vm.scheduler.get_mut(cid).unwrap().set_reg(8, a_sparse).unwrap();
+        assert!(vm.step_instruction(cid, &instr_concat(0, 8, 1, 0)).is_err());
+        assert!(vm.step_instruction(cid, &instr_reshape(0, 8, &[8])).is_err());
+        assert!(vm.step_instruction(cid, &instr_prefetch(8, 0, 0)).is_err());
+        assert_eq!(vm.stats.prefetch_execs, 2);
+        assert_eq!(vm.stats.reshape_execs, 2);
+        assert_eq!(vm.stats.concat_execs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0024_assembled_program_runs() {
+        use crate::opcodes::assemble;
+        // Pipeline combinado: SNAPSHOT -> sujidade -> RESTORE + PREFETCH +
+        // RESHAPE + CONCAT.
+        let src = r#"
+            TENSOR r0 2 2 f32 FILL=1
+            SNAPSHOT r5
+            MEMSET r0 PATTERN=0
+            RESTORE r5
+            PREFETCH r0
+            RESHAPE r1, r0 SHAPE=1x4
+            CONCAT r2, r1, r1 AXIS=0
+            HALT
+        "#;
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.snapshot_execs, 1);
+        assert_eq!(stats.restore_execs, 1);
+        assert_eq!(stats.prefetch_execs, 1);
+        assert_eq!(stats.reshape_execs, 1);
+        assert_eq!(stats.concat_execs, 1);
+        let ctx = vm.scheduler.get(1).unwrap().clone();
+        // r0 restaurado a ones; r2 = [2,4] de ones.
+        let a0 = ctx.reg(0).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a0, 4).unwrap(), vec![1.0; 4]);
+        let a2 = ctx.reg(2).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(a2, 8).unwrap(), vec![1.0; 8]);
+    }
+
+    #[tokio::test]
+    async fn test_rfc0024_demo_runs() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/snap_concat_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(40), ..Default::default() });
+        vm.load_program(prog);
+        let stats = vm.run().unwrap();
+        assert_eq!((stats.snapshot_execs, stats.restore_execs, stats.prefetch_execs, stats.reshape_execs, stats.concat_execs), (1, 1, 1, 1, 1));
     }
 
     // ---- RFC-0005: determinismo -------------------------------------

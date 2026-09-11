@@ -1,0 +1,11 @@
+; programs/snap_concat_demo.m3asm — RFC-0024: views & versions.
+; SNAPSHOT -> sujidade -> RESTORE (roundtrip) + PREFETCH + RESHAPE +
+; CONCAT. Contadores verificados em test_rfc0024_demo_runs: 1 cada.
+TENSOR r0 2 2 f32 FILL=1
+SNAPSHOT r5
+MEMSET r0 PATTERN=0
+RESTORE r5
+PREFETCH r0
+RESHAPE r1, r0 SHAPE=1x4
+CONCAT r2, r1, r1 AXIS=0
+HALT
