@@ -4,7 +4,7 @@
 Status:   Informational Draft (research prototype, not a standard)
 Author:   Matheus de Camargo Marques <matheuscamarques@gmail.com> — ORCID https://orcid.org/0009-0003-4518-2258 — <https://github.com/matheuscamarques/m3_avm>
 Date:     2026-09-10
-Version:  ISA v1.14 (106 opcodes: 0x00-0x49 + 0x60-0x69,0x6A-0x79,0x7A-0x7E + 0xFF implemented; cumulative since v1.13)
+Version:  ISA v1.16 (116 opcodes: 0x00-0x49 + 0x4A-0x4D + 0x50-0x53,0x56-0x57 + 0x60-0x69,0x6A-0x79,0x7A-0x7E + 0xFF implemented; cumulative since v1.15)
 License:  AGPL-3.0-or-later (see LICENSE; Section 15)
 Replaces: all documents under docs/arq/ (archived, non-normative)
 ```
@@ -616,14 +616,18 @@ outruns the Status column above.
 | `0x45-0x49 STREAM_MERGE/VAD_DETECT/AUDIO_RESAMPLE/AUDIO_FILTER/AUDIO_WINDOW` (audio DSP) | IMPL | RFC-0031; VAD/RMS/ZCR goldens, exact DSP vectors, demo `audio_dsp_demo` (exec verified); v1.12 |
 | `0x44 DEPFORMER` (depformer step) | IMPL | RFC-0032; all-ones golden, KV window/rollback, seeded sampling, Rust-level combined test (tables need `.data`/STORE — Fase 9); v1.13 |
 | `0x7D/0x7E CALL/RET` (subroutines) | IMPL | RFC-0034; nesting/underflow/overflow/FORK goldens, demo `call_ret_demo` (exec verified); v1.14 |
+| `0x50/0x51 RAG_INDEX_ADD/DEL` | IMPL | RFC-0038 turno1; IndexStore create/append/del, CoW `Arc<RwLock>` + snapshot/rollback, `REQUIRED bit 50`; demo `rag_demo` (parcial) |
+| `0x52 RAG_SEARCH` + `0x53 EMBED_LOOKUP` | IMPL | RFC-0038 turno2; `DISTANCE` core (EUCLID/DOT/COSINE, tie menor-id, NaN→MAX), `ids ≤2^24`; bag média; goldens `test_rag_search_topk` + `lookup`; demo `rag_demo` |
+| `0x56 PQ_ENCODE` + `0x57 PQ_DECODE` | IMPL | RFC-0038 turno3; `NSUB u16`, `D%NSUB==0`, `K=rows/NSUB≤65536`, `U16`, tie menor índice; goldens `test_rag_pq_encode_decode` + `pq_roundtrip_small`; `benches/rag_bench.rs`; demo `rag_demo` (exec verified); v1.15 |
+| `0x4A LOAD_MODEL` + `0x4B SPAWN_CONTEXT` + `0x4C KILL_CONTEXT` + `0x4D SET_MODEL` (system local shims) | IMPL | RFC-0039 V-3A mini; `MODEL u16`, `entry LABEL+PRIO+MODEL handle`, `model_handle` por contexto, `HashMap` + snapshot `FORK/SNAPSHOT/ABORT/RESTORE`; `REQUIRED bit 51`; demo `system_demo` + `voice_loop_demo` (MVP); v1.16 |
 | KV per-stream stores 0-16 (stream-aware cache) | IMPL | RFC-0033; isolation/geometry/rollback goldens, TRUNCATE/COMPRESS routing, DEPFORMER foresight proof; no bump (no opcode) |
-| End-to-end Mamba GGUF smoke | OPEN | — |
+| End-to-end Mamba GGUF smoke (V-4) | IMPL | `inference::test_v4_mamba_forward_real_smoke` (mamba-130m Q4_K_M 24 layers, finite logits, conv dirty, 42s) + `test_v4_transformer_forward_real_smoke` (TinyLlama Q4_K_M 22 layers, KV 1→2, 74s); model-data local, skip gracioso se ausente |
 
-`cargo test --lib`: 256 green + 4 RFC-0019 arbiters at last report (ISA, sparse, bus,
-reactor, inference, asm_emitter, TUI, VM). One pre-existing failure
+`cargo test --lib`: 379 green (377 + 2 V-4 smoke) + 4 RFC-0019 arbiters (ISA, sparse, bus,
+reactor, inference, asm_emitter, TUI, VM, rag, system, mamba/transformer). One pre-existing failure
 unrelated to this spec: `moshi::test_gguf_qkv_split_shapes` (norm-gamma
 assertion on the local PersonaPlex GGUF; fails identically on the pristine
-tree — model-data issue, not a spec regression).
+tree — model-data issue, not a spec regression). Corpus: 45 `.m3asm` byte-identical (`programs/system_demo.m3asm` incluído). V-4 smokes ~120s com modelos locais (skip se ausente).
 
 ## 17. Measured Benchmarks
 
@@ -705,6 +709,8 @@ ation assumes non-Byzantine peers.
   stream+layer from day one; 17 streams proper is RFC-0033).
 - `ISA v1.14` = v1.13 + call control `0x7D-0x7E` (RFC-0034: `CALL`,
   `RET` + per-context stack; `0x7F` stays RESERVED).
+- `ISA v1.15` = v1.14 + retrieval `0x50-0x53,0x56-0x57` (RFC-0038: `RAG_INDEX_ADD/DEL`, `RAG_SEARCH`, `EMBED_LOOKUP`, `PQ_ENCODE/DECODE`; `0x54-0x55` stay HELD; `M3BC_REQUIRED_HAS_V2_RETRIEVAL=1<<50`).
+- `ISA v1.16` = v1.15 + system local shims `0x4A-0x4D` (RFC-0039: `LOAD_MODEL`, `SPAWN_CONTEXT`, `KILL_CONTEXT`, `SET_MODEL`; `0x4E-0x4F` stay RESERVED; `0xA0+` X-forms stay DRAFT; `M3BC_REQUIRED_HAS_V3_SYSTEM=1<<51`).
 - Draft v2.0 proposal (reconciled, non-normative): `docs/ESPEC-V2.md`
   (DRAFT — do not code against it; reservations in Sections 12-13 of
   this document remain the only binding future encodings).

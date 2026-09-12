@@ -183,9 +183,141 @@ pub fn topk_by_id(scored: &[(u64, f32)], k: usize) -> Vec<(u64, f32)> {
     order.iter().map(|&i| scored[i]).collect()
 }
 
+// ---------------------------------------------------------------------------
+// PQ — product quantizer (turno 3, RFC-0038).
+// ---------------------------------------------------------------------------
+
+/// Valida geometria PQ e extrai (subdim, K). Erros altos nunca silenciosos.
+pub fn pq_validate(d: usize, nsub: usize, cb_rows: usize, cb_cols: usize) -> Result<(usize, usize)> {
+    if nsub == 0 {
+        return Err(anyhow!("PQ: NSUB=0"));
+    }
+    if d == 0 || cb_rows == 0 || cb_cols == 0 {
+        return Err(anyhow!("PQ: dimensão zero (D={}, rows={}, cols={})", d, cb_rows, cb_cols));
+    }
+    if d % nsub != 0 {
+        return Err(anyhow!("PQ: D={} não divisível por NSUB={}", d, nsub));
+    }
+    let subdim = d / nsub;
+    if cb_rows % nsub != 0 {
+        return Err(anyhow!("PQ: codebook rows={} não divisível por NSUB={}", cb_rows, nsub));
+    }
+    let k = cb_rows / nsub;
+    if k == 0 || k > 65536 {
+        return Err(anyhow!("PQ: K={} fora de [1,65536]", k));
+    }
+    if cb_cols != subdim {
+        return Err(anyhow!("PQ: codebook cols={} != subdim {} (D/NSUB)", cb_cols, subdim));
+    }
+    Ok((subdim, k))
+}
+
+/// PQ_ENCODE: para cada subvetor, encontra centróide mais próximo (euclidiana
+/// quadrada; empate => menor índice). `vec` len D, `codebook` len rows*cols
+/// row-major [rows, cols].
+pub fn pq_encode(vec: &[f32], codebook: &[f32], nsub: usize) -> Result<Vec<u16>> {
+    if vec.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("PQ_ENCODE: vetor não-finito recusado (NaN/Inf)"));
+    }
+    if codebook.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("PQ_ENCODE: codebook não-finito recusado (NaN/Inf)"));
+    }
+    // Geometria será validada pelo caller com cb_rows/cb_cols; aqui inferimos
+    // subdim via D/nsub.
+    if nsub == 0 {
+        return Err(anyhow!("PQ_ENCODE: NSUB=0"));
+    }
+    if vec.len() % nsub != 0 {
+        return Err(anyhow!("PQ_ENCODE: D={} não divisível por NSUB={}", vec.len(), nsub));
+    }
+    let subdim = vec.len() / nsub;
+    let rows = codebook.len() / subdim;
+    if codebook.len() % subdim != 0 || rows % nsub != 0 {
+        return Err(anyhow!("PQ_ENCODE: geometria de codebook inconsistente (rows*cols={})", codebook.len()));
+    }
+    let k = rows / nsub;
+    let mut codes = Vec::with_capacity(nsub);
+    for s in 0..nsub {
+        let v = &vec[s * subdim..(s + 1) * subdim];
+        let mut best = 0usize;
+        let mut best_d = f32::MAX;
+        for c in 0..k {
+            let row = s * k + c;
+            let cent = &codebook[row * subdim..(row + 1) * subdim];
+            let d: f32 = v.iter().zip(cent.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+            if d < best_d {
+                best_d = d;
+                best = c;
+            }
+        }
+        codes.push(best as u16);
+    }
+    Ok(codes)
+}
+
+/// PQ_DECODE: reconstrói vetor concatenando centróides indexados por `codes`.
+pub fn pq_decode(codes: &[u16], codebook: &[f32], nsub: usize, subdim: usize, k: usize) -> Result<Vec<f32>> {
+    if codes.len() != nsub {
+        return Err(anyhow!("PQ_DECODE: codes len {} != NSUB {}", codes.len(), nsub));
+    }
+    if codebook.len() != nsub * k * subdim {
+        return Err(anyhow!("PQ_DECODE: codebook len {} != NSUB*K*subdim {}*{}*{}", codebook.len(), nsub, k, subdim));
+    }
+    for &c in codes {
+        if (c as usize) >= k {
+            return Err(anyhow!("PQ_DECODE: code {} >= K {}", c, k));
+        }
+    }
+    if codebook.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("PQ_DECODE: codebook não-finito recusado (NaN/Inf)"));
+    }
+    let mut out = Vec::with_capacity(nsub * subdim);
+    for (s, &code) in codes.iter().enumerate() {
+        let row = s * k + code as usize;
+        out.extend_from_slice(&codebook[row * subdim..(row + 1) * subdim]);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pq_validate_golden() {
+        // D=4 NSUB=2 => subdim=2 K=2 (rows=4)
+        assert_eq!(pq_validate(4, 2, 4, 2).unwrap(), (2, 2));
+        assert!(pq_validate(4, 3, 6, 2).is_err()); // D%NSUB
+        assert!(pq_validate(4, 2, 3, 2).is_err()); // rows%NSUB
+        assert!(pq_validate(4, 2, 4, 3).is_err()); // cols != subdim
+        assert!(pq_validate(4, 0, 4, 2).is_err());
+        assert!(pq_validate(0, 2, 4, 2).is_err());
+    }
+
+    #[test]
+    fn pq_roundtrip_small() {
+        // NSUB=2 subdim=2 K=2 -> codebook 4x2
+        // s0: c0=[0,0] c1=[10,10]; s1: c0=[0,0] c1=[10,10]
+        let cb = vec![0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 10.0, 10.0];
+        let v = vec![0.1, 0.2, 9.8, 10.1];
+        let codes = pq_encode(&v, &cb, 2).unwrap();
+        assert_eq!(codes, vec![0, 1]);
+        let (subdim, k) = pq_validate(4, 2, 4, 2).unwrap();
+        let rec = pq_decode(&codes, &cb, 2, subdim, k).unwrap();
+        assert_eq!(rec, vec![0.0, 0.0, 10.0, 10.0]);
+        // Empate => menor índice (distância igual a dois centróides equidistantes).
+        let cb2 = vec![0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0, 0.0];
+        let v2 = vec![1.0, 0.0, 1.0, 0.0];
+        let codes2 = pq_encode(&v2, &cb2, 2).unwrap();
+        assert_eq!(codes2, vec![0, 0]); // 1.0 equidistante de 0 e 2 -> 0 vence
+        // NaN recusa, geometria inconsistente recusa.
+        assert!(pq_encode(&[f32::NAN, 0.0, 0.0, 0.0], &cb, 2).is_err());
+        assert!(pq_encode(&v, &vec![f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2).is_err());
+        assert!(pq_encode(&[0.0, 0.0, 0.0], &cb, 2).is_err());
+        // Decode: code >=K erra.
+        assert!(pq_decode(&[2, 0], &cb, 2, 2, 2).is_err());
+        assert!(pq_decode(&[0], &cb, 2, 2, 2).is_err());
+    }
 
     #[test]
     fn lifecycle_store() {

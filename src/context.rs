@@ -118,6 +118,8 @@ pub struct Context {
     /// Estado RNG do contexto (splitmix64; RFC-0005). Semente fixa no boot
     /// frio => determinismo; FORK herda (clone), re-seed p/ divergir.
     pub rng_state: u64,
+    /// Handle de modelo ativo (V-3A, RFC-0039). 0 = nenhum; FORK herda.
+    pub model_handle: u64,
 }
 
 impl Context {
@@ -136,6 +138,7 @@ impl Context {
             pipeline: PIPE_TRANSFORMER_CTX,
             deadline: u64::MAX,
             rng_state: crate::determinism::DEFAULT_RNG_SEED,
+            model_handle: 0,
         }
     }
 

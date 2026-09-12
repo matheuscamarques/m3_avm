@@ -1,0 +1,31 @@
+; rag_demo.m3asm — V-2 retrieval end-to-end (RFC-0038)
+;  ADD×3 -> SEARCH TOPK=2 -> LOOKUP -> PQ roundtrip -> HALT
+;  Uso:
+;    cargo run --bin m3_avm -- run programs/rag_demo.m3asm --max-steps 50
+;  Goldens: ver vm::test_rag_pq_encode_decode e V-2_SCOPE §5
+
+; --- RAG_INDEX_ADD ×3 (db=0 cria) ---
+TENSOR r0 1 4 f32 FILL=0.5
+TENSOR r1 1 4 f32 FILL=1.5
+TENSOR r2 1 4 f32 FILL=2.5
+LOADI r5, 0
+RAG_INDEX_ADD r3, r5, r0
+RAG_INDEX_ADD r4, r3, r1
+RAG_INDEX_ADD r5, r3, r2
+
+; --- RAG_SEARCH TOPK=2 (query = r0) ---
+TENSOR r6 1 4 f32 FILL=0.5
+RAG_SEARCH r7, r6, r3 TOPK=2 METRIC=EUCLID
+
+; --- EMBED_LOOKUP (tabela 4×4 ramp, ids [0,0]) ---
+TENSOR r8 4 4 f32
+TENSOR r9 1 2 f32 FILL=0
+EMBED_LOOKUP r10, r9, r8
+
+; --- PQ roundtrip (D=4 NSUB=2 subdim=2 K=2) ---
+TENSOR r11 1 4 f32 FILL=0.5
+TENSOR r12 4 2 f32
+PQ_ENCODE r13, r11, r12 NSUB=2
+PQ_DECODE r14, r13, r12 NSUB=2
+
+HALT

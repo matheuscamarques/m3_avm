@@ -24,7 +24,7 @@ use pollster;
 use crate::opcodes::{
     Instruction, ProgramInstr, INSTR_SIZE, OP_ABORT, OP_ADD, OP_ATTN, OP_AUDIO_ALIGN, OP_CODEC_DEC, OP_CODEC_ENC,
     OP_COMPARE, OP_CTX_SWITCH, OP_DISTANCE, OP_EMBED, OP_FFN, OP_FORK, OP_GATHER, OP_HALT, OP_IF_EQUAL, OP_IF_INTERRUPT, OP_JUMP,
-    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RAG_INDEX_ADD, OP_RAG_INDEX_DEL, OP_RAG_SEARCH, OP_EMBED_LOOKUP, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
+    OP_MATVEC, OP_MUL, OP_NOP, OP_NORM, OP_RAG_INDEX_ADD, OP_RAG_INDEX_DEL, OP_RAG_SEARCH, OP_EMBED_LOOKUP, OP_PQ_ENCODE, OP_PQ_DECODE, OP_LOAD_MODEL, OP_SPAWN_CONTEXT, OP_KILL_CONTEXT, OP_SET_MODEL, OP_RANK1_UPDATE, OP_ROPE, OP_SAMPLE, OP_SENSE, OP_SILU, OP_SSM_RESET, OP_SSM_SCAN,
     OP_STREAM, OP_TENSOR, SENSE_AUDIO, SENSE_AUDIO_PCM, SENSE_CODEC_FRAME, SENSE_TOKEN, SENSE_USER_INPUT,
     SENSE_VAD, STREAM_FLAG_BLOCKING, OP_RNG_SEED, OP_RNG_NEXT, OP_RNG_UNIFORM, OP_RNG_NORMAL,
     OP_HASH, OP_CHECKSUM, OP_HMAC, OP_CYCLES_COUNT, OP_TRACE_EVENT, OP_SANITY_CHECK,
@@ -173,6 +173,12 @@ pub struct VmStats {
     pub rag_index_del_execs: u64,
     pub rag_search_execs: u64,
     pub embed_lookup_execs: u64,
+    pub pq_encode_execs: u64,
+    pub pq_decode_execs: u64,
+    pub load_model_execs: u64,
+    pub spawn_context_execs: u64,
+    pub kill_context_execs: u64,
+    pub set_model_execs: u64,
     pub call_execs: u64,
     pub ret_execs: u64,
     pub start_ns: u64,
@@ -523,6 +529,12 @@ pub struct Vm {
     pub locks: HashMap<u32, u64>,
     /// Anel de trace (TRACE_EVENT 0x6B): (event_id, data), teto TRACE_CAP.
     pub trace: VecDeque<(u64, u128)>,
+    /// Registry de modelos V-3A (LOAD_MODEL 0x4A): handle u64 -> model_id u16.
+    /// FORK herda model_handle do pai via Context; SET_MODEL troca.
+    /// Snapshot: clone leve (HashMap) nos 4 pontos (FORK/SNAPSHOT/ABORT/RESTORE).
+    pub models: HashMap<u64, u16>,
+    models_snapshots: Vec<(u64, HashMap<u64, u16>)>,
+    pub next_model_handle: u64,
 }
 
 /// Estado one-shot de uma barreira local (RFC-0018).
@@ -592,6 +604,9 @@ impl Vm {
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
             trace: VecDeque::new(),
+            models: HashMap::new(),
+            models_snapshots: Vec::new(),
+            next_model_handle: 1,
         })
     }
 
@@ -629,6 +644,9 @@ impl Vm {
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
             trace: VecDeque::new(),
+            models: HashMap::new(),
+            models_snapshots: Vec::new(),
+            next_model_handle: 1,
         }
     }
 
@@ -663,6 +681,9 @@ impl Vm {
             barrier_waiters: HashMap::new(),
             locks: HashMap::new(),
             trace: VecDeque::new(),
+            models: HashMap::new(),
+            models_snapshots: Vec::new(),
+            next_model_handle: 1,
         })
     }
 
@@ -1424,6 +1445,31 @@ impl Vm {
                 self.exec_embed_lookup(ctx_id, instr)?;
                 Ok(true)
             }
+            OP_PQ_ENCODE => {
+                self.exec_pq_encode(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_PQ_DECODE => {
+                self.exec_pq_decode(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_LOAD_MODEL => {
+                self.exec_load_model(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SPAWN_CONTEXT => {
+                self.exec_spawn_context(ctx_id, instr)?;
+                // SPAWN define PC do filho, mas pai avança normalmente
+                Ok(true)
+            }
+            OP_KILL_CONTEXT => {
+                self.exec_kill_context(ctx_id, instr)?;
+                Ok(true)
+            }
+            OP_SET_MODEL => {
+                self.exec_set_model(ctx_id, instr)?;
+                Ok(true)
+            }
             OP_CALL => {
                 self.exec_call(ctx_id, instr)?;
                 // CALL define PC diretamente — sem avanço automático
@@ -1974,6 +2020,8 @@ impl Vm {
         // Snapshot do IndexStore RAG (RFC-0038, opção B): Arc::clone O(1);
         // a primeira escrita com snapshot vivo duplica (ver rag_store_mut).
         self.rag_snapshots.push((snap_version, std::sync::Arc::clone(&self.rag_store)));
+        // Snapshot dos modelos V-3A (RFC-0039): clone leve.
+        self.models_snapshots.push((snap_version, self.models.clone()));
         self.stats.forks += 1;
         log_info("fork", &format!("ctx {} FORK -> child {} prio {} (snap v{})", ctx_id, new_id, child_prio, snap_version));
         Ok(())
@@ -2305,6 +2353,19 @@ impl Vm {
             }
         } else if let Some((_, snap)) = self.rag_snapshots.pop() {
             self.rag_store = snap;
+        }
+        // Rollback modelos V-3A (RFC-0039): mesma disciplina.
+        if ts_version != 0 {
+            while self.models_snapshots.last().map(|(v, _)| *v > ts_version).unwrap_or(false) {
+                self.models_snapshots.pop();
+            }
+            if self.models_snapshots.last().map(|(v, _)| *v == ts_version).unwrap_or(false) {
+                if let Some((_, snap)) = self.models_snapshots.pop() {
+                    self.models = snap;
+                }
+            }
+        } else if let Some((_, snap)) = self.models_snapshots.pop() {
+            self.models = snap;
         }
 
         self.stats.aborts += 1;
@@ -4286,6 +4347,233 @@ impl Vm {
         Ok(())
     }
 
+    fn exec_pq_encode(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::rag::{pq_encode, pq_validate};
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("PQ_ENCODE precisa de rD, rVec, rCodebook (0xFF não é registrador)"));
+        }
+        if instr.rsrc3 != 0xFF {
+            return Err(anyhow!("PQ_ENCODE: rsrc3 deve ser 0xFF (não usado)"));
+        }
+        let nsub = instr.pq_nsub();
+        if nsub == 0 {
+            return Err(anyhow!("PQ_ENCODE: NSUB=0 (carga payload zero; use NSUB=)"));
+        }
+        let (vec_addr, cb_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let vec_meta = self.memory.get_tensor_meta(vec_addr).cloned()
+            .ok_or_else(|| anyhow!("PQ_ENCODE: rVec 0x{:x} não encontrado", vec_addr))?;
+        if vec_meta.is_sparse || vec_meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("PQ_ENCODE: rVec deve ser denso F32, achado dtype {:?} sparse {}", vec_meta.dtype, vec_meta.is_sparse));
+        }
+        let d: usize = vec_meta.shape.iter().product();
+        if d == 0 {
+            return Err(anyhow!("PQ_ENCODE: rVec vazio"));
+        }
+        let vec = self.memory.read_f32_tensor(vec_addr, d)?;
+        if vec.iter().any(|x| !x.is_finite()) {
+            return Err(anyhow!("PQ_ENCODE: vetor não-finito recusado (NaN/Inf)"));
+        }
+        let cb_meta = self.memory.get_tensor_meta(cb_addr).cloned()
+            .ok_or_else(|| anyhow!("PQ_ENCODE: rCodebook 0x{:x} não encontrado", cb_addr))?;
+        if cb_meta.is_sparse || cb_meta.shape.len() != 2 || cb_meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("PQ_ENCODE: rCodebook deve ser denso F32 2D [NSUB*K,subdim], achado {:?}", cb_meta.shape));
+        }
+        let (cb_rows, cb_cols) = (cb_meta.shape[0], cb_meta.shape[1]);
+        let (subdim, _k) = pq_validate(d, nsub as usize, cb_rows, cb_cols)?;
+        let cb = self.memory.read_f32_tensor(cb_addr, cb_rows * cb_cols)?;
+        if cb.iter().any(|x| !x.is_finite()) {
+            return Err(anyhow!("PQ_ENCODE: codebook não-finito recusado (NaN/Inf)"));
+        }
+        let codes = pq_encode(&vec, &cb, nsub as usize)?;
+        // saída [1,NSUB] F32 carregando u16 (f32 exato até 2^24 > 65535).
+        let out: Vec<f32> = codes.iter().map(|&c| c as f32).collect();
+        let out_addr = self.memory.alloc_tensor(&[1, nsub as usize], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &out)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.pq_encode_execs += 1;
+        log_debug("rag", &format!("ctx {} PQ_ENCODE NSUB={} D={} -> 0x{:x}", ctx_id, nsub, d, out_addr));
+        Ok(())
+    }
+
+    fn exec_pq_decode(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        use crate::rag::{pq_decode, pq_validate};
+        if instr.rdest == 0xFF || instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("PQ_DECODE precisa de rD, rCodes, rCodebook (0xFF não é registrador)"));
+        }
+        if instr.rsrc3 != 0xFF {
+            return Err(anyhow!("PQ_DECODE: rsrc3 deve ser 0xFF (não usado)"));
+        }
+        let nsub = instr.pq_nsub();
+        if nsub == 0 {
+            return Err(anyhow!("PQ_DECODE: NSUB=0 (carga payload zero; use NSUB=)"));
+        }
+        let (codes_addr, cb_addr) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)?, ctx.reg(instr.rsrc2)?)
+        };
+        let codes_meta = self.memory.get_tensor_meta(codes_addr).cloned()
+            .ok_or_else(|| anyhow!("PQ_DECODE: rCodes 0x{:x} não encontrado", codes_addr))?;
+        if codes_meta.is_sparse || codes_meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("PQ_DECODE: rCodes deve ser denso F32, achado {:?}", codes_meta.dtype));
+        }
+        let n_codes: usize = codes_meta.shape.iter().product();
+        if n_codes != nsub as usize {
+            return Err(anyhow!("PQ_DECODE: rCodes numel {} != NSUB {}", n_codes, nsub));
+        }
+        let codes_f = self.memory.read_f32_tensor(codes_addr, n_codes)?;
+        let mut codes_u16 = Vec::with_capacity(n_codes);
+        for f in &codes_f {
+            if !f.is_finite() || f.fract() != 0.0 || *f < 0.0 || *f > 65535.0 {
+                return Err(anyhow!("PQ_DECODE: code '{}' inválido (u16 inteiro)", f));
+            }
+            codes_u16.push(*f as u16);
+        }
+        let cb_meta = self.memory.get_tensor_meta(cb_addr).cloned()
+            .ok_or_else(|| anyhow!("PQ_DECODE: rCodebook 0x{:x} não encontrado", cb_addr))?;
+        if cb_meta.is_sparse || cb_meta.shape.len() != 2 || cb_meta.dtype != crate::memory::DType::F32 {
+            return Err(anyhow!("PQ_DECODE: rCodebook deve ser denso F32 2D [NSUB*K,subdim], achado {:?}", cb_meta.shape));
+        }
+        let (cb_rows, cb_cols) = (cb_meta.shape[0], cb_meta.shape[1]);
+        // D inferido de cb: subdim = cols, D = nsub*subdim. Validamos via pq_validate.
+        let d = nsub as usize * cb_cols;
+        let (subdim, k) = pq_validate(d, nsub as usize, cb_rows, cb_cols)?;
+        // Valida cada code < K
+        for &c in &codes_u16 {
+            if (c as usize) >= k {
+                return Err(anyhow!("PQ_DECODE: code {} >= K {}", c, k));
+            }
+        }
+        let cb = self.memory.read_f32_tensor(cb_addr, cb_rows * cb_cols)?;
+        if cb.iter().any(|x| !x.is_finite()) {
+            return Err(anyhow!("PQ_DECODE: codebook não-finito recusado (NaN/Inf)"));
+        }
+        let rec = pq_decode(&codes_u16, &cb, nsub as usize, subdim, k)?;
+        let out_addr = self.memory.alloc_tensor(&[1, d], crate::memory::DType::F32)?;
+        self.memory.write_f32_tensor(out_addr, &rec)?;
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, out_addr)?;
+        }
+        self.stats.pq_decode_execs += 1;
+        log_debug("rag", &format!("ctx {} PQ_DECODE NSUB={} D={} -> 0x{:x}", ctx_id, nsub, d, out_addr));
+        Ok(())
+    }
+
+    fn exec_load_model(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF {
+            return Err(anyhow!("LOAD_MODEL precisa de rD (0xFF não é registrador)"));
+        }
+        let mid = instr.load_model_id();
+        if mid == 0 {
+            return Err(anyhow!("LOAD_MODEL: MODEL=0 (carga payload zero; use MODEL=)"));
+        }
+        let handle = self.next_model_handle;
+        self.next_model_handle += 1;
+        self.models.insert(handle, mid);
+        if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
+            ctx.set_reg(instr.rdest, handle as u128)?;
+        }
+        self.stats.load_model_execs += 1;
+        log_debug("system", &format!("ctx {} LOAD_MODEL id={} -> handle {}", ctx_id, mid, handle));
+        Ok(())
+    }
+
+    fn exec_spawn_context(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rdest == 0xFF {
+            return Err(anyhow!("SPAWN_CONTEXT precisa de rD (0xFF não é registrador)"));
+        }
+        let prio = match instr.flags & 0b11 {
+            0b00 => crate::context::Priority::Green,
+            0b01 => crate::context::Priority::Blue,
+            0b10 => crate::context::Priority::Red,
+            _ => crate::context::Priority::Red,
+        };
+        let entry = instr.spawn_entry();
+        if entry > u128::from(u32::MAX) {
+            return Err(anyhow!("SPAWN_CONTEXT: entry_pc 0x{:x} fora da faixa u32", entry));
+        }
+        let entry_u128 = entry;
+        // valida alinhamento e existência dentro do programa (se programa carregado)
+        if !self.pc_offsets.is_empty() {
+            if entry_u128 < self.program_base {
+                return Err(anyhow!("SPAWN_CONTEXT: entry 0x{:x} abaixo da base 0x{:x}", entry, self.program_base));
+            }
+            let off = entry_u128 - self.program_base;
+            if !self.pc_offsets.contains(&off) {
+                return Err(anyhow!("SPAWN_CONTEXT: entry 0x{:x} (off {}) não alinha com início de instrução", entry, off));
+            }
+        } else if entry_u128 % 32 != 0 {
+            return Err(anyhow!("SPAWN_CONTEXT: entry 0x{:x} não alinha em 32B", entry));
+        }
+        let model_handle = if instr.rsrc1 != 0xFF {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            let v = ctx.reg(instr.rsrc1)? as u64;
+            if v != 0 && !self.models.contains_key(&v) {
+                return Err(anyhow!("SPAWN_CONTEXT: MODEL handle {} inexistente", v));
+            }
+            v
+        } else {
+            0
+        };
+        let parent_root = self.scheduler.get(ctx_id).map(|c| c.root_version).unwrap_or(0);
+        let child_id = self.scheduler.create_context(prio, entry_u128, parent_root);
+        if let Some(child) = self.scheduler.get_mut(child_id) {
+            child.model_handle = model_handle;
+        }
+        // Snapshot dos modelos no FORK-like path já feito pelo caller? SPAWN não é FORK, mas
+        // para CoW do registry já temos; não empilha snapshot aqui (só FORK/SNAPSHOT fazem).
+        if let Some(parent) = self.scheduler.get_mut(ctx_id) {
+            parent.set_reg(instr.rdest, child_id as u128)?;
+        }
+        self.stats.spawn_context_execs += 1;
+        log_debug("system", &format!("ctx {} SPAWN_CONTEXT -> child {} entry 0x{:x} prio {} model {}", ctx_id, child_id, entry, prio, model_handle));
+        Ok(())
+    }
+
+    fn exec_kill_context(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rsrc1 == 0xFF {
+            return Err(anyhow!("KILL_CONTEXT precisa de rTarget (0xFF não é registrador)"));
+        }
+        let target = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            ctx.reg(instr.rsrc1)? as u64
+        };
+        if target == 0 {
+            return Err(anyhow!("KILL_CONTEXT: alvo 0 (ctx inexistente)"));
+        }
+        if self.scheduler.remove(target).is_none() {
+            return Err(anyhow!("KILL_CONTEXT: alvo {} não encontrado", target));
+        }
+        self.stats.kill_context_execs += 1;
+        log_debug("system", &format!("ctx {} KILL_CONTEXT {}", ctx_id, target));
+        Ok(())
+    }
+
+    fn exec_set_model(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
+        if instr.rsrc1 == 0xFF || instr.rsrc2 == 0xFF {
+            return Err(anyhow!("SET_MODEL precisa de rCtx, rModel (0xFF não é registrador)"));
+        }
+        let (target, handle) = {
+            let ctx = self.scheduler.get(ctx_id).ok_or_else(|| anyhow!("ctx {} não encontrado", ctx_id))?;
+            (ctx.reg(instr.rsrc1)? as u64, ctx.reg(instr.rsrc2)? as u64)
+        };
+        if target == 0 {
+            return Err(anyhow!("SET_MODEL: rCtx 0"));
+        }
+        if !self.models.contains_key(&handle) {
+            return Err(anyhow!("SET_MODEL: handle {} inexistente (LOAD_MODEL primeiro)", handle));
+        }
+        let tgt = self.scheduler.get_mut(target).ok_or_else(|| anyhow!("SET_MODEL: ctx {} não encontrado", target))?;
+        tgt.model_handle = handle;
+        self.stats.set_model_execs += 1;
+        log_debug("system", &format!("ctx {} SET_MODEL ctx {} -> model {}", ctx_id, target, handle));
+        Ok(())
+    }
+
     fn exec_snapshot(&mut self, ctx_id: u64, instr: &Instruction) -> Result<()> {
         let mask = instr.snapshot_mask();
         if mask != SNAP_MASK_ALL {
@@ -4298,6 +4586,7 @@ impl Vm {
         self.arena_snapshots.push((v, self.arenas.clone()));
         self.dep_snapshots.push((v, self.dep_kv.clone()));
         self.rag_snapshots.push((v, std::sync::Arc::clone(&self.rag_store)));
+        self.models_snapshots.push((v, self.models.clone()));
         if let Some(ctx) = self.scheduler.get_mut(ctx_id) {
             if instr.rdest != 0xFF {
                 ctx.set_reg(instr.rdest, v as u128)?;
@@ -4369,6 +4658,15 @@ impl Vm {
         if self.rag_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
             if let Some((_, snap)) = self.rag_snapshots.pop() {
                 self.rag_store = snap;
+            }
+        }
+        // Rollback modelos V-3A.
+        while self.models_snapshots.last().map(|(v, _)| *v > version).unwrap_or(false) {
+            self.models_snapshots.pop();
+        }
+        if self.models_snapshots.last().map(|(v, _)| *v == version).unwrap_or(false) {
+            if let Some((_, snap)) = self.models_snapshots.pop() {
+                self.models = snap;
             }
         }
         self.stats.restore_execs += 1;
@@ -9494,6 +9792,220 @@ mod tests {
             assert!(vm.step_instruction(cid, &instr_rag_index_del(4, 1, 2)).is_ok());
             assert_eq!(vm.scheduler.get(cid).unwrap().reg(4).unwrap(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_rag_pq_encode_decode() {
+        use crate::opcodes::{assemble, instr_pq_decode, instr_pq_encode};
+        // Goldens: NSUB=2 subdim=2 K=2 codebook 4x2
+        //  s0: c0=[0,0] c1=[10,10]; s1: c0=[0,0] c1=[10,10]
+        let src = "TENSOR r0 1 4 f32 FILL=0.5\nHALT";
+        let prog = assemble(src).unwrap();
+        let _ = prog[0].mnemonic();
+        // Assembler NSUB obrigatório e byte-igualdade.
+        let a = assemble("PQ_ENCODE r4, r0, r1 NSUB=2").unwrap();
+        let b = assemble("PQ_ENCODE r4, r0, r1 NSUB=2").unwrap();
+        assert_eq!(a[0].encode(), b[0].encode());
+        assert_eq!(a[0].pq_nsub(), 2);
+        assert!(assemble("PQ_ENCODE r4, r0, r1").is_err());
+        assert!(assemble("PQ_ENCODE r4, r0, r1 NSUB=0").is_err());
+        assert!(assemble("PQ_ENCODE r4, r0, r1 NSUB=abc").is_err());
+        assert!(assemble("PQ_ENCODE r4, r0, r1 NSUB=2 FOO=1").is_err());
+        assert!(assemble("PQ_ENCODE r4, r0").is_err());
+        assert!(assemble("PQ_DECODE r4, r0, r1").is_err());
+        assert!(assemble("PQ_DECODE r4, r0, r1 NSUB=0").is_err());
+        assert!(assemble("PQ_DECODE r4, r0, r1 NSUB=2 EXTRA").is_err());
+        // .equ em NSUB
+        let c = assemble(".equ NS 2\nPQ_ENCODE r4, r0, r1 NSUB=NS").unwrap();
+        assert_eq!(c[0].pq_nsub(), 2);
+        // Exec goldens via step_instruction.
+        // Helpers: cria tensores manualmente (denso F32).
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        // codebook [4,2] f32
+        let cb = {
+            let flat = vec![0.0f32, 0.0, 10.0, 10.0, 0.0, 0.0, 10.0, 10.0];
+            rfc0004_f32(&mut vm, &[4, 2], &flat)
+        };
+        let vec = rfc0004_f32(&mut vm, &[1, 4], &[0.1, 0.2, 9.8, 10.1]);
+        let cid = rfc0004_ctx_with(&mut vm, &[(0, vec), (1, cb)]);
+        vm.step_instruction(cid, &instr_pq_encode(4, 0, 1, 2)).unwrap();
+        let out = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        let codes = vm.memory.read_f32_tensor(out, 2).unwrap();
+        assert_eq!(codes, vec![0.0, 1.0]);
+        assert_eq!(vm.stats.pq_encode_execs, 1);
+        // DECODE roundtrip
+        let codes_addr = vm.scheduler.get(cid).unwrap().reg(4).unwrap();
+        let cid2 = rfc0004_ctx_with(&mut vm, &[(0, codes_addr), (1, cb)]);
+        vm.step_instruction(cid2, &instr_pq_decode(4, 0, 1, 2)).unwrap();
+        let rec_addr = vm.scheduler.get(cid2).unwrap().reg(4).unwrap();
+        let rec = vm.memory.read_f32_tensor(rec_addr, 4).unwrap();
+        assert_eq!(rec, vec![0.0, 0.0, 10.0, 10.0]);
+        assert_eq!(vm.stats.pq_decode_execs, 1);
+        // Empate => menor índice (distância igual)
+        let cb2 = rfc0004_f32(&mut vm, &[4, 2], &[0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+        let v2 = rfc0004_f32(&mut vm, &[1, 4], &[1.0, 0.0, 1.0, 0.0]);
+        let cid3 = rfc0004_ctx_with(&mut vm, &[(0, v2), (1, cb2)]);
+        vm.step_instruction(cid3, &instr_pq_encode(4, 0, 1, 2)).unwrap();
+        let out3 = vm.scheduler.get(cid3).unwrap().reg(4).unwrap();
+        assert_eq!(vm.memory.read_f32_tensor(out3, 2).unwrap(), vec![0.0, 0.0]);
+        // Exec erra: D%NSUB, rows%NSUB, cols!=subdim, NaN, code>=K, codes len !=NSUB, rdest 0xFF
+        let bad_vec = rfc0004_f32(&mut vm, &[1, 3], &[1.0, 2.0, 3.0]);
+        let cid_err = rfc0004_ctx_with(&mut vm, &[(0, bad_vec), (1, cb)]);
+        assert!(vm.step_instruction(cid_err, &instr_pq_encode(4, 0, 1, 2)).is_err());
+        let bad_cb_rows = rfc0004_f32(&mut vm, &[3, 2], &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let cid_err2 = rfc0004_ctx_with(&mut vm, &[(0, vec), (1, bad_cb_rows)]);
+        assert!(vm.step_instruction(cid_err2, &instr_pq_encode(4, 0, 1, 2)).is_err());
+        let bad_cb_cols = rfc0004_f32(&mut vm, &[4, 3], &[0.0; 12]);
+        let cid_err3 = rfc0004_ctx_with(&mut vm, &[(0, vec), (1, bad_cb_cols)]);
+        assert!(vm.step_instruction(cid_err3, &instr_pq_encode(4, 0, 1, 2)).is_err());
+        let nan_vec = rfc0004_f32(&mut vm, &[1, 4], &[f32::NAN, 0.0, 0.0, 0.0]);
+        let cid_err4 = rfc0004_ctx_with(&mut vm, &[(0, nan_vec), (1, cb)]);
+        assert!(vm.step_instruction(cid_err4, &instr_pq_encode(4, 0, 1, 2)).is_err());
+        let nan_cb = rfc0004_f32(&mut vm, &[4, 2], &[f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let cid_err5 = rfc0004_ctx_with(&mut vm, &[(0, vec), (1, nan_cb)]);
+        assert!(vm.step_instruction(cid_err5, &instr_pq_encode(4, 0, 1, 2)).is_err());
+        assert!(vm.step_instruction(cid_err5, &instr_pq_encode(0xFF, 0, 1, 2)).is_err());
+        // DECODE erros: code >=K, codes len diverge, NaN code
+        let bad_codes = rfc0004_f32(&mut vm, &[1, 2], &[2.0, 0.0]); // K=2 => 2 inválido
+        let cid_err6 = rfc0004_ctx_with(&mut vm, &[(0, bad_codes), (1, cb)]);
+        assert!(vm.step_instruction(cid_err6, &instr_pq_decode(4, 0, 1, 2)).is_err());
+        let short_codes = rfc0004_f32(&mut vm, &[1, 1], &[0.0]);
+        let cid_err7 = rfc0004_ctx_with(&mut vm, &[(0, short_codes), (1, cb)]);
+        assert!(vm.step_instruction(cid_err7, &instr_pq_decode(4, 0, 1, 2)).is_err());
+        let nan_codes = rfc0004_f32(&mut vm, &[1, 2], &[f32::NAN, 0.0]);
+        let cid_err8 = rfc0004_ctx_with(&mut vm, &[(0, nan_codes), (1, cb)]);
+        assert!(vm.step_instruction(cid_err8, &instr_pq_decode(4, 0, 1, 2)).is_err());
+        assert!(vm.step_instruction(cid_err8, &instr_pq_decode(0xFF, 0, 1, 2)).is_err());
+        // Programa montado e executado ponta a ponta (TENSOR + PQ)
+        let src2 = "TENSOR r0 1 4 f32 FILL=1.0\nTENSOR r1 4 2 f32 FILL=0.0\nPQ_ENCODE r2, r0, r1 NSUB=2\nPQ_DECODE r3, r2, r1 NSUB=2\nHALT";
+        let prog2 = assemble(src2).unwrap();
+        assert_eq!(prog2[2].mnemonic(), "PQ_ENCODE");
+        assert_eq!(prog2[3].mnemonic(), "PQ_DECODE");
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(50), ..Default::default() });
+        // Sobrescreve codebook com valores reais para o teste de run
+        vm2.load_program(prog2);
+        // Preenche codebook após TENSOR (precisa rodar até alocar): usa run parcial via step?
+        // Simplifica: testa apenas montagem e contadores após run com FILL zero -> codes 0,0 decode 0,0,0,0
+        vm2.run().unwrap();
+        assert_eq!(vm2.stats.pq_encode_execs, 1);
+        assert_eq!(vm2.stats.pq_decode_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_system_ops_mini() {
+        use crate::opcodes::{assemble, instr_kill_context, instr_load_model, instr_set_model, instr_spawn_context, FORK_FLAG_GREEN};
+        // Assembler strictness
+        let a = assemble("LOAD_MODEL r0, MODEL=1").unwrap();
+        assert_eq!(a[0].load_model_id(), 1);
+        assert!(assemble("LOAD_MODEL r0").is_err());
+        assert!(assemble("LOAD_MODEL r0, MODEL=0").is_err());
+        assert!(assemble("LOAD_MODEL r0, MODEL=1 EXTRA").is_err());
+        assert!(assemble("LOAD_MODEL r0, FOO=1").is_err());
+        let b = assemble("SPAWN_CONTEXT r1, WORKER, GREEN\nWORKER: HALT").unwrap();
+        assert_eq!(b[0].mnemonic(), "SPAWN_CONTEXT");
+        assert!(assemble("SPAWN_CONTEXT r1, NOPE, GREEN").is_err());
+        assert!(assemble("SPAWN_CONTEXT r1, WORKER, YELLOW").is_err());
+        assert!(assemble("KILL_CONTEXT r0").is_ok());
+        assert!(assemble("KILL_CONTEXT r0, r1").is_err());
+        assert!(assemble("SET_MODEL r0, r1").is_ok());
+        assert!(assemble("SET_MODEL r0").is_err());
+        // .equ em MODEL
+        let c = assemble(".equ M 5\nLOAD_MODEL r2, MODEL=M").unwrap();
+        assert_eq!(c[0].load_model_id(), 5);
+
+        // Exec goldens via step_instruction
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(30), ..Default::default() });
+        let cid = rfc0004_ctx_with(&mut vm, &[]);
+        // LOAD_MODEL 1 -> handle 1
+        vm.step_instruction(cid, &instr_load_model(0, 1)).unwrap();
+        let h1 = vm.scheduler.get(cid).unwrap().reg(0).unwrap() as u64;
+        assert_eq!(h1, 1);
+        assert_eq!(vm.models.get(&h1).cloned(), Some(1));
+        vm.step_instruction(cid, &instr_load_model(1, 2)).unwrap();
+        let h2 = vm.scheduler.get(cid).unwrap().reg(1).unwrap() as u64;
+        assert_eq!(h2, 2);
+        assert_eq!(vm.stats.load_model_execs, 2);
+        // SPAWN_CONTEXT via step: precisa de programa com label, mas testamos via step com entry pc 0 (HALT)
+        // Cria programa dummy para obter entry pc válido (0x1000)
+        let mut vm2 = Vm::new_in_memory(VmConfig { max_steps: Some(50), ..Default::default() });
+        let prog = assemble("WORKER: HALT\nMAIN: SPAWN_CONTEXT r0, WORKER, GREEN\nHALT").unwrap();
+        vm2.load_program(prog);
+        let entry = vm2.pc_offsets[0] as u128 + vm2.program_base; // WORKER at 0
+        // Models precisam existir em vm2 (handle 1/2 do vm anterior)
+        vm2.models.insert(h1, 1);
+        vm2.models.insert(h2, 2);
+        vm2.next_model_handle = 3;
+        vm2.scheduler.get_mut(1).unwrap().set_reg(1, h1 as u128).unwrap();
+        // step SPAWN at MAIN (pc = offset 1)
+        let main_cid = 1;
+        let spawn = instr_spawn_context(0, 1, FORK_FLAG_GREEN, entry);
+        vm2.step_instruction(main_cid, &spawn).unwrap();
+        let child = vm2.scheduler.get(main_cid).unwrap().reg(0).unwrap() as u64;
+        assert!(child > 1);
+        assert_eq!(vm2.scheduler.get(child).unwrap().model_handle, h1);
+        assert_eq!(vm2.stats.spawn_context_execs, 1);
+        // SET_MODEL: troca modelo do filho
+        vm2.scheduler.get_mut(main_cid).unwrap().set_reg(2, child as u128).unwrap();
+        vm2.scheduler.get_mut(main_cid).unwrap().set_reg(3, h2 as u128).unwrap();
+        vm2.step_instruction(main_cid, &instr_set_model(2, 3)).unwrap();
+        assert_eq!(vm2.scheduler.get(child).unwrap().model_handle, h2);
+        // KILL_CONTEXT
+        vm2.step_instruction(main_cid, &instr_kill_context(2)).unwrap();
+        assert!(vm2.scheduler.get(child).is_none());
+        assert_eq!(vm2.stats.kill_context_execs, 1);
+        assert_eq!(vm2.stats.set_model_execs, 1);
+        // Erros exec
+        assert!(vm2.step_instruction(main_cid, &instr_load_model(0xFF, 1)).is_err());
+        assert!(vm2.step_instruction(main_cid, &instr_kill_context(0xFF)).is_err());
+        assert!(vm2.step_instruction(main_cid, &instr_set_model(0xFF, 3)).is_err());
+        let mut vm3 = Vm::new_in_memory(VmConfig { max_steps: Some(10), ..Default::default() });
+        let cid3 = rfc0004_ctx_with(&mut vm3, &[(0, 999)]);
+        // handle inexistente
+        assert!(vm3.step_instruction(cid3, &instr_set_model(0, 1)).is_err());
+        // SNAPSHOT/RESTORE sobre models
+        let mut vm4 = Vm::new_in_memory(VmConfig { max_steps: Some(100), ..Default::default() });
+        let cid4 = rfc0004_ctx_with(&mut vm4, &[]);
+        vm4.step_instruction(cid4, &instr_load_model(0, 10)).unwrap();
+        let snap = vm4.memory.snapshot();
+        vm4.ssm_snapshots.push((snap, vm4.ssm_states.clone()));
+        vm4.rank1_snapshots.push((snap, vm4.rank1_layers.clone()));
+        vm4.snn_snapshots.push((snap, vm4.snn_layers.clone()));
+        vm4.arena_snapshots.push((snap, vm4.arenas.clone()));
+        vm4.dep_snapshots.push((snap, vm4.dep_kv.clone()));
+        vm4.rag_snapshots.push((snap, std::sync::Arc::clone(&vm4.rag_store)));
+        vm4.models_snapshots.push((snap, vm4.models.clone()));
+        vm4.step_instruction(cid4, &instr_load_model(1, 11)).unwrap();
+        assert_eq!(vm4.models.len(), 2);
+        vm4.memory.restore(snap).unwrap();
+        // pop manual como em exec_restore
+        if let Some((_, snap)) = vm4.models_snapshots.pop() { vm4.models = snap; }
+        assert_eq!(vm4.models.len(), 1);
+        assert_eq!(vm4.models.get(&1).cloned(), Some(10));
+    }
+
+    #[tokio::test]
+    async fn test_rag_demo_exec() {
+        use crate::opcodes::assemble;
+        let src = include_str!("../programs/rag_demo.m3asm");
+        let prog = assemble(src).unwrap();
+        assert_eq!(prog.len(), 17);
+        assert!(prog.iter().any(|i| i.mnemonic() == "RAG_INDEX_ADD"));
+        assert!(prog.iter().any(|i| i.mnemonic() == "RAG_SEARCH"));
+        assert!(prog.iter().any(|i| i.mnemonic() == "PQ_ENCODE"));
+        let mut vm = Vm::new_in_memory(VmConfig { max_steps: Some(100), ..Default::default() });
+        vm.load_program(prog);
+        vm.run().unwrap();
+        assert_eq!(vm.stats.rag_index_add_execs, 3);
+        assert_eq!(vm.stats.rag_search_execs, 1);
+        assert_eq!(vm.stats.embed_lookup_execs, 1);
+        assert_eq!(vm.stats.pq_encode_execs, 1);
+        assert_eq!(vm.stats.pq_decode_execs, 1);
+        // PQ roundtrip no demo: encode de [0.5,0.5,0.5,0.5] com codebook ramp -> decode produz 4 floats finitos
+        let ctx = vm.scheduler.get(1).unwrap();
+        let out = ctx.reg(14).unwrap();
+        let rec = vm.memory.read_f32_tensor(out, 4).unwrap();
+        assert_eq!(rec.len(), 4);
+        assert!(rec.iter().all(|x| x.is_finite()));
     }
 
     #[tokio::test]

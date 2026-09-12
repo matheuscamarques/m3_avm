@@ -277,24 +277,28 @@ State: `S` stateless · `F2` stateful Family 2 (declares per ESPEC 6.4).
 | `0x48` | `AUDIO_FILTER` | 32 | IMPL | S | FIR same-size; IIR traps (RFC-0031) |
 | `0x49` | `AUDIO_WINDOW` | 32 | IMPL | S | Hann/Hamming periodic (RFC-0031) |
 
-### 3.7 Gap (`0x4A-0x4F`) — RESERVED
+### 3.7 System local shims (`0x4A-0x4D`) — IMPL, 32B (v1.16, RFC-0039); `0x4E-0x4F` RESERVED
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x4A-0x4F` | — | — | RESERVED | — | Dedup R4: [B] §5.5 cluster rows deleted; single home §3.10 |
+| `0x4A` | `LOAD_MODEL` | 32 | IMPL | S | Registry stub (RFC-0039 V-3A) |
+| `0x4B` | `SPAWN_CONTEXT` | 32 | IMPL | S | Fork-like + model_handle (RFC-0039) |
+| `0x4C` | `KILL_CONTEXT` | 32 | IMPL | S | Terminate (RFC-0039) |
+| `0x4D` | `SET_MODEL` | 32 | IMPL | S | ctx.model swap (RFC-0039) |
+| `0x4E-0x4F` | — | — | RESERVED | — | Future 32B system (GET_MODEL/UNLOAD) |
 
-### 3.8 Retrieval (`0x50-0x57`) — DRAFT/HELD, 32B
+### 3.8 Retrieval (`0x50-0x57`) — IMPL/HELD, 32B (v1.15, RFC-0038)
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|
-| `0x50` | `RAG_INDEX_ADD` | 32 | DRAFT | S | RAG_INDEX insert |
-| `0x51` | `RAG_INDEX_DEL` | 32 | DRAFT | S | RAG_INDEX delete |
-| `0x52` | `RAG_SEARCH` | 32 | DRAFT | S | RAG_INDEX; flat/IVF/HNSW/PQ + top-k |
-| `0x53` | `EMBED_LOOKUP` | 32 | DRAFT | S | WEIGHTS; embedding bag |
+| `0x50` | `RAG_INDEX_ADD` | 32 | IMPL | S | RAG_INDEX insert (RFC-0038 turno1) |
+| `0x51` | `RAG_INDEX_DEL` | 32 | IMPL | S | RAG_INDEX delete (turno1) |
+| `0x52` | `RAG_SEARCH` | 32 | IMPL | S | RAG_INDEX flat top-k (turno2; `DISTANCE` core) |
+| `0x53` | `EMBED_LOOKUP` | 32 | IMPL | S | WEIGHTS embedding bag (turno2) |
 | `0x54` | `HASH_BUCKET` | 32 | HELD | S | R12 judged RFC-0030: lowering adequate, no opcode |
 | `0x55` | `QUANTIZE_VEC` | 32 | HELD | S | R12 judged RFC-0030: lowering adequate, no opcode |
-| `0x56` | `PQ_ENCODE` | 32 | DRAFT | S | RAG_INDEX; product quantizer |
-| `0x57` | `PQ_DECODE` | 32 | DRAFT | S | RAG_INDEX; inverse |
+| `0x56` | `PQ_ENCODE` | 32 | IMPL | S | RAG_INDEX product quantizer (turno3; `NSUB u16`) |
+| `0x57` | `PQ_DECODE` | 32 | IMPL | S | RAG_INDEX inverse (turno3) |
 
 ### 3.9 Classical ML (`0x58-0x5F`) — HELD, 32B
 
@@ -392,7 +396,7 @@ Section 12).
 | `0x99` | `WFI` | 64 | DRAFT | S | Wait-for-interrupt |
 | `0x9A-0x9F` | — | — | RESERVED | — | Future MMIO |
 
-### 3.14 System (`0xA0-0xAF`) — DRAFT (ops) / RESERVED, 64B
+### 3.14 System (`0xA0-0xAF`) — DRAFT (ops) / RESERVED, 64B — shims 0x4A-0x4D are the operational 32B forms until freeze
 
 | Hex | Mnemonic | W | Status | State | Region / Notes |
 |-----|----------|---|--------|-------|----------------|

@@ -139,11 +139,18 @@ pub const MEMCPY_DIR_NIC: u8 = 2;
 pub const OP_ADD_IMM: u8 = 0x7A; // rD = rS wrapping_add imm
 pub const OP_SUB_IMM: u8 = 0x7B; // rD = rS wrapping_sub imm (único SUB do ISA)
 pub const OP_STEPS: u8 = 0x7C; // rD <- instruções retiradas (determinístico)
-// RFC-0038: retrieval (0x50-0x53/0x56-0x57, v1.15; turno 1: ADD/DEL).
+// RFC-0038: retrieval (0x50-0x53/0x56-0x57, v1.15; turno 1: ADD/DEL; turno3: PQ).
 pub const OP_RAG_INDEX_ADD: u8 = 0x50; // anexa vetor (rDb=0 cria; rD <- id/contagem)
 pub const OP_RAG_INDEX_DEL: u8 = 0x51; // remove por id (rD <- restante)
 pub const OP_RAG_SEARCH: u8 = 0x52; // busca top-k (rD <- [1,2*TOPK])
 pub const OP_EMBED_LOOKUP: u8 = 0x53; // bag: média das linhas (rD <- [1,D])
+pub const OP_PQ_ENCODE: u8 = 0x56; // quantiza PQ (rD <- [1,NSUB] F32 com u16)
+pub const OP_PQ_DECODE: u8 = 0x57; // dequantiza PQ (rD <- [1,D] F32)
+// RFC-0039: system local stubs (V-3A mini, v1.16; 64B X-forms DRAFT ficam 0xA0+).
+pub const OP_LOAD_MODEL: u8 = 0x4A; // rD <- handle (payload[0..2]=model_id u16)
+pub const OP_SPAWN_CONTEXT: u8 = 0x4B; // rD <- child ctx_id (rsrc1=modelHandle, flags prio, imm=entry_pc)
+pub const OP_KILL_CONTEXT: u8 = 0x4C; // termina ctx (rsrc1=ctx_id)
+pub const OP_SET_MODEL: u8 = 0x4D; // ctx.model <- handle (rsrc1=ctx, rsrc2=model)
 // Métricas — RAG_SEARCH (payload[2]): namespace próprio (não confundir
 // com DIST_METRIC_*; o mapeamento é explícito no exec).
 pub const RAG_METRIC_COSINE: u8 = 0;
@@ -617,6 +624,12 @@ impl Instruction {
             OP_RAG_INDEX_DEL => "RAG_INDEX_DEL",
             OP_RAG_SEARCH => "RAG_SEARCH",
             OP_EMBED_LOOKUP => "EMBED_LOOKUP",
+            OP_PQ_ENCODE => "PQ_ENCODE",
+            OP_PQ_DECODE => "PQ_DECODE",
+            OP_LOAD_MODEL => "LOAD_MODEL",
+            OP_SPAWN_CONTEXT => "SPAWN_CONTEXT",
+            OP_KILL_CONTEXT => "KILL_CONTEXT",
+            OP_SET_MODEL => "SET_MODEL",
             OP_HALT => "HALT",
             OP_NOP => "NOP",
             _ => "UNKNOWN",
@@ -2522,6 +2535,33 @@ impl Instruction {
         b.copy_from_slice(&self.payload[0..2]);
         (u16::from_le_bytes(b), self.payload[2])
     }
+
+    /// PQ_ENCODE/DECODE: payload[0..2]=nsub u16 (0 inválido).
+    pub fn pq_nsub(&self) -> u16 {
+        u16::from_le_bytes([self.payload[0], self.payload[1]])
+    }
+
+    pub fn set_pq_nsub(&mut self, nsub: u16) {
+        self.payload[0..2].copy_from_slice(&nsub.to_le_bytes());
+    }
+
+    /// LOAD_MODEL: payload[0..2]=model_id u16 (0 veta; .equ ok).
+    pub fn load_model_id(&self) -> u16 {
+        u16::from_le_bytes([self.payload[0], self.payload[1]])
+    }
+
+    pub fn set_load_model_id(&mut self, id: u16) {
+        self.payload[0..2].copy_from_slice(&id.to_le_bytes());
+    }
+
+    /// SPAWN_CONTEXT: payload[0..16]=entry_pc u128 LE (FORK-like); flags=prio.
+    pub fn spawn_entry(&self) -> u128 {
+        self.imm_u128()
+    }
+
+    pub fn set_spawn_entry(&mut self, pc: u128) {
+        self.set_imm_u128(pc);
+    }
 }
 
 /// FOREST rD, rF, rT, rL [TREES=n] [DEPTH=d] [MODE=VOTE|MEAN]
@@ -2564,10 +2604,57 @@ pub fn instr_embed_lookup(rdest: u8, r_ids: u8, r_table: u8) -> Instruction {
     Instruction::new(OP_EMBED_LOOKUP, 0, rdest, r_ids, r_table, 0xFF)
 }
 
+/// PQ_ENCODE rD, rVec, rCodebook [NSUB=n] — rD <- [1,NSUB] F32 com u16.
+pub fn instr_pq_encode(rdest: u8, r_vec: u8, r_codebook: u8, nsub: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_PQ_ENCODE, 0, rdest, r_vec, r_codebook, 0xFF);
+    instr.set_pq_nsub(nsub);
+    instr
+}
+
+/// PQ_DECODE rD, rCodes, rCodebook [NSUB=n] — rD <- [1,D] F32.
+pub fn instr_pq_decode(rdest: u8, r_codes: u8, r_codebook: u8, nsub: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_PQ_DECODE, 0, rdest, r_codes, r_codebook, 0xFF);
+    instr.set_pq_nsub(nsub);
+    instr
+}
+
+// ---------------------------------------------------------------------------
+// RFC-0039: system local shims (V-3A mini, 32B, 0x4A-0x4D). 64B X-forms DRAFT ficam 0xA0+.
+// ---------------------------------------------------------------------------
+
+/// LOAD_MODEL rD, MODEL=n — rD <- handle (u128). payload[0..2]=model_id u16.
+pub fn instr_load_model(rdest: u8, model_id: u16) -> Instruction {
+    let mut instr = Instruction::new(OP_LOAD_MODEL, 0, rdest, 0xFF, 0xFF, 0xFF);
+    instr.set_load_model_id(model_id);
+    instr
+}
+
+/// SPAWN_CONTEXT rD, LABEL, PRIO [, MODEL=rM] — rD <- child ctx_id; imm=entry_pc.
+pub fn instr_spawn_context(rdest: u8, r_model: u8, priority_flag: u8, entry_pc: u128) -> Instruction {
+    let mut instr = Instruction::new(OP_SPAWN_CONTEXT, priority_flag, rdest, r_model, 0xFF, 0xFF);
+    instr.set_spawn_entry(entry_pc);
+    instr
+}
+
+/// KILL_CONTEXT rTarget — termina ctx.
+pub fn instr_kill_context(r_target: u8) -> Instruction {
+    Instruction::new(OP_KILL_CONTEXT, 0, 0xFF, r_target, 0xFF, 0xFF)
+}
+
+/// SET_MODEL rCtx, rModel — ctx.model <- handle.
+pub fn instr_set_model(r_ctx: u8, r_model: u8) -> Instruction {
+    Instruction::new(OP_SET_MODEL, 0, 0xFF, r_ctx, r_model, 0xFF)
+}
+
 /// Detecta uso da faixa V-2 (`0x50-0x53/0x56-0x57`) p/ o bit REQUIRED
 /// do container (RFC-0038; valor do bit em `m3bc.rs`, sem ciclo).
 pub fn uses_v2_retrieval(prog: &[Instruction]) -> bool {
     prog.iter().any(|i| matches!(i.opcode, 0x50..=0x53 | 0x56..=0x57))
+}
+
+/// Detecta uso da faixa V-3A (`0x4A-0x4D`) p/ bit REQUIRED 51 (RFC-0039).
+pub fn uses_v3_system(prog: &[Instruction]) -> bool {
+    prog.iter().any(|i| matches!(i.opcode, 0x4A..=0x4D))
 }
 
 // ---------------------------------------------------------------------------
@@ -5608,6 +5695,112 @@ fn parse_line(line: &str, labels: &HashMap<String, u128>, syms: &mut SymbolTable
                 parse_reg(parts[2], syms)?,
                 parse_reg(parts[3], syms)?,
             ))
+        }
+        "PQ_ENCODE" => {
+            // PQ_ENCODE rD, rVec, rCodebook [NSUB=n] — NSUB exigido.
+            if parts.len() < 4 {
+                return Err(anyhow!("PQ_ENCODE precisa de rdest, rVec, rCodebook — ex: PQ_ENCODE r4, r0, r1 NSUB=2"));
+            }
+            let mut nsub: Option<u16> = None;
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("NSUB=") {
+                    let val = if let Ok(n) = v.parse::<u16>() { n }
+                    else if let Ok(n) = syms.resolve_const(v) { u16::try_from(n).map_err(|_| anyhow!("PQ_ENCODE NSUB inválido '{}'", p))? }
+                    else { return Err(anyhow!("PQ_ENCODE NSUB inválido '{}'", p)); };
+                    nsub = Some(val);
+                } else {
+                    return Err(anyhow!("PQ_ENCODE token desconhecido '{}' (use NSUB=)", p));
+                }
+            }
+            let n = nsub.ok_or_else(|| anyhow!("PQ_ENCODE precisa de NSUB= — ex: PQ_ENCODE r4, r0, r1 NSUB=2"))?;
+            if n == 0 {
+                return Err(anyhow!("PQ_ENCODE NSUB=0 (explícito; NSUB>=1)"));
+            }
+            Ok(instr_pq_encode(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, n))
+        }
+        "PQ_DECODE" => {
+            // PQ_DECODE rD, rCodes, rCodebook [NSUB=n] — NSUB exigido.
+            if parts.len() < 4 {
+                return Err(anyhow!("PQ_DECODE precisa de rdest, rCodes, rCodebook — ex: PQ_DECODE r4, r0, r1 NSUB=2"));
+            }
+            let mut nsub: Option<u16> = None;
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("NSUB=") {
+                    let val = if let Ok(n) = v.parse::<u16>() { n }
+                    else if let Ok(n) = syms.resolve_const(v) { u16::try_from(n).map_err(|_| anyhow!("PQ_DECODE NSUB inválido '{}'", p))? }
+                    else { return Err(anyhow!("PQ_DECODE NSUB inválido '{}'", p)); };
+                    nsub = Some(val);
+                } else {
+                    return Err(anyhow!("PQ_DECODE token desconhecido '{}' (use NSUB=)", p));
+                }
+            }
+            let n = nsub.ok_or_else(|| anyhow!("PQ_DECODE precisa de NSUB= — ex: PQ_DECODE r4, r0, r1 NSUB=2"))?;
+            if n == 0 {
+                return Err(anyhow!("PQ_DECODE NSUB=0 (explícito; NSUB>=1)"));
+            }
+            Ok(instr_pq_decode(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?, parse_reg(parts[3], syms)?, n))
+        }
+        "LOAD_MODEL" => {
+            // LOAD_MODEL rD, MODEL=n (u16; .equ ok) — rD <- handle
+            if parts.len() < 3 {
+                return Err(anyhow!("LOAD_MODEL precisa de rdest, MODEL=n — ex: LOAD_MODEL r0, MODEL=1"));
+            }
+            let mut mid: Option<u16> = None;
+            for p in &parts[2..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("MODEL=") {
+                    let val = if let Ok(n) = v.parse::<u16>() { n }
+                    else if let Ok(n) = syms.resolve_const(v) { u16::try_from(n).map_err(|_| anyhow!("LOAD_MODEL MODEL inválido '{}'", p))? }
+                    else { return Err(anyhow!("LOAD_MODEL MODEL inválido '{}'", p)); };
+                    mid = Some(val);
+                } else {
+                    return Err(anyhow!("LOAD_MODEL token desconhecido '{}' (use MODEL=)", p));
+                }
+            }
+            let id = mid.ok_or_else(|| anyhow!("LOAD_MODEL precisa de MODEL=n — ex: LOAD_MODEL r0, MODEL=1"))?;
+            if id == 0 {
+                return Err(anyhow!("LOAD_MODEL MODEL=0 (explícito; MODEL>=1)"));
+            }
+            Ok(instr_load_model(parse_reg(parts[1], syms)?, id))
+        }
+        "SPAWN_CONTEXT" => {
+            // SPAWN_CONTEXT rD, LABEL, PRIO [, MODEL=rM] — rD <- child id; imm=entry_pc
+            if parts.len() < 4 {
+                return Err(anyhow!("SPAWN_CONTEXT precisa de rdest, LABEL, PRIO — ex: SPAWN_CONTEXT r0, WORKER, GREEN MODEL=r1"));
+            }
+            let rdest = parse_reg(parts[1], syms)?;
+            let label = parts[2].to_ascii_uppercase();
+            let target_pc = *labels.get(&label).ok_or_else(|| anyhow!("SPAWN_CONTEXT rótulo '{}' não encontrado", parts[2]))?;
+            let prio = match parts[3].to_ascii_uppercase().as_str() {
+                "RED" | "2" => FORK_FLAG_RED,
+                "BLUE" | "1" => FORK_FLAG_BLUE,
+                "GREEN" | "0" => FORK_FLAG_GREEN,
+                _ => return Err(anyhow!("SPAWN_CONTEXT prioridade '{}' inválida (use RED/BLUE/GREEN)", parts[3])),
+            };
+            let mut r_model = 0xFF;
+            for p in &parts[4..] {
+                let up = p.to_ascii_uppercase();
+                if let Some(v) = up.strip_prefix("MODEL=") {
+                    r_model = parse_reg(v, syms).map_err(|_| anyhow!("SPAWN_CONTEXT MODEL inválido '{}' (use registrador)", p))?;
+                } else {
+                    return Err(anyhow!("SPAWN_CONTEXT token desconhecido '{}' (use MODEL=)", p));
+                }
+            }
+            Ok(instr_spawn_context(rdest, r_model, prio, target_pc))
+        }
+        "KILL_CONTEXT" => {
+            if parts.len() != 2 {
+                return Err(anyhow!("KILL_CONTEXT precisa de rTarget — ex: KILL_CONTEXT r0"));
+            }
+            Ok(instr_kill_context(parse_reg(parts[1], syms)?))
+        }
+        "SET_MODEL" => {
+            if parts.len() != 3 {
+                return Err(anyhow!("SET_MODEL precisa de rCtx, rModel — ex: SET_MODEL r0, r1"));
+            }
+            Ok(instr_set_model(parse_reg(parts[1], syms)?, parse_reg(parts[2], syms)?))
         }
         "HALT" => {
             if parts.len() > 1 {

@@ -1,0 +1,26 @@
+; system_demo.m3asm — V-3A mini (local shims 0x4A-0x4D, v1.16)
+; Uso:
+;   cargo run --bin m3_avm -- run programs/system_demo.m3asm --max-steps 50
+; Cobre: LOAD_MODEL -> SPAWN_CONTEXT (GREEN/RED) -> SET_MODEL -> KILL_CONTEXT
+
+LOAD_MODEL r0, MODEL=1
+LOAD_MODEL r1, MODEL=2
+
+; worker 1
+SPAWN_CONTEXT r2, WORKER, GREEN MODEL=r0
+; worker 2 with BLUE prio, no model
+SPAWN_CONTEXT r3, WORKER, BLUE
+
+; muda modelo do worker 2 para r1
+SET_MODEL r3, r1
+
+; mata worker 1
+KILL_CONTEXT r2
+
+HALT
+
+WORKER:
+    ; worker faz algo trivial
+    TENSOR r4 1 4 f32 FILL=1.0
+    ADD r5, r4, r4
+    HALT

@@ -1975,4 +1975,60 @@ mod tests {
             inf.config.d_state, inf.config.d_conv, inf.config.dt_rank,
             inf.config.dt_b_c_rms, resolved, inf.config.n_layers);
     }
+
+    #[test]
+    fn test_v4_mamba_forward_real_smoke() {
+        // V-4 (G5) — fumaça Mamba com pesos reais mamba-130M Q4_K_M.
+        // Se modelo ausente, skip; senão 1 token deve produzir logits finitos e sujar estado SSM.
+        let path = "./models/mamba-130m-hf.Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip V-4 mamba smoke ausente ({})", path);
+            return;
+        }
+        let mut inf = RealInference::new(path).unwrap();
+        assert!(inf.config.is_mamba());
+        let mem_mgr = crate::memory::MemoryManager::new_in_memory();
+        let mem = crate::vm::MemBackend::Cpu(mem_mgr);
+        // token 1 (BOS-like) — forward deve ser determinístico e finito
+        let logits1 = inf.forward_one_mamba(&mem, 1).unwrap();
+        assert_eq!(logits1.len(), inf.tokenizer.vocab_size());
+        assert!(logits1.iter().all(|v| v.is_finite()), "logits com NaN/Inf");
+        // estado alocado (24 layers)
+        assert_eq!(inf.ssm_states.len(), 24, "ssm_states len");
+        assert_eq!(inf.ssm_states[0].ssm.len(), 1536*16);
+        assert_eq!(inf.ssm_states[0].conv.len(), 1536*4);
+        let logits2 = inf.forward_one_mamba(&mem, 2).unwrap();
+        assert_eq!(logits2.len(), inf.tokenizer.vocab_size());
+        assert!(logits2.iter().all(|v| v.is_finite()));
+        // segundo forward deve ser finito e cabeçalhos consistentes (dummy head pode ser constante)
+        eprintln!("[V-4 mamba smoke] {} -> logits[0]={:.3} -> logits2[0]={:.3} ssm_len={} vocab={}", path, logits1[0], logits2[0], inf.ssm_states[0].ssm.len(), inf.tokenizer.vocab_size());
+    }
+
+    #[test]
+    fn test_v4_transformer_forward_real_smoke() {
+        // V-4 (G5) — fumaça Transformer com pesos reais TinyLlama 1.1B Q4_K_M.
+        let path = "./models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip V-4 transformer smoke ausente ({})", path);
+            return;
+        }
+        let mut inf = RealInference::new(path).unwrap();
+        assert!(!inf.config.is_mamba(), "esperado transformer, achado {}", inf.config.arch);
+        let mem_mgr = crate::memory::MemoryManager::new_in_memory();
+        let mem = crate::vm::MemBackend::Cpu(mem_mgr);
+        let logits1 = inf.forward_one(&mem, 1).unwrap();
+        assert_eq!(logits1.len(), inf.tokenizer.vocab_size());
+        assert!(logits1.iter().all(|v| v.is_finite()), "logits1 não-finito");
+        let min1 = logits1.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max1 = logits1.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[V-4 transformer smoke] logits1 min {:.5} max {:.5} first 5 {:?}", min1, max1, &logits1[..5]);
+        // KV cache deve ter crescido (1 token)
+        assert_eq!(inf.kv_cache_k[0].len(), inf.config.hidden);
+        let logits2 = inf.forward_one(&mem, 2).unwrap();
+        assert_eq!(logits2.len(), inf.tokenizer.vocab_size());
+        assert!(logits2.iter().all(|v| v.is_finite()), "logits2 não-finito");
+        // KV cache deve ter 2 tokens agora (mesmo que logits sejam zero dummy, cache deve crescer)
+        assert_eq!(inf.kv_cache_k[0].len(), inf.config.hidden * 2);
+        eprintln!("[V-4 transformer smoke] {} -> logits[0]={:.3} -> logits2[0]={:.3} kv_len={} min/max1 {:.3}/{:.3}", path, logits1[0], logits2[0], inf.kv_cache_k[0].len(), min1, max1);
+    }
 }

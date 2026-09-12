@@ -42,11 +42,10 @@ pub const M3BC_MAGIC: &[u8; 4] = b"M3BC";
 pub const M3BC_HEADER_LEN: usize = 34;
 /// Versão corrente do container (= linha ISA implementada).
 pub const M3BC_VERSION: (u16, u16, u16) = (1, 5, 0);
-/// Bits REQUIRED suportados: nenhum além do baseline (que não usa bit).
-/// V-2 liga o bit 50 abaixo (turno 1 implementa ADD/DEL; membros ainda
-/// não implementados falham alto no decode — UnknownOpcode, nunca
-/// misdecode — até seu turno).
-pub const M3BC_SUPPORTED_REQUIRED: u64 = M3BC_REQUIRED_HAS_V2_RETRIEVAL;
+/// Bits REQUIRED suportados: baseline + V-2 (50) + V-3A (51).
+/// Membros ainda não implementados falham alto no decode — UnknownOpcode,
+/// nunca misdecode — até seu turno.
+pub const M3BC_SUPPORTED_REQUIRED: u64 = M3BC_REQUIRED_HAS_V2_RETRIEVAL | M3BC_REQUIRED_HAS_V3_SYSTEM;
 /// Bit OPTIONAL 49: seção `.data` no container (V-1b dia 3).
 /// NÚMERO CONGELADO, semântica pendente: o container ainda não carrega
 /// payload de dados (CLI `assemble` rejeita `.data`; só o path API
@@ -59,6 +58,10 @@ pub const M3BC_OPTIONAL_HAS_DATA_SECTION: u64 = 1 << 49;
 /// em runtime sem suporte (firewall antes do fetch — nunca misdecode).
 /// Número livre confirmado (nenhum bit atribuído até hoje).
 pub const M3BC_REQUIRED_HAS_V2_RETRIEVAL: u64 = 1 << 50;
+/// Bit REQUIRED 51: system V-3A mini (RFC-0039, `0x4A-0x4D` local shims).
+/// 64B X-forms DRAFT (0xA0+) seguem não-suportados; os shims 32B são
+/// os operacionais até o freeze dual-mode.
+pub const M3BC_REQUIRED_HAS_V3_SYSTEM: u64 = 1 << 51;
 
 /// Formato detectado por sniffing (R10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,12 +514,24 @@ mod tests {
     fn v2_retrieval_bit_wired() {
         // RFC-0038 turno 1: bit 50 REQUIRED, suportado (ADD/DEL no decoder).
         assert_eq!(M3BC_REQUIRED_HAS_V2_RETRIEVAL, 1 << 50);
-        assert_eq!(M3BC_SUPPORTED_REQUIRED, M3BC_REQUIRED_HAS_V2_RETRIEVAL);
+        assert!(M3BC_SUPPORTED_REQUIRED & M3BC_REQUIRED_HAS_V2_RETRIEVAL != 0);
         // Arquivo com o bit carrega (antes: UnsupportedFeature).
         let payload = instr_nop().encode();
         let bytes = encode_m3bc(&header(M3BC_REQUIRED_HAS_V2_RETRIEVAL, 0, 0), &payload);
         let prog = load(&bytes).unwrap();
         assert_eq!(prog.frames.len(), 1);
+    }
+
+    #[test]
+    fn v3_system_bit_wired() {
+        assert_eq!(M3BC_REQUIRED_HAS_V3_SYSTEM, 1 << 51);
+        assert!(M3BC_SUPPORTED_REQUIRED & M3BC_REQUIRED_HAS_V3_SYSTEM != 0);
+        let payload = instr_nop().encode();
+        let bytes = encode_m3bc(&header(M3BC_REQUIRED_HAS_V3_SYSTEM, 0, 0), &payload);
+        assert!(load(&bytes).is_ok());
+        // Ambos bits juntos também carregam.
+        let bytes = encode_m3bc(&header(M3BC_REQUIRED_HAS_V2_RETRIEVAL | M3BC_REQUIRED_HAS_V3_SYSTEM, 0, 0), &payload);
+        assert!(load(&bytes).is_ok());
     }
 
     #[test]

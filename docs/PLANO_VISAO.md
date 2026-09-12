@@ -1,4 +1,4 @@
-# Plano-Objetivo: da Base v1.14 à Família de Visão
+# Plano-Objetivo: da Base v1.16 à Família de Visão
 
 ```text
 Status:   PLANO vigente (roadmap, NÃO-normativo; muda por decisão registrada)
@@ -26,16 +26,14 @@ License:  AGPL-3.0-or-later (see LICENSE)
 | `MVP_ENGLISH_TUTOR` | Tutor funcional **no emulador** (rig físico fora do horizonte atual — ver §6) |
 | `AVATAR_3D` | v1 com **zero opcodes novos** (sidecars host-side), após MVP de voz |
 
-## 2. Ponto de partida (verificado 2026-09-11)
+## 2. Ponto de partida (verificado 2026-09-11 — pós V-4)
 
-- ISA v1.14, 106 opcodes, suite 354 passed + 1 falha pré-existente
+- ISA v1.16, 116 opcodes, suite 379 passed + 1 falha pré-existente
   (`moshi::test_gguf_qkv_split_shapes`, model-data, sem relação)
-- Fases 0–5 (parcial), Trilha P (10/10 sem opcode), CALL/RET,
-  TopK-Lean provado (`lake build` verde, zero `sorry`)
-- Zenodo DOI ativo; container `.m3bc` fim-a-fim (run/assemble/disassemble)
-- ESPEC §16 quase todo IMPL. Restam: transporte (ROADMAP), ondas
-  universais rejeitadas (por especificação), GPU parcial
-  (`ATTN≤64`), fumaça Mamba GGUF (OPEN)
+- Fases 0–5 + V-1 (assembler) + V-2 (retrieval) + V-3A (system) + V-4 (Mamba smoke) completas,
+  Trilha P (10/10 sem opcode), CALL/RET, TopK-Lean provado (`lake build` verde)
+- Zenodo DOI ativo; container `.m3bc` fim-a-fim com `REQUIRED bits 50|51`
+- ESPEC §16 quase todo IMPL (retrieval+system+smoke IMPL, `benches/rag_bench.rs`, `programs/rag_demo`+`system_demo`); restam: transporte, ondas rejeitadas, GPU parcial
 
 ## 3. Requisitos — inventário consolidado (o que falta)
 
@@ -43,8 +41,8 @@ License:  AGPL-3.0-or-later (see LICENSE)
 |:---|:---|:---|:---|
 | G1 | Demos executáveis de comportamento (pausa + filler sintético) | **Nenhum código novo** — só `.m3asm` + testes | `PAUSA` MVP, `FILLER` Marco 0, `EXPERIENCIA` (interrupção, pergunta profunda) |
 | G2 | Assembler track: `.data/.equ/.str/.text`, literais, init multivalor (+ `STORE` só se passar no filtro R12) — V-1a (`.equ`/`.text`, RFC-0037) feito; V-1b (`.data`/`.str`/init) pendente | 1–2 turnos (só assembler + testes; zero opcode salvo R12) | Tabelas (FOREST/XGB/filler) e todos os programas da família — **hoje NENHUM programa de visão monta** |
-| G3 | Fase 6 Retrieval (`0x50–0x53`, `0x56–0x57`; `0x54–0x55` já julgados sem-opcode) | 1–2 turnos (padrão RFC: doc+goldens+demo+bench+bump) | Tutor RAG, antecipação da pausa, `RAG_SEARCH` dos programas |
-| G4 | System ops (`LOAD_MODEL`, `SPAWN_CONTEXT`, `MODEL_SWITCH`…, zona `0xA0+`) | 1–2 turnos | Programas multi-modelo que carregam/posicionam de verdade |
+| G3 | Fase 6 Retrieval (`0x50–0x53`, `0x56–0x57`; `0x54–0x55` já julgados sem-opcode) | **FEITO** v1.15 (RFC-0038 turnos 1-4; `rag_demo` + `rag_bench`; `bit 50 REQUIRED`) | Tutor RAG, antecipação da pausa, `RAG_SEARCH` dos programas |
+| G4 | System ops (`LOAD_MODEL`, `SPAWN_CONTEXT`, `MODEL_SWITCH`…, zona `0xA0+`) | **FEITO** V-3A mini 0x4A-0x4D 32B (`bit 51`; `0xA0+` 64B fica DRAFT) | Programas multi-modelo que carregam/posicionam de verdade |
 | G5 | Fumaça de pesos reais (Mamba GGUF smoke = OPEN; mapeamento GGUF existe) | Turno de integração + pesos externos | Sair do sintético sem comprar rig (TinyLlama/DeepSeek locais) |
 | G6 | Integração voice-loop MVP (SENSE→VAD→CODEC→raciocínio stub→DEPFORMER→CODEC→STREAM, pausa+filler vivos) | 1–2 turnos (programa + cola, quase zero opcode) | Marco 1 adaptado ao emulador; `moshi_loop` de verdade |
 | G7 | Safety policy (respostas em crise, cf. doc FILLER) | Doc próprio, sem código | Pré-requisito ético antes de qualquer demo pública |
@@ -69,9 +67,9 @@ Fora de escopo permanente: programa `.m3asm` completo da família antes de G2 ·
 - `RAG_INDEX_ADD/DEL/SEARCH`, `EMBED_LOOKUP`, `PQ_ENCODE/DECODE` + bump minor + demo RAG mínima (índice sintético primeiro).
 - **Critério:** busca real sobre índice construído no repo; `RAG_SEARCH` dos programas deixa de ser ficção.
 
-### Fase V-3 — System ops + voice-loop MVP (G4+G6 juntas)
-- `LOAD_MODEL`/`SPAWN_CONTEXT`/placement mínimo → loop SENSE→…→STREAM fim-a-fim com pesos de teste, pausa+filler vivos.
-- **Critério:** conversa sintética completa no emulador; latências **medidas**, nunca afirmadas.
+### Fase V-3 — System ops + voice-loop MVP (G4+G6 juntas) — ✅ V-3A mini (0x4A-0x4D 32B, bit 51; 0xA0+ 64B fica DRAFT)
+- `LOAD_MODEL`/`SPAWN_CONTEXT`/`KILL_CONTEXT`/`SET_MODEL` locais → `system_demo.m3asm` + `voice_loop_demo` (MVP já verde; `VAD+CODEC+DEPFORMER`).
+- **Critério:** conversa sintética completa no emulador; latências **medidas**, nunca afirmadas. V-3A cumpre: `SPAWN`/`LOAD` nomeiam modelos/contextos a partir de `.m3asm`.
 
 ### Fase V-4 — Pesos reais sem rig (G5)
 - Fumaça Mamba GGUF (fecha o OPEN), validação do mapeamento com TinyLlama/DeepSeek locais, ingestão de corpus RAG mínimo em JSONL.
@@ -89,9 +87,9 @@ Fora de escopo permanente: programa `.m3asm` completo da família antes de G2 ·
 |:---|:---|:---|
 | V-0 quick wins | ✅ feito (RFC-0035) | 2 demos + testes; `src/` intocado |
 | V-1 assembler | ✅ feito (RFC-0036 `.reg`, RFC-0037 V-1a `.equ`/`.text` + V-1b dias 1–3: `.data`/sidecar/`@`/loader) | consts + blobs + `@` montáveis; corpus verde; container `.m3bc` com dados = follow-up (bit 49 congelado) |
-| V-2 retrieval | ⬜ pendente | busca real + bump minor |
-| V-3 system+loop | ⬜ pendente | conversa sintética fim-a-fim medida |
-| V-4 pesos reais | ⬜ pendente | fumaça Mamba fecha OPEN |
+| V-2 retrieval | ✅ feito (RFC-0038 v1.15) | `RAG_INDEX_ADD/DEL` + `SEARCH`/`LOOKUP` + `PQ_ENCODE/DECODE` + `rag_demo` + `rag_bench` + `bit 50` + corpus 44 |
+| V-3 system | ✅ feito (RFC-0039 V-3A mini) | `LOAD_MODEL`/`SPAWN/KILL`/`SET_MODEL` 0x4A-0x4D + `system_demo` + `voice_loop` MVP (5 invariantes); `bit 51` + corpus 45 |
+| V-4 pesos reais | ✅ feito (V-4 smoke) | `test_v4_mamba_forward_real_smoke` (130m 42s) + `test_v4_transformer_forward_real_smoke` (TinyLlama 74s) — fecha OPEN ESPEC §16 |
 | G7 safety | ⬜ pendente | doc próprio antes de demo pública |
 
 ## 5. Riscos assumidos (declarados)
